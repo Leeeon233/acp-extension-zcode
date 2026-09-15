@@ -13,11 +13,13 @@
  * setModel rerouting through updateRuntimeModelConfig.
  */
 
+import { randomUUID } from "node:crypto";
 import type * as acp from "@agentclientprotocol/sdk";
 
 import { emitInitialUsage } from "../config/model-cache.js";
 import { applyModelSwitch } from "../config/runtime-model.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
+import { withLodyActivity } from "../lody.js";
 import { ProjectionDiffer } from "../translators/projection-differ.js";
 import { clientConnectionRoot, log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
@@ -164,36 +166,64 @@ export async function compact(
 ): Promise<Result> {
   const acpSid = params.sessionId;
   const zcodeSid = await resolveSidOrThrow(server, params);
-  const resp = await server
-    .ensureBackend()
-    .request(server.nextId(), "session/compact", { sessionId: zcodeSid }, 30000);
-  if (resp.error) throw new Error(`compact failed: ${resp.error.message}`);
-  // compact's internal AI turn (read history → LLM compress → write back) can
-  // take minutes; expectLock=true avoids the startup-delay false-success window.
-  // timeout is in MILLISECONDS (Date.now()-based), not seconds — Python's
-  // timeout=300 becomes 300000. A bare 300 expires on the first probe sleep,
-  // making compact return "✓" while the internal turn lock is still held.
-  const released = await waitForTurnIdle(server, zcodeSid, 300_000, "session/goal", true);
-  if (released) {
-    log("session/compact → ok (lock released)");
-  } else {
-    warn("session/compact → ⚠ lock wait timeout (backend may still be compacting)");
-  }
-  if (released) {
-    // Refresh usage so the UI reflects the reduced contextUsed post-compact.
-    // Ensure a differ exists (compact may be the first action on a fresh session)
-    // and sync its usage baseline so the next turn won't re-emit the same value.
-    let differ = server.differs.get(zcodeSid);
-    if (!differ) {
-      differ = new ProjectionDiffer();
-      server.differs.set(zcodeSid, differ);
+  const activityId = `lody_compact_${randomUUID().slice(0, 12)}`;
+  const activityStartedAt = Date.now();
+  let activityStatus: "completed" | "failed" = "failed";
+  await server.notifyByZcodeSid(zcodeSid, {
+    sessionUpdate: "tool_call",
+    toolCallId: activityId,
+    title: "Context compaction",
+    kind: "other",
+    status: "in_progress",
+    _meta: withLodyActivity({}, { version: 1, kind: "context_compaction" }),
+  });
+  try {
+    const resp = await server
+      .ensureBackend()
+      .request(server.nextId(), "session/compact", { sessionId: zcodeSid }, 30000);
+    if (resp.error) throw new Error(`compact failed: ${resp.error.message}`);
+    // compact's internal AI turn (read history → LLM compress → write back) can
+    // take minutes; expectLock=true avoids the startup-delay false-success window.
+    // timeout is in MILLISECONDS (Date.now()-based), not seconds — Python's
+    // timeout=300 becomes 300000. A bare 300 expires on the first probe sleep,
+    // making compact return "✓" while the internal turn lock is still held.
+    const released = await waitForTurnIdle(server, zcodeSid, 300_000, "session/goal", true);
+    if (released) {
+      log("session/compact → ok (lock released)");
+    } else {
+      warn("session/compact → ⚠ lock wait timeout (backend may still be compacting)");
     }
-    await emitInitialUsage(server, cx, acpSid, zcodeSid, differ);
+    if (released) {
+      // Refresh usage so the UI reflects the reduced contextUsed post-compact.
+      // Ensure a differ exists (compact may be the first action on a fresh session)
+      // and sync its usage baseline so the next turn won't re-emit the same value.
+      let differ = server.differs.get(zcodeSid);
+      if (!differ) {
+        differ = new ProjectionDiffer();
+        server.differs.set(zcodeSid, differ);
+      }
+      await emitInitialUsage(server, cx, acpSid, zcodeSid, differ);
+      activityStatus = "completed";
+    }
+    // Surface the lock-timeout to the slash-command path so it can warn the user
+    // (the ACP method path ignores this non-standard flag). Mirrors Python's
+    // "⚠ 压缩超时" branch in _handle_slash_command.
+    return { ...((resp.result ?? {}) as Result), __lockTimeout: !released };
+  } finally {
+    await server.notifyByZcodeSid(zcodeSid, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: activityId,
+      status: activityStatus,
+      _meta: withLodyActivity(
+        {},
+        {
+          version: 1,
+          kind: "context_compaction",
+          durationMs: Math.max(0, Date.now() - activityStartedAt),
+        },
+      ),
+    });
   }
-  // Surface the lock-timeout to the slash-command path so it can warn the user
-  // (the ACP method path ignores this non-standard flag). Mirrors Python's
-  // "⚠ 压缩超时" branch in _handle_slash_command.
-  return { ...((resp.result ?? {}) as Result), __lockTimeout: !released };
 }
 
 /** session/cancelBackgroundTask → zcode session/cancelBackgroundTask. */

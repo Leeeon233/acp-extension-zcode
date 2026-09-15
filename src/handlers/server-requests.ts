@@ -46,6 +46,7 @@ import {
 } from "../interaction/adapter.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
 import { messages } from "../i18n.js";
+import { withLodyToolName } from "../lody.js";
 import type { ClientLike } from "../remote/broadcast.js";
 import { clientConnectionRoot, log, warn } from "../utils.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
@@ -480,7 +481,7 @@ async function handleSinglePermission(
     kind: tcKind,
     status: "pending",
     rawInput,
-    _meta: { claudeCode: { toolName } },
+    _meta: withLodyToolName({ claudeCode: { toolName } }, toolName),
   };
   if (epm && rawInput && typeof rawInput === "object") {
     const planText = (rawInput as { plan?: string }).plan;
@@ -658,7 +659,7 @@ async function handleAskUserViaElicitation(
     kind: "other",
     status: "pending",
     rawInput,
-    _meta: { claudeCode: { toolName } },
+    _meta: withLodyToolName({ claudeCode: { toolName } }, toolName),
   });
   const formParams = buildAskUserElicitationForm(params, acpSid, toolCallId || undefined);
   log(
@@ -744,7 +745,7 @@ async function emitAskToolCall(
     kind: "other",
     status: "pending",
     rawInput,
-    _meta: { claudeCode: { toolName: "AskUserQuestion" } },
+    _meta: withLodyToolName({ claudeCode: { toolName: "AskUserQuestion" } }, "AskUserQuestion"),
     content: [{ type: "content", content: { type: "text", text: qText } }],
   });
 }

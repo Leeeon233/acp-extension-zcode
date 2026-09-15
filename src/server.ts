@@ -19,6 +19,7 @@ import { armSandboxArgv, collectSandboxWorkspaces, sandboxActive } from "./backe
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend } from "./handlers/io.js";
 import { SandboxRestartBatcher, flushSandboxGrants } from "./handlers/sandbox-allow.js";
+import { LODY_AGENT_CAPABILITIES } from "./lody.js";
 import { ClientRegistry } from "./remote/broadcast.js";
 import { AGENT_INFO, clientConnectionRoot, PROTOCOL_VERSION, log, warn } from "./utils.js";
 
@@ -60,6 +61,11 @@ export interface PendingTurn {
    * app-server (its abort controller is never registered; see AGENTS.md).
    */
   foregroundExecutionId?: string;
+  /**
+   * Backend `turn.completed.usage` captured for the Lody cumulative accounting
+   * update. Per-turn scope; emitted once after the turn loop returns.
+   */
+  lodyUsageRaw?: Record<string, unknown> | null;
   /**
    * Set when the turn was ended by the stall-recovery heuristic (backend
    * reported idle after a silence) rather than a real turn.completed event.
@@ -711,7 +717,10 @@ export class ZcodeAcpServer {
         sessionCapabilities: { list: {}, resume: {}, fork: {} },
         // Read-only session file access lives on the bridge's loopback /fs
         // endpoint, hub-proxied at /api/instances/{id}/fs/* (ADR-0004).
-        _meta: { zcode: { fs: true } },
+        // `lody` advertises the provider-neutral extension surface consumed
+        // by Lody's ACP client (usage accounting, quota snapshots, task
+        // lifecycle metadata, and compaction activity markers).
+        _meta: { zcode: { fs: true }, lody: LODY_AGENT_CAPABILITIES },
       },
       // The GLM API key is read from ~/.zcode/v2/config.json by the ZCode
       // backend subprocess; the editor never needs to supply credentials.
