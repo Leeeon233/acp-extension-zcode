@@ -196,15 +196,23 @@ export function toLodyModelUsage(
     return typeof value === "number" && Number.isFinite(value) ? value : undefined;
   };
 
+  // ZCode reports input/output as inclusive totals: totalTokens is
+  // inputTokens + outputTokens, while cacheReadTokens/cacheWriteTokens are
+  // subsets of input and reasoningTokens is a subset of output. The core
+  // contract requires disjoint buckets, so subtract the details before
+  // publishing them as separate counters.
+  const cacheRead = count("cacheReadTokens");
+  const cacheWrite = optionalCount("cacheWriteTokens") ?? 0;
+  const reasoning = optionalCount("reasoningTokens") ?? 0;
   const usage: ModelUsage = {
-    inputTokens: count("inputTokens"),
-    outputTokens: count("outputTokens"),
-    cacheReadInputTokens: count("cacheReadTokens"),
+    inputTokens: Math.max(0, count("inputTokens") - cacheRead - cacheWrite),
+    outputTokens: Math.max(0, count("outputTokens") - reasoning),
+    cacheReadInputTokens: cacheRead,
   };
   const cacheCreation = optionalCount("cacheWriteTokens");
   if (cacheCreation !== undefined) usage.cacheCreationInputTokens = cacheCreation;
-  const reasoning = optionalCount("reasoningTokens");
-  if (reasoning !== undefined) usage.reasoningOutputTokens = reasoning;
+  const reasoningReported = optionalCount("reasoningTokens");
+  if (reasoningReported !== undefined) usage.reasoningOutputTokens = reasoningReported;
   const webSearch = optionalCount("webSearchRequests");
   if (webSearch !== undefined) usage.webSearchRequests = webSearch;
   if (contextWindow !== undefined && contextWindow > 0) usage.contextWindow = contextWindow;

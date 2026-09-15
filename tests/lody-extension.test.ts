@@ -82,28 +82,35 @@ describe("Lody metadata helpers", () => {
 });
 
 describe("Lody token usage", () => {
-  it("renames backend counters and keeps unreported optional buckets absent", () => {
-    expect(
-      toLodyModelUsage(
-        {
-          inputTokens: 1200,
-          outputTokens: 350,
-          cacheReadTokens: 900,
-          cacheWriteTokens: 120,
-          reasoningTokens: 200,
-          webSearchRequests: 0,
-        },
-        128_000,
-      ),
-    ).toEqual({
-      inputTokens: 1200,
-      outputTokens: 350,
+  it("splits inclusive backend totals into disjoint core buckets", () => {
+    const usage = toLodyModelUsage(
+      {
+        inputTokens: 1200,
+        outputTokens: 350,
+        totalTokens: 1550,
+        cacheReadTokens: 900,
+        cacheWriteTokens: 120,
+        reasoningTokens: 200,
+        webSearchRequests: 0,
+      },
+      128_000,
+    );
+    expect(usage).toEqual({
+      inputTokens: 180,
+      outputTokens: 150,
       cacheReadInputTokens: 900,
       cacheCreationInputTokens: 120,
       reasoningOutputTokens: 200,
       webSearchRequests: 0,
       contextWindow: 128_000,
     });
+    expect(
+      (usage?.inputTokens ?? 0) +
+        (usage?.outputTokens ?? 0) +
+        (usage?.cacheReadInputTokens ?? 0) +
+        (usage?.cacheCreationInputTokens ?? 0) +
+        (usage?.reasoningOutputTokens ?? 0),
+    ).toBe(1550);
   });
 
   it("omits optional buckets that the backend did not report", () => {
@@ -111,6 +118,24 @@ describe("Lody token usage", () => {
       inputTokens: 5,
       outputTokens: 6,
       cacheReadInputTokens: 0,
+    });
+  });
+
+  it("never emits a negative input/output bucket when details exceed totals", () => {
+    expect(
+      toLodyModelUsage({
+        inputTokens: 10,
+        outputTokens: 5,
+        cacheReadTokens: 8,
+        cacheWriteTokens: 8,
+        reasoningTokens: 9,
+      }),
+    ).toMatchObject({
+      inputTokens: 0,
+      outputTokens: 0,
+      cacheReadInputTokens: 8,
+      cacheCreationInputTokens: 8,
+      reasoningOutputTokens: 9,
     });
   });
 });
