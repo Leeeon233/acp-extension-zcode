@@ -31,6 +31,23 @@ export interface ClientCapabilities {
   _meta?: Record<string, unknown>;
 }
 
+/**
+ * Auth method advertised at `initialize` and accepted by `authenticate`.
+ *
+ * The GLM API key is read from `~/.zcode/v2/config.json` by the ZCode backend
+ * subprocess, so there is no editor-side credential exchange: the auth method
+ * is agent-type and `authenticate` only acknowledges it.
+ */
+export const ZCODE_AUTH_METHOD_ID = "zcode-credentials";
+const ZCODE_AUTH_METHODS: acp.AuthMethod[] = [
+  {
+    id: ZCODE_AUTH_METHOD_ID,
+    name: "ZCode built-in credentials",
+    description:
+      "Reads the GLM API key from ~/.zcode/v2/config.json managed by the ZCode desktop app. No editor-side credentials required.",
+  },
+];
+
 /** A pending prompt turn. */
 export interface PendingTurn {
   zcodeSid: string;
@@ -700,14 +717,22 @@ export class ZcodeAcpServer {
       // backend subprocess; the editor never needs to supply credentials.
       // Declared as AuthMethodAgent (no `type` field → defaults to "agent"),
       // which the ACP registry CI accepts as "agent self-handles auth".
-      authMethods: [
-        {
-          id: "zcode-credentials",
-          name: "ZCode built-in credentials",
-          description:
-            "Reads the GLM API key from ~/.zcode/v2/config.json managed by the ZCode desktop app. No editor-side credentials required.",
-        },
-      ],
+      authMethods: ZCODE_AUTH_METHODS,
     };
+  }
+
+  /**
+   * Handle ACP `authenticate`. The advertised method is backed by ZCode's own
+   * credential store (read lazily by the backend on first session RPC), so the
+   * bridge only needs to acknowledge the selected method. Without this route a
+   * client that follows the advertised `authMethods` gets -32601, which is the
+   * exact path Lody's registry-provider setup takes.
+   */
+  async authenticate(params: acp.AuthenticateRequest): Promise<acp.AuthenticateResponse> {
+    if (params.methodId !== ZCODE_AUTH_METHOD_ID) {
+      throw new Error(`Unsupported authentication method: ${params.methodId}`);
+    }
+    log(`authenticate: ${params.methodId} acknowledged`);
+    return {};
   }
 }

@@ -47,10 +47,44 @@ interface ExtensionParams {
   [key: string]: unknown;
 }
 
+/**
+ * ACP spec `session/fork` params (the ZCode extension historically accepted
+ * only `sessionId` + `target`/`checkpointId`). The spec fields are optional
+ * here so both the old extension call and a spec/Lody client parse.
+ */
+interface ForkParams extends ExtensionParams {
+  /** Absolute working directory requested for the fork, if the client sent one. */
+  cwd?: string;
+  /** ACP additional workspace roots; the backend fork inherits the source. */
+  additionalDirectories?: string[];
+  /** ACP MCP servers; the backend fork inherits the source's server set. */
+  mcpServers?: unknown[];
+}
+
 type Result = Record<string, unknown>;
 
-/** session/fork → zcode session/fork: branch a new session from a checkpoint. */
-export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
+/**
+ * session/fork → zcode session/fork: branch a new session from a checkpoint.
+ *
+ * Two callers share this route:
+ *   - ACP-spec clients (Lody, Zed unstable fork) send `{ sessionId, cwd,
+ *     mcpServers, _meta }` and read the returned `sessionId`.
+ *   - ZCode extension clients (the `/fork` slash command) send
+ *     `{ sessionId, target | checkpointId }` and read `forkedSessionId`.
+ *
+ * The backend forks at a checkpoint and returns `forkedSessionId`; we publish
+ * both spellings plus the initial modes/configOptions so spec clients can
+ * adopt the new session without a follow-up resume. `cwd`, additional roots
+ * and MCP servers are intentionally not overlaid: the backend fork inherits
+ * the source session's workspace/MCP setup, matching how the bridge treats
+ * `session/resume` client cwd as non-authoritative.
+ */
+export async function fork(
+  server: ZcodeAcpServer,
+  params: ForkParams,
+  cx?: acp.AgentContext,
+): Promise<Result> {
+  const acpSid = params.sessionId;
   const zcodeSid = await resolveSidOrThrow(server, params);
   const backend = server.ensureBackend();
   const resp = await backend.request(
@@ -62,13 +96,36 @@ export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Pro
   if (resp.error) throw new Error(`fork failed: ${resp.error.message}`);
   // 3.3.0 returns `forkedSessionId` (not `sessionId`) for the new session id.
   // Register it so subsequent ACP calls targeting the fork can resolve the sid.
-  const result = (resp.result ?? {}) as { forkedSessionId?: string };
-  if (result.forkedSessionId) {
-    server.registerSession(result.forkedSessionId, result.forkedSessionId);
-    server.ensureBackgroundListener(result.forkedSessionId);
-  }
-  log(`session/fork → ${result.forkedSessionId ?? "?"}`);
-  return result;
+  const result = (resp.result ?? {}) as { forkedSessionId?: string; sessionId?: string };
+  const forkedSessionId = result.forkedSessionId ?? result.sessionId;
+  if (!forkedSessionId) throw new Error("fork failed: backend returned no session id");
+
+  // The fork is a real backend session; use its id as the ACP session id (the
+  // same convention the ZCode extension and session/list already use).
+  server.registerSession(forkedSessionId, forkedSessionId);
+  server.ensureBackgroundListener(forkedSessionId);
+  server.markBackendLoaded(forkedSessionId);
+  const sourceCwd = server.sessionCwds.get(acpSid);
+  if (sourceCwd) server.sessionCwds.set(forkedSessionId, sourceCwd);
+
+  const modes = await buildModes(server, forkedSessionId);
+  server.lastMode.set(forkedSessionId, modes.currentModeId);
+  log(`session/fork ${acpSid} → ${forkedSessionId}`);
+
+  return {
+    // Preserve any additional backend fork fields the extension exposed before.
+    ...result,
+    // ACP spec response shape (ForkSessionResponse).
+    sessionId: forkedSessionId,
+    // Back-compat for the bridge's own `/fork` extension clients.
+    forkedSessionId,
+    modes,
+    configOptions: await buildConfigOptions(
+      server,
+      forkedSessionId,
+      cx ? clientConnectionRoot(cx) : undefined,
+    ),
+  };
 }
 
 /** session/goal → zcode session/goal: read/set/replace/clear/pause/resume the goal. */

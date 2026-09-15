@@ -75,7 +75,7 @@ export function buildTuiArgs(
 export async function runTui(): Promise<void> {
   const marttyJs = resolveMarttyJs();
   if (!marttyJs) {
-    throw new Error("martty is not installed — reinstall the zcode-acp-server package");
+    throw new Error("martty is not installed — reinstall the acp-extension-zcode package");
   }
   seedMarttyQuotaPlugin();
   const child = spawn(process.execPath, [marttyJs, ...buildTuiArgs(agentEntryJs())], {
@@ -92,7 +92,7 @@ export async function runTui(): Promise<void> {
 export async function checkTuiRuntime(): Promise<boolean> {
   const marttyJs = resolveMarttyJs();
   if (!marttyJs) {
-    warn("tui: martty is not installed — reinstall the zcode-acp-server package");
+    warn("tui: martty is not installed — reinstall the acp-extension-zcode package");
     return false;
   }
   const child = spawn(

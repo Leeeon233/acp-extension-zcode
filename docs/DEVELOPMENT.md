@@ -11,7 +11,7 @@
 ### Install dependencies
 
 ```bash
-cd zcode-acp-server
+cd acp-extension-zcode
 pnpm install
 ```
 
@@ -63,7 +63,7 @@ full `ZCODE_BIN` per-platform paths):
     "ZCode": {
       "type": "custom",
       "command": "node",
-      "args": ["/absolute/path/to/zcode-acp-server/dist/index.js"],
+      "args": ["/absolute/path/to/acp-extension-zcode/dist/index.js"],
       "env": {
         "ZCODE_BIN": "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs"
       }

@@ -2,7 +2,7 @@
 
 ## Project overview
 
-**zcode-acp-server** — a Node.js bridge that connects the ZCode agent backend
+**acp-extension-zcode** — a Node.js bridge that connects the ZCode agent backend
 (`zcode app-server --stdio`) to any ACP-compatible editor (Zed, JetBrains, …)
 via JSON-RPC over stdio. Translates ACP protocol requests into ZCode session
 methods and streams events back as ACP `session/update` notifications.

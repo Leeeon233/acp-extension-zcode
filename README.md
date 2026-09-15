@@ -1,6 +1,6 @@
-# zcode-acp-server
+# acp-extension-zcode
 
-[![CI](https://github.com/william0wang/zcode-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/william0wang/zcode-acp/actions/workflows/ci.yml)
+[![CI](https://github.com/Leeeon233/acp-extension-zcode/actions/workflows/ci.yml/badge.svg)](https://github.com/Leeeon233/acp-extension-zcode/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 English | **[简体中文](README.zh-CN.md)**
@@ -34,25 +34,26 @@ in place; see the project board for what's next.
 ## Install
 
 ```bash
-npm install -g zcode-acp-server
+npm install -g acp-extension-zcode
 ```
 
-This installs both bins: `zcode-acp-server` (what your editor launches) and
-`zcode-acp` (the unified CLI). Configure your ACP client to launch it — see
-**Configure Zed** below or your editor's ACP docs.
+This installs the `acp-extension-zcode` bin (what your editor launches; the
+legacy `zcode-acp-server` bin remains as an alias) and `zcode-acp` (the unified
+CLI). Configure your ACP client to launch it — see **Configure Zed** below or
+your editor's ACP docs.
 
 <details>
 <summary>Install from source instead</summary>
 
 ```bash
-git clone https://github.com/william0wang/zcode-acp.git
-cd zcode-acp-server
+git clone https://github.com/Leeeon233/acp-extension-zcode.git
+cd acp-extension-zcode
 pnpm install
 pnpm build
 ```
 
 The compiled entry point is `dist/index.js` (also exposed as the
-`zcode-acp-server` bin).
+`acp-extension-zcode` bin; the legacy `zcode-acp-server` alias remains).
 
 </details>
 
@@ -66,7 +67,7 @@ Add the server to Zed as a custom agent server. In `~/.config/zed/settings.json`
   "agent_servers": {
     "ZCode": {
       "type": "custom",
-      "command": "zcode-acp-server",
+      "command": "acp-extension-zcode",
       "env": {
         // Only needed for custom installs — the CLI is auto-discovered from
         // the desktop app bundle or PATH (see the table below).
@@ -78,7 +79,7 @@ Add the server to Zed as a custom agent server. In `~/.config/zed/settings.json`
 ```
 
 Running from source instead? Use `"command": "node"` with
-`"args": ["/absolute/path/to/zcode-acp-server/dist/index.js"]`.
+`"args": ["/absolute/path/to/acp-extension-zcode/dist/index.js"]`.
 
 Restart Zed and pick **ZCode** from the agent dropdown.
 
@@ -234,12 +235,12 @@ code style, commit conventions, and the PR checklist. Notable changes are
 recorded in [CHANGELOG.md](CHANGELOG.md).
 
 Thanks to everyone who has contributed (updated automatically from the
-[contributors graph](https://github.com/william0wang/zcode-acp/graphs/contributors)):
+[contributors graph](https://github.com/Leeeon233/acp-extension-zcode/graphs/contributors)):
 
-<a href="https://github.com/william0wang/zcode-acp/graphs/contributors">
+<a href="https://github.com/Leeeon233/acp-extension-zcode/graphs/contributors">
   <!-- release-please re-stamps &v= on every release: the new URL busts the
        contrib.rocks and GitHub camo image caches. -->
-  <img src="https://contrib.rocks/image?repo=william0wang/zcode-acp&v=0.38.0" alt="Contributors" /> <!-- x-release-please-version -->
+  <img src="https://contrib.rocks/image?repo=Leeeon233/acp-extension-zcode&v=0.38.0" alt="Contributors" /> <!-- x-release-please-version -->
 </a>
 
 ## Related Projects

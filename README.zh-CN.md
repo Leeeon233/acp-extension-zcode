@@ -1,6 +1,6 @@
-# zcode-acp-server
+# acp-extension-zcode
 
-[![CI](https://github.com/william0wang/zcode-acp/actions/workflows/ci.yml/badge.svg)](https://github.com/william0wang/zcode-acp/actions/workflows/ci.yml)
+[![CI](https://github.com/Leeeon233/acp-extension-zcode/actions/workflows/ci.yml/badge.svg)](https://github.com/Leeeon233/acp-extension-zcode/actions/workflows/ci.yml)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 
 **[English](README.md)** | 简体中文
@@ -31,23 +31,25 @@
 ## 安装
 
 ```bash
-npm install -g zcode-acp-server
+npm install -g acp-extension-zcode
 ```
 
-会同时安装两个 bin：`zcode-acp-server`（编辑器调用）和 `zcode-acp`（统一 CLI）。
+会安装 `acp-extension-zcode` bin（编辑器调用；旧的 `zcode-acp-server`
+仍作为兼容别名保留），以及 `zcode-acp`（统一 CLI）。
 在你的 ACP 客户端里配置启动它 —— 见下方的 **在 Zed 中配置** 或你的编辑器的 ACP 文档。
 
 <details>
 <summary>改为从源码安装</summary>
 
 ```bash
-git clone https://github.com/william0wang/zcode-acp.git
-cd zcode-acp-server
+git clone https://github.com/Leeeon233/acp-extension-zcode.git
+cd acp-extension-zcode
 pnpm install
 pnpm build
 ```
 
-编译产物入口为 `dist/index.js`（同时作为 `zcode-acp-server` bin 暴露）。
+编译产物入口为 `dist/index.js`（同时作为 `acp-extension-zcode` bin 暴露；
+旧的 `zcode-acp-server` 别名保留）。
 
 </details>
 
@@ -61,7 +63,7 @@ pnpm build
   "agent_servers": {
     "ZCode": {
       "type": "custom",
-      "command": "zcode-acp-server",
+      "command": "acp-extension-zcode",
       "env": {
         // 仅自定义安装时需要——CLI 会从桌面应用内置路径或 PATH 自动发现
         // （见下方表格）。
@@ -73,7 +75,7 @@ pnpm build
 ```
 
 从源码运行？改用 `"command": "node"` 与
-`"args": ["/absolute/path/to/zcode-acp-server/dist/index.js"]`。
+`"args": ["/absolute/path/to/acp-extension-zcode/dist/index.js"]`。
 
 重启 Zed，然后从 agent 下拉菜单中选择 **ZCode**。
 
@@ -199,11 +201,11 @@ CI 会在每次 push 和 pull request 时运行 `typecheck`、`lint`、`build` �
 欢迎贡献！请阅读 [CONTRIBUTING.md](CONTRIBUTING.md) 了解环境搭建、代码风格、
 commit 约定和 PR 检查清单。重要变更记录在 [CHANGELOG.md](CHANGELOG.md)。
 
-感谢每一位贡献者（由[贡献者图谱](https://github.com/william0wang/zcode-acp/graphs/contributors)
+感谢每一位贡献者（由[贡献者图谱](https://github.com/Leeeon233/acp-extension-zcode/graphs/contributors)
 自动生成，覆盖全部历史贡献者）：
 
-<a href="https://github.com/william0wang/zcode-acp/graphs/contributors">
-  <img src="https://contrib.rocks/image?repo=william0wang/zcode-acp" alt="贡献者" />
+<a href="https://github.com/Leeeon233/acp-extension-zcode/graphs/contributors">
+  <img src="https://contrib.rocks/image?repo=Leeeon233/acp-extension-zcode" alt="贡献者" />
 </a>
 
 ## 相关项目

@@ -2040,7 +2040,7 @@ function stopBackendTurn(
   try {
     server.ensureBackend().send("v4/command", {
       commandId: randomUUID(),
-      clientId: "zcode-acp-server",
+      clientId: "acp-extension-zcode",
       sessionId: zcodeSid,
       type: "stop",
       payload: foregroundExecutionId

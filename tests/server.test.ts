@@ -12,7 +12,7 @@
 import type * as acp from "@agentclientprotocol/sdk";
 import { describe, expect, it } from "vitest";
 
-import { ZcodeAcpServer } from "../src/server.js";
+import { ZCODE_AUTH_METHOD_ID, ZcodeAcpServer } from "../src/server.js";
 
 /** Minimal initialize params matching the ACP handshake shape. */
 function initParams(): acp.InitializeRequest {
@@ -28,7 +28,7 @@ describe("ZcodeAcpServer.initialize", () => {
     const server = new ZcodeAcpServer();
     const resp = await server.initialize(initParams());
     expect(resp.protocolVersion).toBe(1);
-    expect(resp.agentInfo.name).toBe("zcode-acp-server");
+    expect(resp.agentInfo.name).toBe("acp-extension-zcode");
   });
 
   it("advertises loadSession + list/resume/fork session capabilities", async () => {
@@ -76,6 +76,21 @@ describe("ZcodeAcpServer.initialize", () => {
     const server = new ZcodeAcpServer();
     await server.initialize(initParams());
     expect(server.backend).toBeNull();
+  });
+});
+
+describe("ZcodeAcpServer.authenticate", () => {
+  it("accepts the advertised agent auth method and resolves the empty response", async () => {
+    const server = new ZcodeAcpServer();
+    await expect(server.authenticate({ methodId: ZCODE_AUTH_METHOD_ID })).resolves.toEqual({});
+    expect(server.backend).toBeNull();
+  });
+
+  it("rejects a method that was not advertised", async () => {
+    const server = new ZcodeAcpServer();
+    await expect(server.authenticate({ methodId: "not-advertised" })).rejects.toThrow(
+      /Unsupported authentication method/,
+    );
   });
 });
 

@@ -1,7 +1,8 @@
 # Unified CLI (`zcode-acp`)
 
 Every surface of this package is available under one command — `zcode-acp` —
-installed alongside the `zcode-acp-server` bin your editor configures.
+installed alongside the `acp-extension-zcode` bin your editor configures
+(the legacy `zcode-acp-server` alias remains).
 
 ## Interactive TUI
 
@@ -136,10 +137,10 @@ server` speaks ACP on stdio — that is what editors invoke through the
 0.12.0 folds the old standalone bins into the unified CLI (see
 [ADR-0007](adr/0007-unified-cli-entry-and-bin-pruning.md)):
 
-| Old (≤0.11)          | New (0.12)                            |
-| -------------------- | ------------------------------------- |
-| `zcode-acp-server`   | unchanged (kept for editor configs)   |
-| `zcode-quota [args]` | `zcode-acp quota [args]` (same flags) |
-| `zcode-acp-hub`      | `zcode-acp hub`                       |
+| Old (≤0.11)          | New (0.12+)                                   |
+| -------------------- | --------------------------------------------- |
+| `zcode-acp-server`   | `acp-extension-zcode` (legacy alias remains)  |
+| `zcode-quota [args]` | `zcode-acp quota [args]` (same flags)         |
+| `zcode-acp-hub`      | `zcode-acp hub`                               |
 
 Editor configs referencing `zcode-acp-server` keep working unchanged.
