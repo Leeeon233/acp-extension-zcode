@@ -13,9 +13,15 @@ import { resolveInvocation } from "../src/cli.js";
 import { serveIdleDecision } from "../src/index.js";
 
 describe("resolveInvocation", () => {
+  it("routes the acp-extension-zcode bin straight to server", () => {
+    // Editors spawn `acp-extension-zcode` with no subcommand; the symlink
+    // lands here with argv[1] keeping the bin name.
+    expect(resolveInvocation("acp-extension-zcode", [])).toEqual({ kind: "server" });
+    expect(resolveInvocation("acp-extension-zcode", ["--anything"])).toEqual({ kind: "server" });
+  });
+
   it("routes the legacy zcode-acp-server bin alias straight to server", () => {
-    // Editors spawn `zcode-acp-server` with no subcommand; the symlink lands
-    // here with argv[1] keeping the alias name.
+    // Existing editor configs keep working during the package rename.
     expect(resolveInvocation("zcode-acp-server", [])).toEqual({ kind: "server" });
     // Even if extra args sneak in, the alias is not a subcommand parser.
     expect(resolveInvocation("zcode-acp-server", ["--anything"])).toEqual({ kind: "server" });

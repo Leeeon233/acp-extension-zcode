@@ -4,13 +4,13 @@
  * Unified CLI entry (`zcode-acp`). Every operational surface is a subcommand;
  * bare invocation opens the interactive Martty TUI (ADR-0020). See docs/adr
  * 0007 for why the old `zcode-acp-hub` / `zcode-quota` bins were folded in
- * here and why `zcode-acp-server` remains as a bin alias pointing at this
- * same file.
+ * here and why `zcode-acp-server` remains as a compatibility bin alias
+ * pointing at this same file.
  *
- * The legacy alias is detected via argv[0]: npm/pnpm install bin names as
- * symlinks, so both `zcode-acp` and `zcode-acp-server` resolve to dist/cli.js
- * while Node keeps the invoked path in argv — basename tells us which name the
- * user (or editor config) actually typed.
+ * The stdio-server alias is detected via argv[0]: npm/pnpm install bin names
+ * as symlinks, so `acp-extension-zcode`, `zcode-acp`, and `zcode-acp-server`
+ * resolve to dist/cli.js while Node keeps the invoked path in argv — basename
+ * tells us which name the user (or editor config) actually typed.
  */
 
 import { basename } from "node:path";
@@ -36,13 +36,16 @@ export type Invocation =
 /**
  * Map (invoked name, argv) to a subcommand. Pure — exported for unit tests.
  *
- * `invokedAs` is basename(argv[1]); `zcode-acp-server` means we were spawned
- * by an editor config that expects the bridge to speak ACP on stdio with no
- * subcommand prefix. Bare `zcode-acp` opens the interactive Martty TUI;
- * `repl` stays accepted as the old spelling of `tui`.
+ * `invokedAs` is basename(argv[1]); `acp-extension-zcode` (and the legacy
+ * `zcode-acp-server`) means we were spawned by an editor config that expects
+ * the bridge to speak ACP on stdio with no subcommand prefix. Bare
+ * `zcode-acp` opens the interactive Martty TUI; `repl` stays accepted as the
+ * old spelling of `tui`.
  */
 export function resolveInvocation(invokedAs: string, argv: readonly string[]): Invocation {
-  if (invokedAs === "zcode-acp-server") return { kind: "server" };
+  if (invokedAs === "acp-extension-zcode" || invokedAs === "zcode-acp-server") {
+    return { kind: "server" };
+  }
   const sub = argv[0];
   if (sub === undefined) return { kind: "tui", explicit: false, check: false };
   if (sub === "repl" || sub === "tui") {
@@ -67,7 +70,7 @@ export function resolveInvocation(invokedAs: string, argv: readonly string[]): I
 
 const HELP_TEXT = `Usage: zcode-acp [command] [options]
 
-The single entry point for every zcode-acp-server surface. Bare invocation
+The single entry point for every acp-extension-zcode surface. Bare invocation
 opens the interactive Martty TUI (agent chat in this terminal).
 
 Commands:
@@ -83,8 +86,8 @@ Commands:
                     Normally spawned by the hub, not run by hand (needs
                     ZCODE_ACP_REMOTE=1 + ZCODE_ACP_REMOTE_TOKEN).
   server            The editor-facing ACP bridge over stdio (was
-                    zcode-acp-server; editors normally launch it via the bin
-                    alias without this subcommand).
+                    zcode-acp-server; editors normally launch it via the
+                    acp-extension-zcode bin without this subcommand).
   -h, --help        Show this help.
   --version         Show the package version.
 
@@ -148,15 +151,16 @@ async function main(): Promise<void> {
 }
 
 // Only auto-run when this file is the executed entry — directly
-// (`node dist/cli.js`) or through either bin symlink (`zcode-acp`,
-// `zcode-acp-server`), where argv[1] keeps the symlink path. Imports (the
-// test suite) fall through to a no-op.
+// (`node dist/cli.js`) or through a bin symlink (`acp-extension-zcode`,
+// `zcode-acp`, `zcode-acp-server`), where argv[1] keeps the symlink path.
+// Imports (the test suite) fall through to a no-op.
 const invokedDirectly = (() => {
   const entry = process.argv[1] ?? "";
   const name = basename(entry);
   return (
     entry.endsWith("cli.js") ||
     entry.endsWith("cli.ts") ||
+    name === "acp-extension-zcode" ||
     name === "zcode-acp" ||
     name === "zcode-acp-server"
   );

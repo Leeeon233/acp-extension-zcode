@@ -1,8 +1,8 @@
-# zcode-acp-server Architecture
+# acp-extension-zcode Architecture
 
 ## Overview
 
-`zcode-acp-server` bridges the headless ZCode CLI (`zcode app-server --stdio`) to
+`acp-extension-zcode` bridges the headless ZCode CLI (`zcode app-server --stdio`) to
 ACP (Agent Client Protocol) compatible editors. It is the translation layer
 between ZCode's internal JSON-RPC event stream and the standard ACP protocol.
 
@@ -13,7 +13,7 @@ application-client (Zed / JetBrains)
   session/update
        |
        v
-zcode-acp-server (stdio JSON-RPC ACP)
+acp-extension-zcode (stdio JSON-RPC ACP)
   |-- handlers/     session, extensions, dispatch, server-requests, io, slash, account
   |-- translators/    event-translator, projection-differ, tool-helpers
   |-- interaction/    adapter

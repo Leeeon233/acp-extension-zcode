@@ -30,7 +30,7 @@ const PACKAGE_VERSION: string = (() => {
 
 /** Agent identity advertised in the initialize response. */
 export const AGENT_INFO = {
-  name: "zcode-acp-server",
+  name: "acp-extension-zcode",
   title: "ZCode",
   version: PACKAGE_VERSION,
 } as const;

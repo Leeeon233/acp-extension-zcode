@@ -9,7 +9,8 @@
  * correlation, param validation, AbortSignal plumbing) is handled by the SDK.
  *
  * Invoked directly (`node dist/index.js`) or via the Unified CLI's `server`
- * subcommand / the `zcode-acp-server` bin alias (both resolve to `dist/cli.js`).
+ * subcommand / the `acp-extension-zcode` bin (both resolve to `dist/cli.js`;
+ * the legacy `zcode-acp-server` alias remains).
  */
 
 import { Readable, Writable } from "node:stream";
@@ -42,6 +43,7 @@ import { loadEarlier } from "./handlers/replay.js";
 import { resendPendingInteractions } from "./handlers/server-requests.js";
 import { loadPluginCommands } from "./config/plugin-commands.js";
 import { loadSkillCommands } from "./config/skill-discovery.js";
+import { getLodyRateLimits, LODY_EXTENSION_METHODS } from "./lody.js";
 import { trackConnections } from "./remote/broadcast.js";
 import { parseRemoteConfig } from "./remote/config.js";
 import { startRemoteEndpoint, type RemoteEndpointHandle } from "./remote/endpoint.js";
@@ -155,6 +157,18 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
     acp
       .agent({ name: AGENT_INFO.name })
       .onRequest("initialize", (ctx) => server.initialize(ctx.params, ctx.client))
+      .onRequest("authenticate", (ctx) => server.authenticate(ctx.params))
+      .onRequest(
+        LODY_EXTENSION_METHODS.rateLimitsGet,
+        z
+          .object({
+            sessionId: z.string().optional(),
+            accountId: z.string().optional(),
+            modelId: z.string().optional(),
+          })
+          .passthrough(),
+        () => getLodyRateLimits(),
+      )
       .onRequest("session/new", async (ctx) => {
         const result = await newSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(result.sessionId)) {
@@ -219,7 +233,7 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       // session/steer, session/rewind, session/rewindCascade were removed in
       // zcode app-server 0.16+ (steer/rewind moved to the v4 conversation API);
       // the bridge dropped its passthroughs accordingly.
-      .onRequest("session/fork", extParams, (ctx) => fork(server, ctx.params))
+      .onRequest("session/fork", extParams, (ctx) => fork(server, ctx.params, ctx.client))
       .onRequest("session/goal", extParams, (ctx) => goal(server, ctx.params))
       .onRequest("session/compact", extParams, (ctx) =>
         compact(server, ctx.params, server.clients.broadcast()),

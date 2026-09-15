@@ -2,7 +2,7 @@
 # release PR (version bump + CHANGELOG); merging it tags the release and
 # publishes to npm via trusted publishing (OIDC — no NPM_TOKEN secret).
 # One-time manual step: add this repo + this workflow filename as a trusted
-# publisher on npmjs.com for the zcode-acp-server package.
+# publisher on npmjs.com for the acp-extension-zcode package.
 name: Release
 
 on:

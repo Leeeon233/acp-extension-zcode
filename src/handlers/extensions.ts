@@ -13,11 +13,13 @@
  * setModel rerouting through updateRuntimeModelConfig.
  */
 
+import { randomUUID } from "node:crypto";
 import type * as acp from "@agentclientprotocol/sdk";
 
 import { emitInitialUsage } from "../config/model-cache.js";
 import { applyModelSwitch } from "../config/runtime-model.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
+import { withLodyActivity } from "../lody.js";
 import { ProjectionDiffer } from "../translators/projection-differ.js";
 import { clientConnectionRoot, log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
@@ -47,10 +49,44 @@ interface ExtensionParams {
   [key: string]: unknown;
 }
 
+/**
+ * ACP spec `session/fork` params (the ZCode extension historically accepted
+ * only `sessionId` + `target`/`checkpointId`). The spec fields are optional
+ * here so both the old extension call and a spec/Lody client parse.
+ */
+interface ForkParams extends ExtensionParams {
+  /** Absolute working directory requested for the fork, if the client sent one. */
+  cwd?: string;
+  /** ACP additional workspace roots; the backend fork inherits the source. */
+  additionalDirectories?: string[];
+  /** ACP MCP servers; the backend fork inherits the source's server set. */
+  mcpServers?: unknown[];
+}
+
 type Result = Record<string, unknown>;
 
-/** session/fork → zcode session/fork: branch a new session from a checkpoint. */
-export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
+/**
+ * session/fork → zcode session/fork: branch a new session from a checkpoint.
+ *
+ * Two callers share this route:
+ *   - ACP-spec clients (Lody, Zed unstable fork) send `{ sessionId, cwd,
+ *     mcpServers, _meta }` and read the returned `sessionId`.
+ *   - ZCode extension clients (the `/fork` slash command) send
+ *     `{ sessionId, target | checkpointId }` and read `forkedSessionId`.
+ *
+ * The backend forks at a checkpoint and returns `forkedSessionId`; we publish
+ * both spellings plus the initial modes/configOptions so spec clients can
+ * adopt the new session without a follow-up resume. `cwd`, additional roots
+ * and MCP servers are intentionally not overlaid: the backend fork inherits
+ * the source session's workspace/MCP setup, matching how the bridge treats
+ * `session/resume` client cwd as non-authoritative.
+ */
+export async function fork(
+  server: ZcodeAcpServer,
+  params: ForkParams,
+  cx?: acp.AgentContext,
+): Promise<Result> {
+  const acpSid = params.sessionId;
   const zcodeSid = await resolveSidOrThrow(server, params);
   const backend = server.ensureBackend();
   const resp = await backend.request(
@@ -62,13 +98,36 @@ export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Pro
   if (resp.error) throw new Error(`fork failed: ${resp.error.message}`);
   // 3.3.0 returns `forkedSessionId` (not `sessionId`) for the new session id.
   // Register it so subsequent ACP calls targeting the fork can resolve the sid.
-  const result = (resp.result ?? {}) as { forkedSessionId?: string };
-  if (result.forkedSessionId) {
-    server.registerSession(result.forkedSessionId, result.forkedSessionId);
-    server.ensureBackgroundListener(result.forkedSessionId);
-  }
-  log(`session/fork → ${result.forkedSessionId ?? "?"}`);
-  return result;
+  const result = (resp.result ?? {}) as { forkedSessionId?: string; sessionId?: string };
+  const forkedSessionId = result.forkedSessionId ?? result.sessionId;
+  if (!forkedSessionId) throw new Error("fork failed: backend returned no session id");
+
+  // The fork is a real backend session; use its id as the ACP session id (the
+  // same convention the ZCode extension and session/list already use).
+  server.registerSession(forkedSessionId, forkedSessionId);
+  server.ensureBackgroundListener(forkedSessionId);
+  server.markBackendLoaded(forkedSessionId);
+  const sourceCwd = server.sessionCwds.get(acpSid);
+  if (sourceCwd) server.sessionCwds.set(forkedSessionId, sourceCwd);
+
+  const modes = await buildModes(server, forkedSessionId);
+  server.lastMode.set(forkedSessionId, modes.currentModeId);
+  log(`session/fork ${acpSid} → ${forkedSessionId}`);
+
+  return {
+    // Preserve any additional backend fork fields the extension exposed before.
+    ...result,
+    // ACP spec response shape (ForkSessionResponse).
+    sessionId: forkedSessionId,
+    // Back-compat for the bridge's own `/fork` extension clients.
+    forkedSessionId,
+    modes,
+    configOptions: await buildConfigOptions(
+      server,
+      forkedSessionId,
+      cx ? clientConnectionRoot(cx) : undefined,
+    ),
+  };
 }
 
 /** session/goal → zcode session/goal: read/set/replace/clear/pause/resume the goal. */
@@ -107,36 +166,64 @@ export async function compact(
 ): Promise<Result> {
   const acpSid = params.sessionId;
   const zcodeSid = await resolveSidOrThrow(server, params);
-  const resp = await server
-    .ensureBackend()
-    .request(server.nextId(), "session/compact", { sessionId: zcodeSid }, 30000);
-  if (resp.error) throw new Error(`compact failed: ${resp.error.message}`);
-  // compact's internal AI turn (read history → LLM compress → write back) can
-  // take minutes; expectLock=true avoids the startup-delay false-success window.
-  // timeout is in MILLISECONDS (Date.now()-based), not seconds — Python's
-  // timeout=300 becomes 300000. A bare 300 expires on the first probe sleep,
-  // making compact return "✓" while the internal turn lock is still held.
-  const released = await waitForTurnIdle(server, zcodeSid, 300_000, "session/goal", true);
-  if (released) {
-    log("session/compact → ok (lock released)");
-  } else {
-    warn("session/compact → ⚠ lock wait timeout (backend may still be compacting)");
-  }
-  if (released) {
-    // Refresh usage so the UI reflects the reduced contextUsed post-compact.
-    // Ensure a differ exists (compact may be the first action on a fresh session)
-    // and sync its usage baseline so the next turn won't re-emit the same value.
-    let differ = server.differs.get(zcodeSid);
-    if (!differ) {
-      differ = new ProjectionDiffer();
-      server.differs.set(zcodeSid, differ);
+  const activityId = `lody_compact_${randomUUID().slice(0, 12)}`;
+  const activityStartedAt = Date.now();
+  let activityStatus: "completed" | "failed" = "failed";
+  await server.notifyByZcodeSid(zcodeSid, {
+    sessionUpdate: "tool_call",
+    toolCallId: activityId,
+    title: "Context compaction",
+    kind: "other",
+    status: "in_progress",
+    _meta: withLodyActivity({}, { version: 1, kind: "context_compaction" }),
+  });
+  try {
+    const resp = await server
+      .ensureBackend()
+      .request(server.nextId(), "session/compact", { sessionId: zcodeSid }, 30000);
+    if (resp.error) throw new Error(`compact failed: ${resp.error.message}`);
+    // compact's internal AI turn (read history → LLM compress → write back) can
+    // take minutes; expectLock=true avoids the startup-delay false-success window.
+    // timeout is in MILLISECONDS (Date.now()-based), not seconds — Python's
+    // timeout=300 becomes 300000. A bare 300 expires on the first probe sleep,
+    // making compact return "✓" while the internal turn lock is still held.
+    const released = await waitForTurnIdle(server, zcodeSid, 300_000, "session/goal", true);
+    if (released) {
+      log("session/compact → ok (lock released)");
+    } else {
+      warn("session/compact → ⚠ lock wait timeout (backend may still be compacting)");
     }
-    await emitInitialUsage(server, cx, acpSid, zcodeSid, differ);
+    if (released) {
+      // Refresh usage so the UI reflects the reduced contextUsed post-compact.
+      // Ensure a differ exists (compact may be the first action on a fresh session)
+      // and sync its usage baseline so the next turn won't re-emit the same value.
+      let differ = server.differs.get(zcodeSid);
+      if (!differ) {
+        differ = new ProjectionDiffer();
+        server.differs.set(zcodeSid, differ);
+      }
+      await emitInitialUsage(server, cx, acpSid, zcodeSid, differ);
+      activityStatus = "completed";
+    }
+    // Surface the lock-timeout to the slash-command path so it can warn the user
+    // (the ACP method path ignores this non-standard flag). Mirrors Python's
+    // "⚠ 压缩超时" branch in _handle_slash_command.
+    return { ...((resp.result ?? {}) as Result), __lockTimeout: !released };
+  } finally {
+    await server.notifyByZcodeSid(zcodeSid, {
+      sessionUpdate: "tool_call_update",
+      toolCallId: activityId,
+      status: activityStatus,
+      _meta: withLodyActivity(
+        {},
+        {
+          version: 1,
+          kind: "context_compaction",
+          durationMs: Math.max(0, Date.now() - activityStartedAt),
+        },
+      ),
+    });
   }
-  // Surface the lock-timeout to the slash-command path so it can warn the user
-  // (the ACP method path ignores this non-standard flag). Mirrors Python's
-  // "⚠ 压缩超时" branch in _handle_slash_command.
-  return { ...((resp.result ?? {}) as Result), __lockTimeout: !released };
 }
 
 /** session/cancelBackgroundTask → zcode session/cancelBackgroundTask. */

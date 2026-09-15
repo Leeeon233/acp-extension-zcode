@@ -36,6 +36,7 @@ import { randomUUID } from "node:crypto";
 import type { EventListener } from "../backend/client.js";
 import type { ZcodeEvent } from "../backend/types.js";
 import { messages } from "../i18n.js";
+import { buildLodyTaskMeta, toLodyTaskStatus, withLodyMeta } from "../lody.js";
 import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 
@@ -69,6 +70,12 @@ interface TrackedTask {
   acpCallId: string;
   /** Description shown in the card title (from the launch `session.updated`). */
   description: string;
+  /** Lody task kind; subagent for Agent/Task, background for Bash/other. */
+  lodyKind: "subagent" | "background";
+  /** Canonical provider tool name, when the backend reports one. */
+  toolName?: string;
+  /** Task start timestamp (backend ISO string), for Lody task metadata. */
+  startedAt?: string;
   /** Last status we advertised to the client (to skip no-op updates). */
   lastStatus: string;
   /** messageId for the background-result message stream (allocated lazily). */
@@ -192,12 +199,20 @@ export class BackgroundTaskListener implements EventListener {
       const launchToolCallId = p.toolCallId;
       const reusesLaunchCard =
         !!launchToolCallId && this.server.terminalSentData.has(launchToolCallId);
+      const lodyKind =
+        p.toolName === "Agent" || p.toolName === "Task"
+          ? ("subagent" as const)
+          : ("background" as const);
+      const toolName = p.toolName ?? (reusesLaunchCard ? "Bash" : undefined);
       if (reusesLaunchCard) {
         task = {
           acpCallId: launchToolCallId!,
           sourceToolCallId: launchToolCallId!,
           reusesLaunchCard: true,
           description: p.description ?? "",
+          lodyKind,
+          ...(toolName ? { toolName } : {}),
+          ...(p.startedAt ? { startedAt: p.startedAt } : {}),
           lastStatus: "",
         };
         this.tasks.set(taskId, task);
@@ -215,17 +230,35 @@ export class BackgroundTaskListener implements EventListener {
         acpCallId: `bg_${randomUUID().slice(0, 12)}`,
         reusesLaunchCard: false,
         description: p.description ?? "",
+        lodyKind,
+        ...(toolName ? { toolName } : {}),
+        ...(p.startedAt ? { startedAt: p.startedAt } : {}),
         lastStatus: "",
       };
       this.tasks.set(taskId, task);
-      const meta: Record<string, unknown> = {
-        backgroundTask: {
-          taskId,
-          agentId: p.terminalId ?? undefined,
-          outputPath: p.outputPath ?? undefined,
-          sourceToolCallId: p.toolCallId ?? undefined,
+      const taskMeta = buildLodyTaskMeta({
+        taskId,
+        kind: task.lodyKind,
+        status: toLodyTaskStatus(status),
+        description: task.description,
+        actor: task.lodyKind === "subagent" ? "ZCode subagent" : "ZCode background task",
+        parentToolCallId: p.toolCallId,
+        startedAt: p.startedAt ?? Date.now(),
+      });
+      const meta = withLodyMeta(
+        {
+          backgroundTask: {
+            taskId,
+            agentId: p.terminalId ?? undefined,
+            outputPath: p.outputPath ?? undefined,
+            sourceToolCallId: p.toolCallId ?? undefined,
+          },
         },
-      };
+        {
+          ...(task.toolName ? { toolName: task.toolName } : {}),
+          task: taskMeta,
+        },
+      );
       const ok = await this.server.notifyByZcodeSid(this.zcodeSid, {
         sessionUpdate: "tool_call",
         toolCallId: task.acpCallId,
@@ -258,12 +291,32 @@ export class BackgroundTaskListener implements EventListener {
     // Skip no-op status updates (same as last advertised).
     if (task.lastStatus === acpStatus && !task.reusesLaunchCard) return;
 
-    const meta: Record<string, unknown> = {
-      backgroundTask: { taskId: p.taskId },
-    };
-    if (p.outputPath) (meta.backgroundTask as Record<string, unknown>)["outputPath"] = p.outputPath;
-
     const isTerminal = acpStatus === "completed" || acpStatus === "failed";
+    const taskMeta = buildLodyTaskMeta({
+      taskId: p.taskId,
+      kind: task.lodyKind,
+      status: toLodyTaskStatus(acpStatus),
+      description: task.description,
+      actor: task.lodyKind === "subagent" ? "ZCode subagent" : "ZCode background task",
+      parentToolCallId: task.sourceToolCallId ?? p.toolCallId,
+      startedAt: task.startedAt ?? p.startedAt ?? Date.now(),
+      endedAt: isTerminal ? (p.completedAt ?? Date.now()) : undefined,
+      summary: isTerminal ? (p.outputTail ?? p.stdoutTail) : undefined,
+      error:
+        acpStatus === "failed"
+          ? p.status === "cancelled"
+            ? "cancelled"
+            : (p.stderrTail ?? "background task failed")
+          : undefined,
+    });
+    const meta: Record<string, unknown> = withLodyMeta(
+      { backgroundTask: { taskId: p.taskId } },
+      {
+        ...(task.toolName ? { toolName: task.toolName } : {}),
+        task: taskMeta,
+      },
+    );
+    if (p.outputPath) (meta.backgroundTask as Record<string, unknown>)["outputPath"] = p.outputPath;
 
     // Background Bash closing a launch terminal card: stream final output +
     // emit terminal_exit so Zed's terminal UI finalises. The terminal_output
@@ -291,7 +344,10 @@ export class BackgroundTaskListener implements EventListener {
           await this.server.notifyByZcodeSid(this.zcodeSid, {
             sessionUpdate: "tool_call_update",
             toolCallId: task.sourceToolCallId,
-            _meta: { terminal_output: { terminal_id: task.sourceToolCallId, data: delta } },
+            _meta: withLodyMeta(
+              { terminal_output: { terminal_id: task.sourceToolCallId, data: delta } },
+              { ...(task.toolName ? { toolName: task.toolName } : {}) },
+            ),
           });
         }
       }
@@ -377,21 +433,39 @@ export class BackgroundTaskListener implements EventListener {
   async markCancelled(taskId: string): Promise<void> {
     const task = this.tasks.get(taskId);
     if (!task) return;
+    const cancelledTaskMeta = buildLodyTaskMeta({
+      taskId,
+      kind: task.lodyKind,
+      status: "failed",
+      description: task.description,
+      actor: task.lodyKind === "subagent" ? "ZCode subagent" : "ZCode background task",
+      parentToolCallId: task.sourceToolCallId,
+      startedAt: task.startedAt ?? Date.now(),
+      endedAt: Date.now(),
+      error: "cancelled",
+    });
+    const lodyTaskMetaPatch = {
+      ...(task.toolName ? { toolName: task.toolName } : {}),
+      task: cancelledTaskMeta,
+    };
     if (task.reusesLaunchCard && task.sourceToolCallId) {
       await this.server.notifyByZcodeSid(this.zcodeSid, {
         sessionUpdate: "tool_call_update",
         toolCallId: task.sourceToolCallId,
         status: "failed",
         content: [{ type: "terminal", terminalId: task.sourceToolCallId }],
-        _meta: {
-          backgroundTask: { taskId, cancelled: true },
-          claudeCode: { toolName: "Bash" },
-          terminal_exit: {
-            terminal_id: task.sourceToolCallId,
-            exit_code: 1,
-            signal: null,
+        _meta: withLodyMeta(
+          {
+            backgroundTask: { taskId, cancelled: true },
+            claudeCode: { toolName: task.toolName ?? "Bash" },
+            terminal_exit: {
+              terminal_id: task.sourceToolCallId,
+              exit_code: 1,
+              signal: null,
+            },
           },
-        },
+          lodyTaskMetaPatch,
+        ),
       });
       this.server.terminalSentData.delete(task.sourceToolCallId);
     } else {
@@ -399,7 +473,7 @@ export class BackgroundTaskListener implements EventListener {
         sessionUpdate: "tool_call_update",
         toolCallId: task.acpCallId,
         status: "failed",
-        _meta: { backgroundTask: { taskId, cancelled: true } },
+        _meta: withLodyMeta({ backgroundTask: { taskId, cancelled: true } }, lodyTaskMetaPatch),
       });
     }
     this.tasks.delete(taskId);

@@ -24,6 +24,7 @@ import {
   TOOL_KIND_MAP,
 } from "../translators/tool-helpers.js";
 import { messages } from "../i18n.js";
+import { buildLodyTaskMeta, toLodyTaskStatus, withLodyMeta, withLodyToolName } from "../lody.js";
 import type { InternalEvent } from "../translators/types.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { clientConnectionRoot, warn } from "../utils.js";
@@ -56,6 +57,18 @@ function hintSandboxEperm(server: ZcodeAcpServer, ev: InternalEvent): void {
 /** Test hook: re-arm the one-shot EPERM hint. */
 export function resetSandboxEpermHintForTest(): void {
   sandboxEpermHinted = false;
+}
+
+/** Best-effort human description for a subagent tool call. */
+function toolDescription(input: unknown, title: string): string {
+  if (input && typeof input === "object" && !Array.isArray(input)) {
+    const record = input as Record<string, unknown>;
+    for (const key of ["description", "prompt", "task", "name"]) {
+      const value = record[key];
+      if (typeof value === "string" && value.trim()) return value;
+    }
+  }
+  return title;
 }
 
 /** Dispatch one internal event to the ACP client as a session/update. */
@@ -180,10 +193,25 @@ function dispatchToolCallNew(
 ): Promise<void> {
   const termSupported =
     server.supportsTerminalOutput() && (ev.tool === "Bash" || ev.tool === "bash");
-  const meta: Record<string, unknown> = { claudeCode: { toolName: ev.tool } };
+  let meta: Record<string, unknown> = withLodyToolName(
+    { claudeCode: { toolName: ev.tool } },
+    ev.tool,
+  );
   if (termSupported) meta["terminal_info"] = { terminal_id: ev.callId };
   // Mark sub-agent dispatch cards so editors can badge them from creation.
-  if (ev.tool === "Agent" || ev.tool === "Task") meta["subagent"] = true;
+  if (ev.tool === "Agent" || ev.tool === "Task") {
+    meta["subagent"] = true;
+    meta = withLodyMeta(meta, {
+      task: buildLodyTaskMeta({
+        taskId: ev.callId,
+        kind: "subagent",
+        status: toLodyTaskStatus(ev.status),
+        description: toolDescription(ev.input, ev.title),
+        actor: "ZCode subagent",
+        startedAt: Date.now(),
+      }),
+    });
+  }
 
   const update: acp.SessionUpdate = {
     sessionUpdate: "tool_call",
@@ -236,8 +264,10 @@ function dispatchToolCallUpdate(
     toolCallId: ev.callId,
     status: ev.status,
   };
-  const meta: Record<string, unknown> = {};
-  if (toolName) meta["claudeCode"] = { toolName };
+  let meta: Record<string, unknown> = {};
+  if (toolName) {
+    meta = withLodyToolName({ claudeCode: { toolName } }, toolName);
+  }
   // Sub-agent (Agent/Task tool) result: surface structured metadata so editors
   // can badge the card (agentId, background flag, token/tool/time usage). The
   // raw result text is left in `content` for the user-facing view.
@@ -247,6 +277,22 @@ function dispatchToolCallUpdate(
   ) {
     const sub = parseSubagentMetadata(ev.rawResult);
     if (sub) meta["subagent"] = sub;
+    meta = withLodyMeta(meta, {
+      task: buildLodyTaskMeta({
+        taskId: ev.callId,
+        kind: "subagent",
+        status: toLodyTaskStatus(ev.status),
+        actor: "ZCode subagent",
+        endedAt: Date.now(),
+        usage: sub
+          ? {
+              ...(sub.tokens !== undefined ? { totalTokens: sub.tokens } : {}),
+              ...(sub.toolUses !== undefined ? { toolUses: sub.toolUses } : {}),
+              ...(sub.durationMs !== undefined ? { durationMs: sub.durationMs } : {}),
+            }
+          : undefined,
+      }),
+    });
   }
   if (ev.output !== undefined) update.rawOutput = ev.output;
   if (ev.diffContent && ev.diffContent.length > 0) {
@@ -314,7 +360,10 @@ async function dispatchTerminalUpdate(
       await sendSessionUpdate(cx, acpSid, {
         sessionUpdate: "tool_call_update",
         toolCallId: ev.callId,
-        _meta: { terminal_output: { terminal_id: ev.callId, data: delta } },
+        _meta: withLodyToolName(
+          { terminal_output: { terminal_id: ev.callId, data: delta } },
+          toolName,
+        ),
       });
     }
   }
@@ -342,10 +391,13 @@ async function dispatchTerminalUpdate(
       toolCallId: ev.callId,
       status: ev.status,
       content: [{ type: "terminal", terminalId: ev.callId }],
-      _meta: {
-        claudeCode: { toolName },
-        terminal_exit: { terminal_id: ev.callId, exit_code: exitCode, signal: null },
-      },
+      _meta: withLodyToolName(
+        {
+          claudeCode: { toolName },
+          terminal_exit: { terminal_id: ev.callId, exit_code: exitCode, signal: null },
+        },
+        toolName,
+      ),
     };
     await sendSessionUpdate(cx, acpSid, exitUpdate);
     // Terminal session ended — clear the snapshot so a future tool reusing this
