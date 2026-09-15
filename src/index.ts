@@ -43,6 +43,7 @@ import { loadEarlier } from "./handlers/replay.js";
 import { resendPendingInteractions } from "./handlers/server-requests.js";
 import { loadPluginCommands } from "./config/plugin-commands.js";
 import { loadSkillCommands } from "./config/skill-discovery.js";
+import { getLodyRateLimits, LODY_EXTENSION_METHODS } from "./lody.js";
 import { trackConnections } from "./remote/broadcast.js";
 import { parseRemoteConfig } from "./remote/config.js";
 import { startRemoteEndpoint, type RemoteEndpointHandle } from "./remote/endpoint.js";
@@ -157,6 +158,17 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .agent({ name: AGENT_INFO.name })
       .onRequest("initialize", (ctx) => server.initialize(ctx.params, ctx.client))
       .onRequest("authenticate", (ctx) => server.authenticate(ctx.params))
+      .onRequest(
+        LODY_EXTENSION_METHODS.rateLimitsGet,
+        z
+          .object({
+            sessionId: z.string().optional(),
+            accountId: z.string().optional(),
+            modelId: z.string().optional(),
+          })
+          .passthrough(),
+        () => getLodyRateLimits(),
+      )
       .onRequest("session/new", async (ctx) => {
         const result = await newSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(result.sessionId)) {

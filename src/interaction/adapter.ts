@@ -528,6 +528,7 @@ export function buildAskUserElicitationForm(
   sessionId: string;
   toolCallId?: string;
   message: string;
+  _meta?: Record<string, unknown>;
   requestedSchema: {
     type: "object";
     properties: Record<string, unknown>;
@@ -536,14 +537,27 @@ export function buildAskUserElicitationForm(
 } {
   const questions = params.questions?.length ? params.questions : (params.input?.questions ?? []);
   const properties: Record<string, unknown> = {};
+  const lodyQuestions: Array<Record<string, unknown>> = [];
   for (let i = 0; i < questions.length; i++) {
     const q = questions[i];
     if (!q || typeof q.question !== "string") continue;
     const key = `q_${i}`;
-    const labels = (q.options ?? [])
-      .map((o) => o.label ?? o.value ?? "")
-      .filter((l) => l.length > 0);
+    const optionMetas = (q.options ?? [])
+      .map((o) => {
+        const label = o.label ?? o.value ?? "";
+        return label ? { label, ...(o.description ? { description: o.description } : {}) } : null;
+      })
+      .filter((o): o is { label: string; description?: string } => o !== null);
+    const labels = optionMetas.map((o) => o.label);
     if (labels.length === 0) continue;
+    lodyQuestions.push({
+      id: key,
+      question: q.question,
+      header: q.header ?? q.question,
+      options: optionMetas,
+      multiSelect: q.multiSelect === true,
+      allowCustomAnswer: true,
+    });
     // Titled enum option for "skip": const carries the sentinel value the
     // parser recognizes; title is what the client renders in the dropdown.
     const skipOption = { const: ELICIT_SKIP, title: messages().askSkipQuestionTitle };
@@ -570,6 +584,9 @@ export function buildAskUserElicitationForm(
       title: q.multiSelect
         ? "↳    or add a custom value (combined with the selection)"
         : "↳    or type a custom value (overrides the selection)",
+      // Lody's elicitation parser associates the companion free-text field
+      // with its question so custom answers stay paired in the UI.
+      _meta: { lody: { elicitation: { version: 1, customAnswerFor: key } } },
     };
   }
   // The question text already appears as each field's `title` (its label), so
@@ -586,6 +603,7 @@ export function buildAskUserElicitationForm(
     sessionId: string;
     toolCallId?: string;
     message: string;
+    _meta?: Record<string, unknown>;
     requestedSchema: {
       type: "object";
       properties: Record<string, unknown>;
@@ -599,6 +617,16 @@ export function buildAskUserElicitationForm(
     // blank free-text) without being blocked by validation.
     requestedSchema: { type: "object", properties, required: [] },
   };
+  if (lodyQuestions.length > 0) {
+    form._meta = {
+      lody: {
+        elicitation: {
+          version: 1,
+          questions: lodyQuestions,
+        },
+      },
+    };
+  }
   if (toolCallId) form.toolCallId = toolCallId;
   return form;
 }

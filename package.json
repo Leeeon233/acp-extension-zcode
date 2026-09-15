@@ -51,6 +51,7 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.3.0",
+    "acp-extension-core": "^0.1.5",
     "ws": "^8.21.3",
     "zcode-acp-martty": "0.2.39-zcode.3"
   },

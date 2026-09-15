@@ -52,6 +52,7 @@ import {
   recordMaterializedSession,
   rememberLazySession,
 } from "../lazy-sessions.js";
+import { emitLodyRateLimitsUpdate, emitLodyUsageUpdate } from "../lody.js";
 import { refreshTerminalTabTitle } from "../terminal-title.js";
 import {
   buildDiffContent,
@@ -1510,6 +1511,18 @@ export async function runOneTurn(
           gateArmed,
         );
 
+        // Publish Lody's cumulative per-model accounting update (best-effort,
+        // fire-and-forget so a quota/model lookup never delays the turn).
+        if (turn.lodyUsageRaw) {
+          void emitLodyUsageUpdate(
+            server,
+            acpSid,
+            zcodeSid,
+            turn.foregroundExecutionId ?? `turn-${String(requestId)}`,
+            turn.lodyUsageRaw,
+          );
+        }
+
         // Auto-compact: if context usage exceeds the threshold, compact before
         // returning so the next prompt has room. Configured via
         // ZCODE_ACP_AUTO_COMPACT_THRESHOLD (absolute token count; 0/unset =
@@ -1629,6 +1642,9 @@ export async function runOneTurn(
     // Turn end = quota refresh point (ADR-0021): usage moved, the dock should
     // catch up immediately instead of waiting for the 60s interval.
     void forceRefreshQuota();
+    // Lody clients consume account quota through `_lody/rate_limits/update`;
+    // the helper throttles and skips when no client is attached.
+    void emitLodyRateLimitsUpdate(server);
     // Report "running" only while no other turn for the session took over
     // (preempt): the preempting turn's own running:true must survive.
     const stillBusy = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
@@ -3069,6 +3085,7 @@ export async function runEventTurn(
       if (fge) turn.foregroundExecutionId = fge;
     }
     const internalEvents = translator.translate(ev);
+    if (translator.turnUsage) turn.lodyUsageRaw = translator.turnUsage;
     // Capture the turn-start timestamp for the thinking-phase hint above.
     // Done after translate so the flag flip on the turn.started event is
     // observed on the same iteration that processes it.
