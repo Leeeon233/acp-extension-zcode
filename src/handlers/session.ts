@@ -122,6 +122,24 @@ function authoritativeSessionCwd(server: ZcodeAcpServer, acpSid: string): string
 }
 
 /**
+ * Record a session's client-provided MCP servers as session-lifetime state.
+ * The backend does not persist mcpServers with the session record, so the
+ * bridge must remember them and re-send on every backend load (#193). An
+ * empty/absent array is ignored, NOT a clear: the SDK makes `mcpServers: []`
+ * mandatory on session/load, and wiping on it would drop a set declared at
+ * session/new.
+ */
+function rememberSessionMcpServers(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  mcpServers?: acp.McpServer[],
+): void {
+  if (mcpServers && mcpServers.length > 0) {
+    server.sessionMcpServers.set(acpSid, mcpServers);
+  }
+}
+
+/**
  * Extract the backend-recorded workspace from a session/resume result
  * (`result.session.workspace.workspacePath`). This is the session's own
  * project directory as the backend sees it — the value remote file access
@@ -273,6 +291,7 @@ export async function newSession(
         : (sanitizeClientCwd(params.cwd) ?? process.cwd());
       server.pendingSessions.set(bindSid, { cwd, mcpServers: params.mcpServers });
       server.sessionCwds.set(bindSid, cwd);
+      rememberSessionMcpServers(server, bindSid, params.mcpServers);
       // Remote-created: discovery must advertise it in the ACTIVE list for
       // as long as this bridge lives (a phone has no editor-side session
       // storage of its own; the window closing ends the listing).
@@ -362,6 +381,7 @@ export async function newSession(
   // Persists past materialization (pendingSessions is cleared on first use) so
   // the remote discovery payload can still label the workspace.
   server.sessionCwds.set(acpSid, cwd);
+  rememberSessionMcpServers(server, acpSid, params.mcpServers);
   // Durable alias so the placeholder survives a bridge restart and session/
   // resume can still resolve it (best-effort; failures are swallowed inside
   // the store). Serve-mode mints are remote-driven — advertise them.
@@ -490,7 +510,8 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
       // Serve mode pins to its process cwd even here (belt and suspenders —
       // the guard above already proved the record's cwd matches).
       const cwd = server.serveMode ? process.cwd() : record.cwd;
-      pending = { cwd };
+      const mcpServers = server.sessionMcpServers.get(acpSid);
+      pending = { cwd, mcpServers };
       server.pendingSessions.set(acpSid, pending);
       if (cwd !== "/") server.sessionCwds.set(acpSid, cwd);
     }
@@ -524,6 +545,14 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
     if (pending.mcpServers && pending.mcpServers.length > 0) {
       createParams.mcpServers = pending.mcpServers;
       log(`session/create carrying ${pending.mcpServers.length} client MCP server(s)`);
+    } else {
+      // Materialization after lazy recovery: the pending entry may lack the
+      // servers while the session-lifetime map still has them.
+      const remembered = server.sessionMcpServers.get(acpSid);
+      if (remembered) {
+        createParams.mcpServers = remembered;
+        log(`session/create carrying ${remembered.length} remembered client MCP server(s)`);
+      }
     }
     const resp = await backend.request(server.nextId(), "session/create", createParams, 15000);
     if (resp.error) {
@@ -804,10 +833,11 @@ export async function resumeSession(
     };
     // ACP session/resume may also carry mcpServers; the backend's resume
     // schema accepts the same array shape (verified: an unknown key would be
-    // rejected before the session lookup).
-    if (params.mcpServers && params.mcpServers.length > 0) {
-      zcParams.mcpServers = params.mcpServers;
-    }
+    // rejected before the session lookup). Remembered as session-lifetime
+    // state so later reloads keep re-sending them (#193).
+    rememberSessionMcpServers(server, acpSid, params.mcpServers);
+    const storedMcp = server.sessionMcpServers.get(acpSid);
+    if (storedMcp) zcParams.mcpServers = storedMcp;
     // Push the provider registry BEFORE resume: a resumed session may carry a
     // third-party model in its history, and the backend needs the provider
     // registered to even process the resume turn.
@@ -943,6 +973,10 @@ export async function resumeIntoSession(
     const outcome = await resumePreservingModel(server, {
       sessionId: zcodeTarget,
       workspace: workspaceFor(cwd),
+      // Session-lifetime MCP set keeps riding every resume (#193).
+      ...(server.sessionMcpServers.get(acpSid)
+        ? { mcpServers: server.sessionMcpServers.get(acpSid) }
+        : {}),
     });
     settledHistory = outcome.history;
     server.markBackendLoaded(acpSid);
@@ -1028,6 +1062,11 @@ export async function loadSession(
       sessionId: zcodeSid,
       workspace: workspaceFor(cwd),
     };
+    // Same mcpServers contract as resume: the client may re-declare them on
+    // load; a stored set keeps riding along when it doesn't (#193).
+    rememberSessionMcpServers(server, acpSid, params.mcpServers);
+    const storedMcp = server.sessionMcpServers.get(acpSid);
+    if (storedMcp) zcParams.mcpServers = storedMcp;
     // Push the provider registry BEFORE resume: a loaded session may carry a
     // third-party model in its history, and the backend needs the provider
     // registered to process it.
@@ -2477,6 +2516,13 @@ export async function reloadBackendSession(
     sessionId: zcodeSid,
     workspace: workspaceFor(cwd),
   };
+  // Eviction/respawn reload: the backend lost the per-load mcpServers runtime
+  // config with its resident session — re-send or the tools vanish (#193).
+  const reloadMcp = server.sessionMcpServers.get(acpSid);
+  if (reloadMcp) {
+    zcParams.mcpServers = reloadMcp;
+    log(`session/resume (reload) carrying ${reloadMcp.length} client MCP server(s)`);
+  }
   // Same pre-resume steps as the ACP resume/load handlers: register the
   // provider registry (a resumed session's history references a model the
   // fresh backend can't process until its provider is registered — sends
@@ -2527,6 +2573,12 @@ async function resumePreservingModel(
   const zcodeSid = String(zcParams["sessionId"] ?? "");
   const inFlight = server.resumeInFlight.get(zcodeSid) as Promise<ResumeOutcome> | undefined;
   if (inFlight) {
+    // Known limitation (#193): the joiner rides the performer's params as
+    // frozen at flight start, so mcpServers the joiner just remembered are
+    // NOT delivered by this resume. Window: only right after a bridge
+    // restart (map empty) with two clients loading the same session; the
+    // next eviction reload re-sends the set. Re-issuing a second resume
+    // here would break the single-flight dehydration guarantee.
     const shared = await inFlight; // rethrows the first flight's failure
     return { ...shared, performed: false };
   }

@@ -17,6 +17,7 @@ import {
   ensureRealSession,
   loadSession,
   newSession,
+  reloadBackendSession,
   resumeSession,
 } from "../src/handlers/session.js";
 import { ZcodeAcpServer } from "../src/server.js";
@@ -312,6 +313,47 @@ describe("resumeSession with lazy placeholders", () => {
     // only); with no recorded root and no workspace in the resume result the
     // bridge falls back to its process cwd.
     expect(server.sessionCwds.get("sess_real_1")).toBe(process.cwd());
+  });
+
+  it("re-sends stored mcpServers on an eviction reload (#193)", async () => {
+    // The backend treats mcpServers as per-load runtime config, not persisted
+    // state — an idle-eviction reload must carry them again or the session
+    // silently loses its client MCP tools for the rest of its life.
+    const server = new ZcodeAcpServer();
+    const mcpServers = [{ name: "echo", command: "node", args: [], env: [] }];
+    const resp = await newSession(server, { cwd: "/tmp/ws", mcpServers } as acp.NewSessionRequest);
+    const { backend, calls } = fakeBackend();
+    server.backend = backend;
+    await ensureRealSession(server, resp.sessionId);
+    calls.length = 0;
+
+    await reloadBackendSession(server, resp.sessionId, "sess_lazy_1");
+
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0].params).toMatchObject({ sessionId: "sess_lazy_1", mcpServers });
+  });
+
+  it("session/load re-sends a stored mcpServers set even when params carry []", async () => {
+    // The SDK makes `mcpServers: []` mandatory on session/load; that empty
+    // array must NOT wipe a set remembered at session/new.
+    const server = new ZcodeAcpServer();
+    const { backend, calls } = fakeBackend();
+    server.backend = backend;
+    const mcpServers = [{ name: "echo", command: "node", args: [], env: [] }];
+    server.registerSession("s-load", "sess_load");
+    server.sessionCwds.set("s-load", "/tmp/ws");
+    server.sessionMcpServers.set("s-load", mcpServers);
+
+    await loadSession(
+      server,
+      { sessionId: "s-load", cwd: "/tmp/ws", mcpServers: [] } as acp.LoadSessionRequest,
+      {} as acp.AgentContext,
+    );
+
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0].params).toMatchObject({ sessionId: "sess_load", mcpServers });
   });
 
   it("resumes an already-materialized placeholder without backend resume", async () => {

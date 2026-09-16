@@ -70,6 +70,13 @@ export async function fork(server: ZcodeAcpServer, params: ExtensionParams): Pro
   const result = (resp.result ?? {}) as { forkedSessionId?: string };
   if (result.forkedSessionId) {
     server.registerSession(result.forkedSessionId, result.forkedSessionId);
+    // The fork is live in THIS backend already (session/fork created it) —
+    // mark it loaded or a first-use ensureRealSession treats it as evicted
+    // and reloads without the client MCP servers. The source session's
+    // remembered set is inherited so every later reload re-sends it (#193).
+    server.markBackendLoaded(result.forkedSessionId);
+    const srcMcp = server.sessionMcpServers.get(params.sessionId);
+    if (srcMcp) server.sessionMcpServers.set(result.forkedSessionId, srcMcp);
     server.ensureBackgroundListener(result.forkedSessionId);
   }
   log(`session/fork → ${result.forkedSessionId ?? "?"}`);
