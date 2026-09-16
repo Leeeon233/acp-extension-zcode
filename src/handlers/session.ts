@@ -517,7 +517,9 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
     // clash behaviour is the backend's own and unasserted here.
     const createParams: Record<string, unknown> = {
       workspace: workspaceFor(pending.cwd),
-      mode: "yolo",
+      // ZCODE_ACP_MODE picks the mode a new session starts in; the default
+      // stays "yolo" (unrestricted), which is what the bridge always used.
+      mode: process.env.ZCODE_ACP_MODE || "yolo",
     };
     if (pending.mcpServers && pending.mcpServers.length > 0) {
       createParams.mcpServers = pending.mcpServers;

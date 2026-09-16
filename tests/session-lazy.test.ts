@@ -9,7 +9,7 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeMessage } from "../src/backend/types.js";
@@ -53,6 +53,13 @@ vi.mock("../src/lazy-sessions.js", () => ({
 
 beforeEach(() => {
   mockStore.clear();
+  // Keep the create-mode assertions deterministic on a machine that exports
+  // ZCODE_ACP_MODE; the per-test stub below still overrides this.
+  vi.stubEnv("ZCODE_ACP_MODE", "");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
 });
 
 /**
@@ -162,6 +169,20 @@ describe("ensureRealSession", () => {
     // Idempotent: a second call reuses the mapping, no new create.
     await expect(ensureRealSession(server, resp.sessionId)).resolves.toBe(sid);
     expect(calls.filter((c) => c.method === "session/create")).toHaveLength(1);
+  });
+
+  it("starts the session in ZCODE_ACP_MODE when it is set", async () => {
+    vi.stubEnv("ZCODE_ACP_MODE", "build");
+    const server = new ZcodeAcpServer();
+    const resp = await newSession(server, newSessionParams("/tmp/ws"));
+    const { backend, calls } = fakeBackend();
+    server.backend = backend;
+
+    await ensureRealSession(server, resp.sessionId);
+
+    const creates = calls.filter((c) => c.method === "session/create");
+    expect(creates).toHaveLength(1);
+    expect(creates[0].params).toMatchObject({ mode: "build" });
   });
 
   it("serializes concurrent first-uses into a single session/create", async () => {
