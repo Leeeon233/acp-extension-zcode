@@ -18,6 +18,13 @@ describe("resolveInvocation", () => {
     // lands here with argv[1] keeping the bin name.
     expect(resolveInvocation("acp-extension-zcode", [])).toEqual({ kind: "server" });
     expect(resolveInvocation("acp-extension-zcode", ["--anything"])).toEqual({ kind: "server" });
+    // Explicit CLI subcommands still work through the canonical bin.
+    expect(resolveInvocation("acp-extension-zcode", ["server"])).toEqual({ kind: "server" });
+    expect(resolveInvocation("acp-extension-zcode", ["quota", "-w"])).toEqual({
+      kind: "quota",
+      args: ["-w"],
+    });
+    expect(resolveInvocation("acp-extension-zcode", ["--help"])).toEqual({ kind: "help" });
   });
 
   it("routes the legacy zcode-acp-server bin alias straight to server", () => {
@@ -38,26 +45,14 @@ describe("resolveInvocation", () => {
     });
   });
 
-  it("treats bare invocation as the interactive TUI and help flags as help", () => {
-    // Bare is NOT explicit: without a TTY it falls back to the stdio server
-    // (Windows npm shims land there with the bin name lost from argv).
-    expect(resolveInvocation("cli.js", [])).toEqual({ kind: "tui", explicit: false, check: false });
-    expect(resolveInvocation("cli.js", ["tui"])).toEqual({
-      kind: "tui",
-      explicit: true,
-      check: false,
-    });
-    // `repl` stays accepted as the old spelling of `tui`.
-    expect(resolveInvocation("cli.js", ["repl"])).toEqual({
-      kind: "tui",
-      explicit: true,
-      check: false,
-    });
-    expect(resolveInvocation("cli.js", ["tui", "--check"])).toEqual({
-      kind: "tui",
-      explicit: true,
-      check: true,
-    });
+  it("treats bare invocation as the stdio server and help flags as help", () => {
+    // Bare `cli.js` is how Windows npm shims lose the bin name, and it is
+    // also what the remote terminal incubation used to invoke before the TUI
+    // was removed. Both paths need the editor-facing bridge.
+    expect(resolveInvocation("cli.js", [])).toEqual({ kind: "server" });
+    expect(resolveInvocation("cli.js", ["tui"])).toEqual({ kind: "unknown", sub: "tui" });
+    // `repl` is no longer accepted either.
+    expect(resolveInvocation("cli.js", ["repl"])).toEqual({ kind: "unknown", sub: "repl" });
     expect(resolveInvocation("cli.js", ["-h"])).toEqual({ kind: "help" });
     expect(resolveInvocation("cli.js", ["--help"])).toEqual({ kind: "help" });
     expect(resolveInvocation("cli.js", ["help"])).toEqual({ kind: "help" });

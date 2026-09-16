@@ -9,11 +9,11 @@
 
 本服务端以子进程方式启动 ZCode 无头 app-server（`zcode app-server --stdio`），将其内部事件流翻译为 ACP `session/update` 通知，并把 ZCode 的交互通道桥接到 ACP —— 当客户端支持时优先使用 `elicitation/create`，否则回退到 `session/request_permission` —— 从而让编辑器获得原生的、一流的编码助手体验。
 
-## 为什么选 zcode-acp
+## 为什么选 acp-extension-zcode
 
 - **编辑器原生体验** —— 流式改动以真实 diff 呈现，权限确认、计划模式都走 Zed / JetBrains 自己的 agent 面板，无需并排终端。
 - **官方 harness，而非重新实现** —— 驱动真实的 `zcode app-server`：原生工具、skills、MCP 与斜杠命令、自动压缩、会话恢复/分叉。
-- **不止于编辑器** —— 完整的双语终端 REPL（`zcode-acp`，中/英可切换，SSH 下可用），手机/网页访问相同会话（`zcode-acp-remote`），可选的只限写入沙箱。凭据留在 `~/.zcode`。
+- **ACP 优先** —— `acp-extension-zcode` 裸命令直接启动 stdio ACP server；手机/网页访问相同会话与可选的只限写入沙箱仍然可用。凭据留在 `~/.zcode`。
 
 由于驱动的是真实 ZCode 客户端，你现有的 GLM Coding Plan 原样生效——当前的套餐权益（150% 额度加成、高于直连 API 的请求优先级）和包月计费方式都和在官方 App 中一致。编辑器设置无需任何 API key。
 
@@ -133,12 +133,13 @@ ZCode CLI 内置于桌面应用中，默认不会加到 `PATH`。用 `ZCODE_BIN`
 [docs/REMOTE.md](docs/REMOTE.md)；客户端集成契约：
 [docs/REMOTE-CLIENTS.md](docs/REMOTE-CLIENTS.md)。
 
-## 统一 CLI（zcode-acp）
+## CLI（`acp-extension-zcode`）
 
-本包所有能力收敛在一条命令下：交互式终端聊天 REPL（原生滚动回溯）、套餐
-用量卡片（`zcode-acp quota`，GLM + Opencode Go）、远程 hub 守护进程
-（`zcode-acp hub`）以及编辑器调用的 stdio server（`zcode-acp server`）。
-REPL 按键、补全、历史与配额配置详见 [docs/CLI.md](docs/CLI.md)。
+裸命令 `acp-extension-zcode` 直接启动编辑器调用的 stdio ACP server。
+可选子命令包括套餐用量卡片（`acp-extension-zcode quota`，GLM + Opencode
+Go）、远程 hub 守护进程（`... hub`）以及远程创建会话用的 headless 桥接
+（`... serve`）。交互式 Martty TUI 及其 `zcode-acp-martty` 依赖已删除；
+详见 [docs/CLI.md](docs/CLI.md)。
 
 ## ACP Registry
 
@@ -192,7 +193,7 @@ CI 会在每次 push 和 pull request 时运行 `typecheck`、`lint`、`build` �
 - [协议](docs/PROTOCOL.md) —— ZCode JSON-RPC 协议细节
 - [沙箱](docs/SANDBOX.md) —— 沙箱完整手册（开关、白名单、弹窗、验证）
 - [远程访问](docs/REMOTE.md) —— hub、发现 API、隧道、远程创建会话
-- [统一 CLI](docs/CLI.md) —— REPL、配额卡片、hub/server 子命令
+- [CLI](docs/CLI.md) —— ACP server、配额卡片、hub/serve 子命令
 - [开发](docs/DEVELOPMENT.md) —— 本地开发、调试、新增扩展方法
 - [故障排查](docs/TROUBLESHOOTING.md) —— 常见问题排查
 

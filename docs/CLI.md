@@ -1,51 +1,25 @@
-# Unified CLI (`zcode-acp`)
+# CLI (`acp-extension-zcode`)
 
-Every surface of this package is available under one command — `zcode-acp` —
-installed alongside the `acp-extension-zcode` bin your editor configures
-(the legacy `zcode-acp-server` alias remains).
+The package is published as `acp-extension-zcode`. The canonical bin starts
+the editor-facing ACP bridge over stdio; the legacy `zcode-acp-server` and
+`zcode-acp` aliases remain for existing configurations.
 
-## Interactive TUI
+## Stdio ACP server (default)
 
-Bare `zcode-acp` opens an interactive terminal chat against this same bridge,
-powered by [Martty](https://github.com/openma-ai/Martty) — a terminal-native
-ACP client bundled as a dependency (ADR-0020). The in-house Ink REPL it
-replaced was removed entirely; the CLI surface is Martty + this bridge, on
-every platform including Windows.
+Bare `acp-extension-zcode` (or `zcode-acp-server`) starts the ACP bridge on
+stdio. This is the mode used by Lody, Zed, JetBrains, and every editor
+configuration that spawns this package as an ACP agent. It needs no TTY:
 
 ```bash
-zcode-acp            # chat in this directory
-zcode-acp tui        # same thing, explicit
+acp-extension-zcode          # ACP over stdin/stdout
+acp-extension-zcode server   # explicit subcommand
 ```
 
-The TUI is a full ACP client: streaming output with markdown rendering, tool
-rows that expand/collapse on click, a model picker (`Ctrl-P`), queueing
-(`enter` queues, `Ctrl-Enter` steers the running turn), `!` shell escapes,
-themes (`Ctrl-T`), and native mouse support (wheel scroll, click-select,
-drag-copy). `/resume` lists this project's previous conversations (from the
-bridge's `session/list`) and loads one; `/new` starts fresh. Keys: `esc`
-interrupts a turn and clears the draft, `Ctrl-C` clears then quits, `↑`
-recalls history. `/help` inside the TUI lists everything.
-
-Two Martty behaviors worth knowing:
-
-- **Resumed sessions keep their context but not their on-screen history.**
-  A fresh TUI boot starts a new `session/new`, and `/resume` uses ACP
-  `session/resume` — which by protocol design carries no message history —
-  so attaching to a session created elsewhere (the editor, the phone app, a
-  previous remote window) starts a visually empty transcript (the status
-  line notes `resumed <id> — previous transcript was not replayed`). The
-  conversation itself is live: your next prompt runs with the full history
-  in the backend.
-- **Sessions persist in the ZCode backend** like every other client of this
-  bridge — close the TUI any time; the conversation stays available to your
-  editor and to `/resume`.
-
-Without a TTY (pipes, Windows editor shims — where the bin name is lost from
-`argv`), bare `zcode-acp` falls back to the stdio server, so editor configs
-pointing at either bin name keep working. Ask for the TUI explicitly with
-`zcode-acp tui`; without a TTY that errors instead of falling back.
-`zcode-acp tui --check` runs a headless wiring check (spawn + initialize
-handshake) — that is what CI smoke-tests.
+The generic `zcode-acp`/`node dist/cli.js` entrypoint also starts the same
+stdio server when invoked without a subcommand, so Windows shims and old
+editor configs keep working. The interactive Martty terminal TUI was removed
+in this version, along with its `zcode-acp-martty` dependency; this package
+no longer spawns a terminal UI.
 
 ## Quota cards
 

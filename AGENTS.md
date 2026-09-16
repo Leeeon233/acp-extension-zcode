@@ -61,15 +61,12 @@ src/
 │   ├── file-endpoint.ts  Read-only /fs/list + /fs/file, session-root scoped (ADR-0004)
 │   └── hub-server.ts     Hub daemon: auth, discovery, byte-level proxy (ACP WS + /fs files), ?probe=1 liveness
 ├── quota/                GLM Coding Plan usage API client (/quota command)
-├── cli.ts                Unified CLI entry (`zcode-acp`): subcommand dispatch
-│                         (bare invocation → Martty TUI) (ADR-0007, ADR-0020)
-├── tui.ts                Martty launcher: spawn `martty --agent node
-│                         --agent-arg <dist/index.js>` (npm dep `martty`,
-│                         bundled per-platform Rust TUI); `tui --check`
-│                         wraps `martty --check-runtime` for CI smoke
+├── cli.ts                Unified CLI entry (`acp-extension-zcode`): subcommand
+│                         dispatch; bare invocation → stdio ACP server
+│                         (ADR-0007). The Martty TUI launcher was removed.
 └── bin/
-    ├── hub.ts            Hub daemon entry (`zcode-acp hub`; spawned by absolute path)
-    └── quota.ts          Quota cards entry (`zcode-acp quota`)
+    ├── hub.ts            Hub daemon entry (`acp-extension-zcode hub`; spawned by absolute path)
+    └── quota.ts          Quota cards entry (`acp-extension-zcode quota`)
 ```
 
 **Key boundary**: `backend/` talks to the ZCode subprocess. `handlers/` talks to
@@ -119,10 +116,10 @@ ZCode protocol types into ACP notifications directly — always translate.
   `process.env.HOME` assignment so `vi.unstubAllEnvs()` cannot leak back to
   the real HOME); the same setup DELETES `ZCODE_ACP_REMOTE_ORIGIN` /
   `ZCODE_ACP_TUI_CLI_PID`, because a vitest run started from inside an
-  incubated TUI inherits them and the session-close endpoint would signal the
-  REAL window's process tree from a test (observed live 2026-09-08 — the run
-  killed its own host window). Keep new tests store-safe by default and don't
-  bypass the setup file.
+  incubated terminal bridge inherits them and the session-close endpoint would
+  signal the REAL window's process tree from a test (observed live 2026-09-08 —
+  the run killed its own host window). Keep new tests store-safe by default and
+  don't bypass the setup file.
 - **AGENTS.md is workspace-scoped**: the global `~/.zcode/AGENTS.md` also exists;
   this file takes precedence for this repo.
 - **WS proxy frame type**: the SDK's WS server drops non-text frames, and
@@ -144,8 +141,8 @@ ZCode protocol types into ACP notifications directly — always translate.
   LIVE at every incubation (`remoteTerminalPrefs`); token/ports apply when the
   hub is next (re)born. Per-process plumbing (`ZCODE_ACP_REMOTE_ORIGIN`,
   `_PIN_CWD`, `ZCODE_ACP_RESUME_SESSION`) is deliberately env-only — per-role
-  state, never file-configurable. The TUI script's env embedding is still
-  load-bearing for file-less setups (the .command shell sources no rc).
+  state, never file-configurable. The terminal bridge script's env embedding is
+  still load-bearing for file-less setups (the .command shell sources no rc).
 - **Warp CAN be driven programmatically — don't regress it to "unsupported"**:
   it refuses `.command` files (warpdotdev/warp#1917) and its `warp` CLI is
   agent-only, but its URI scheme EXECUTES a script: `open -a Warp
@@ -155,9 +152,12 @@ ZCode protocol types into ACP notifications directly — always translate.
   `warpUri` launcher in hub-server.ts; Preview = `warppreview://` + the
   "Warp Preview" bundle. #1917/#3959 describe only the missing .command/CLI
   paths, which made Warp look impossible for a long time.
-- **The interactive CLI is Martty, a dependency — never hand-roll UI here**
-  (ADR-0020): bare `zcode-acp` spawns `martty --agent node --agent-arg
-<dist/index.js>` (src/tui.ts); the in-house Ink REPL was deleted wholesale.
+- **The interactive Martty TUI launcher was removed.** Bare
+  `acp-extension-zcode`/`zcode-acp` now starts the stdio ACP server. The
+  bridge still contains Martty-client accommodations (`marttyClientSeen`,
+  boot-resume handshake, terminal titles) for external Martty ACP clients and
+  the remote terminal bridge; do not reintroduce `zcode-acp-martty` as a
+  default dependency.
   Martty folds chunk-delta replay (`user_message_chunk`/`agent_message_chunk`)
   only when the updates arrive AFTER the response on a load/resume path it
   initiated (complete user_message/agent_message updates never fold — verified
@@ -185,8 +185,7 @@ ZCode protocol types into ACP notifications directly — always translate.
   deferred past the response via `setImmediate`, gated on
   `clientInfo.name` ≈ martty — editors replay via session/load themselves and
   would double-render. Martty passes its full env to the spawned agent, which
-  is how ZCODE_ACP_RESUME_SESSION reaches the bridge. `zcode-acp tui --check`
-  (= `martty --check-runtime` over the built bridge) is the CI smoke.
+  is how ZCODE_ACP_RESUME_SESSION reaches the bridge.
 - **Martty never sets a terminal title — the bridge does it (OSC 0 via
   /dev/tty)**: martty's binary contains no SetTitle/OSC sequence, so a
   CLI-launched or hub-incubated window otherwise stays named after the command
