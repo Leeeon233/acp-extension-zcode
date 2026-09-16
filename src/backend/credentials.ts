@@ -11,13 +11,13 @@
 import { readFileSync } from "node:fs";
 import process from "node:process";
 
-import { DEFAULT_MODEL_ID } from "../config/options.js";
+import { DEFAULT_MODEL_ID, providerSelectable } from "../config/options.js";
 import { log, ZCODE_CREDS_PATH } from "../utils.js";
 
 /** Parsed provider entry in config.json. */
 interface ProviderConfig {
   enabled?: boolean;
-  options?: { baseURL?: string; apiKey?: string };
+  options?: { baseURL?: string; apiKey?: string; apiKeyRequired?: boolean };
   models?: Record<string, unknown>;
 }
 
@@ -40,6 +40,14 @@ export function loadZcodeCredentials(): ZcodeCredentials {
     // "first enabled provider wins" behaviour.
     const pinned = process.env.ZCODE_PROVIDER;
     for (const [providerId, p] of Object.entries(cfg.provider ?? {})) {
+      // Mirror the model dropdown's providerSelectable rule (#183): a
+      // keyless builtin provider (typical after plan upgrades in the App)
+      // would inject an empty ANTHROPIC_API_KEY and every turn fails — skip
+      // it in the default scan. Custom keyless providers stay selectable
+      // when they are local or declare apiKeyRequired:false (ollama/
+      // llama.cpp, #156). An explicit pin still honors the user's choice.
+      if (!pinned && !providerSelectable(providerId, p as Parameters<typeof providerSelectable>[1]))
+        continue;
       if (p?.enabled && (!pinned || providerId === pinned)) {
         const opts = p.options ?? {};
         const models = p.models ?? {};
@@ -77,10 +85,13 @@ export function mergeEnvWithCreds(creds: ZcodeCredentials): NodeJS.ProcessEnv {
     if (v) merged[k] = v;
   }
 
-  // Stale-baseURL self-heal.
+  // Stale-baseURL self-heal. Skipped when ANTHROPIC_API_KEY is explicitly
+  // exported: the env key+URL pair is then self-consistent by construction
+  // (the user pointed it at the provider that key belongs to), and reverting
+  // the URL would send that key to the wrong host (#183).
   const envBu = process.env.ZCODE_BASE_URL ?? "";
   const configBu = creds.ZCODE_BASE_URL ?? "";
-  if (envBu && configBu && envBu !== configBu) {
+  if (envBu && configBu && envBu !== configBu && !process.env.ANTHROPIC_API_KEY) {
     const allHosts = collectProviderHosts();
     const envHost = hostOf(envBu);
     const configHost = hostOf(configBu);

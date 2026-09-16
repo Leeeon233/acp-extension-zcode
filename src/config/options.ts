@@ -75,7 +75,7 @@ export interface ModelRef {
  *     usable — has an apiKey, declares keys not required, or points at a
  *     local baseURL (llama.cpp/ollama-style providers work keyless).
  */
-function providerSelectable(pid: string, p: ProviderEntry | undefined): boolean {
+export function providerSelectable(pid: string, p: ProviderEntry | undefined): boolean {
   if (!p) return false;
   if (isBuiltinProvider(pid)) return p.enabled === true && Boolean(p.options?.apiKey);
   if (p.enabled === false) return false;

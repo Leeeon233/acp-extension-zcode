@@ -42,7 +42,9 @@ vi.mock("node:fs", async () => {
   };
 });
 
-const { loadZcodeCredentials } = await import("../src/backend/credentials.js");
+const { loadZcodeCredentials, mergeEnvWithCreds } = await import(
+  "../src/backend/credentials.js"
+);
 const { loadAllModels } = await import("../src/config/options.js");
 
 afterEach(() => {
@@ -73,6 +75,71 @@ describe("loadZcodeCredentials provider pinning", () => {
     vi.stubEnv("ZCODE_PROVIDER", "builtin:missing");
 
     expect(loadZcodeCredentials()).toEqual({});
+  });
+
+  it("skips enabled providers with an empty apiKey (#183)", () => {
+    fakeConfig = {
+      provider: {
+        // Enabled but keyless — typical state after a plan upgrade.
+        "builtin:keyless": plan("Keyless", "https://keyless.example/api", "", "GLM-keyless"),
+        "builtin:first": plan("First", "https://first.example/api", "first-key", "GLM-first"),
+      },
+    };
+
+    expect(loadZcodeCredentials().ANTHROPIC_API_KEY).toBe("first-key");
+  });
+
+  it("still picks a custom keyless local provider (ollama/llama.cpp, #156)", () => {
+    fakeConfig = {
+      provider: {
+        "builtin:keyless": plan("Keyless", "https://keyless.example/api", "", "GLM-keyless"),
+        "local:ollama": {
+          name: "Ollama",
+          enabled: true,
+          options: { baseURL: "http://localhost:11434/api", apiKey: "" },
+          models: { "llama-local": {} },
+        },
+      },
+    };
+
+    const creds = loadZcodeCredentials();
+    expect(creds.ANTHROPIC_API_KEY).toBe("");
+    expect(creds.ZCODE_BASE_URL).toBe("http://localhost:11434/api");
+  });
+
+  it("honors an explicit pin even when the pinned provider is keyless", () => {
+    fakeConfig = {
+      provider: {
+        "builtin:keyless": plan("Keyless", "https://keyless.example/api", "", "GLM-keyless"),
+        "builtin:first": plan("First", "https://first.example/api", "first-key", "GLM-first"),
+      },
+    };
+    vi.stubEnv("ZCODE_PROVIDER", "builtin:keyless");
+
+    expect(loadZcodeCredentials().ANTHROPIC_API_KEY).toBe("");
+  });
+});
+
+describe("mergeEnvWithCreds stale-host self-heal (#183)", () => {
+  const creds = {
+    ZCODE_MODEL: "GLM-first",
+    ZCODE_BASE_URL: "https://first.example/api",
+    ANTHROPIC_API_KEY: "first-key",
+  };
+
+  it("reverts a stale env ZCODE_BASE_URL when no key is exported", () => {
+    vi.stubEnv("ZCODE_BASE_URL", "https://second.example/api");
+    vi.stubEnv("ANTHROPIC_API_KEY", "");
+
+    expect(mergeEnvWithCreds(creds).ZCODE_BASE_URL).toBe("https://first.example/api");
+  });
+
+  it("keeps the env ZCODE_BASE_URL when ANTHROPIC_API_KEY is explicitly exported", () => {
+    vi.stubEnv("ZCODE_BASE_URL", "https://second.example/api");
+    vi.stubEnv("ANTHROPIC_API_KEY", "second-key");
+
+    expect(mergeEnvWithCreds(creds).ZCODE_BASE_URL).toBe("https://second.example/api");
+    expect(mergeEnvWithCreds(creds).ANTHROPIC_API_KEY).toBe("second-key");
   });
 });
 
