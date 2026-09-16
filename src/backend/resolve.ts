@@ -142,14 +142,34 @@ function happyEyeballsArgs(): string[] {
 }
 
 /**
+ * The backend in app-server mode always registers its Cron* tools, each
+ * implemented by asking THIS client over `automation/*` JSON-RPC requests —
+ * which the bridge does not serve (host capability, see docs/BACKLOG.md).
+ * Advertised-but-unservable tools trap the model, so they are disallowed by
+ * default. `ZCODE_ENABLE_AUTOMATION_TOOLS=1` opts back in for a host that
+ * does implement the port (#192).
+ */
+const AUTOMATION_TOOL_DEFAULTS = ["CronCreate", "CronList", "CronUpdate", "CronDelete"];
+
+function disallowedToolsValue(): string | undefined {
+  const fromEnv = process.env.ZCODE_DISALLOWED_TOOLS?.trim();
+  if (process.env.ZCODE_ENABLE_AUTOMATION_TOOLS === "1") {
+    return fromEnv || undefined;
+  }
+  const user = fromEnv ? fromEnv.split(/[,\s]+/).filter(Boolean) : [];
+  const merged = [...new Set([...user, ...AUTOMATION_TOOL_DEFAULTS])];
+  return merged.length > 0 ? merged.join(" ") : undefined;
+}
+
+/**
  * The backend subcommand and its flags, shared by every launch path.
  *
- * `ZCODE_DISALLOWED_TOOLS` is passed verbatim as the app-server's
- * `--disallowed-tools` value; unset means the flag is absent, which is the
- * backend's own default.
+ * `ZCODE_DISALLOWED_TOOLS` is merged with the default Cron* disallow list
+ * (see AUTOMATION_TOOL_DEFAULTS) and passed as the app-server's
+ * `--disallowed-tools` value; unset means only the defaults.
  */
 export function backendArgs(): string[] {
-  const disallowed = process.env.ZCODE_DISALLOWED_TOOLS;
+  const disallowed = disallowedToolsValue();
   return ["app-server", "--stdio", ...(disallowed ? ["--disallowed-tools", disallowed] : [])];
 }
 

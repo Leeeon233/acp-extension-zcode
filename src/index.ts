@@ -109,7 +109,11 @@ export async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     log(`shutting down (${reason})`);
-    // Stop the remote endpoint first (bounded by its 1.5s unregister timeout);
+    // Terminal records for in-flight background tasks BEFORE the remote
+    // endpoint closes — afterwards the WS/stdio clients are gone and the
+    // records could not be delivered (#194).
+    await server.emitBackgroundTaskShutdownRecords();
+    // Stop the remote endpoint (bounded by its 1.5s unregister timeout);
     // the hub's heartbeat TTL also prunes us if this doesn't complete.
     if (remoteHandle) await remoteHandle.stop();
     if (server.backend) await server.backend.close();
@@ -304,6 +308,9 @@ export async function runHeadless(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     log(`serve: shutting down (${reason})`);
+    // Records first, endpoint second — remote-only clients ride the WS link
+    // that remoteHandle.stop() tears down (#194).
+    await server.emitBackgroundTaskShutdownRecords();
     if (remoteHandle) await remoteHandle.stop();
     if (server.backend) await server.backend.close();
     process.exit(0);

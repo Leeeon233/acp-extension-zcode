@@ -101,7 +101,9 @@ These methods belong to the desktop client or workspace configuration layer and
 have no ACP equivalent. Listed for completeness only — the bridge does not
 intend to surface them.
 
-`automation/*` (scheduled tasks), `usage/stats` (token analytics; the
+`automation/*` (scheduled tasks — the Cron* tools the backend advertises are
+disallowed by default via `--disallowed-tools`, opt back in with
+`ZCODE_ENABLE_AUTOMATION_TOOLS=1`; see #192), `usage/stats` (token analytics; the
 account-level plan quota it does NOT cover is exposed via the bridge's own
 `account/usage_stats` — see Proposal 0002), `workspace/readState`,
 `workspace/upsertModelProvider`, `workspace/removeModelProvider`,

@@ -23,6 +23,7 @@ const SAVED = {
   ZCODE_NODE: process.env.ZCODE_NODE,
   ZCODE_KEEP_HAPPY_EYEBALLS: process.env.ZCODE_KEEP_HAPPY_EYEBALLS,
   ZCODE_DISALLOWED_TOOLS: process.env.ZCODE_DISALLOWED_TOOLS,
+  ZCODE_ENABLE_AUTOMATION_TOOLS: process.env.ZCODE_ENABLE_AUTOMATION_TOOLS,
 };
 
 afterEach(() => {
@@ -60,7 +61,12 @@ describe("resolveZcodeCommand Happy Eyeballs args", () => {
     expect(argv.indexOf("--dns-result-order=ipv4first")).toBeLessThan(
       argv.indexOf("/nonexistent/zcode.cjs"),
     );
-    expect(argv.slice(-2)).toEqual(["app-server", "--stdio"]);
+    expect(argv.slice(-4)).toEqual([
+      "app-server",
+      "--stdio",
+      "--disallowed-tools",
+      "CronCreate CronList CronUpdate CronDelete",
+    ]);
   });
 
   it("drops both flags when ZCODE_KEEP_HAPPY_EYEBALLS is set", () => {
@@ -72,13 +78,33 @@ describe("resolveZcodeCommand Happy Eyeballs args", () => {
 });
 
 describe("resolveZcodeCommand disallowed tools", () => {
-  it("passes no --disallowed-tools when the env var is unset", () => {
+  const CRON_DEFAULTS = "CronCreate CronList CronUpdate CronDelete";
+
+  it("disallows the Cron* tools by default — the bridge cannot serve automation/* (#192)", () => {
     delete process.env.ZCODE_DISALLOWED_TOOLS;
-    expect(nativeLaunchArgs()).toEqual(["/usr/bin/zcode", "app-server", "--stdio"]);
+    expect(nativeLaunchArgs()).toEqual([
+      "/usr/bin/zcode",
+      "app-server",
+      "--stdio",
+      "--disallowed-tools",
+      CRON_DEFAULTS,
+    ]);
   });
 
-  it("passes ZCODE_DISALLOWED_TOOLS through verbatim as one argument", () => {
+  it("merges ZCODE_DISALLOWED_TOOLS with the Cron* defaults (dedup, normalized to spaces)", () => {
     process.env.ZCODE_DISALLOWED_TOOLS = "Bash,Write";
+    expect(nativeLaunchArgs()).toEqual([
+      "/usr/bin/zcode",
+      "app-server",
+      "--stdio",
+      "--disallowed-tools",
+      `Bash Write ${CRON_DEFAULTS}`,
+    ]);
+  });
+
+  it("passes ZCODE_DISALLOWED_TOOLS verbatim when automation tools are opted in", () => {
+    process.env.ZCODE_DISALLOWED_TOOLS = "Bash,Write";
+    process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
     expect(nativeLaunchArgs()).toEqual([
       "/usr/bin/zcode",
       "app-server",
@@ -88,12 +114,18 @@ describe("resolveZcodeCommand disallowed tools", () => {
     ]);
   });
 
+  it("omits --disallowed-tools entirely on the opt-in path when the env var is unset", () => {
+    delete process.env.ZCODE_DISALLOWED_TOOLS;
+    process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
+    expect(nativeLaunchArgs()).toEqual(["/usr/bin/zcode", "app-server", "--stdio"]);
+  });
+
   it("appends the flag after the script path on the JS launch path too", () => {
     process.env.ZCODE_BIN = "/nonexistent/zcode.cjs";
     process.env.ZCODE_NODE = process.execPath;
     process.env.ZCODE_DISALLOWED_TOOLS = "Bash Write";
     const argv = resolveZcodeCommand();
-    expect(argv.slice(-4)).toEqual(["app-server", "--stdio", "--disallowed-tools", "Bash Write"]);
+    expect(argv.slice(-2)).toEqual(["--disallowed-tools", `Bash Write ${CRON_DEFAULTS}`]);
     expect(argv.indexOf("/nonexistent/zcode.cjs")).toBeLessThan(argv.indexOf("app-server"));
   });
 });

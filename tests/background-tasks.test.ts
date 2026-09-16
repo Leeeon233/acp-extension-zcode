@@ -436,3 +436,58 @@ describe("BackgroundTaskListener: background Bash reuses launch card", () => {
     expect(server.terminalSentData.has("call_bash4")).toBe(false);
   });
 });
+
+describe("emitShutdownRecords (#194)", () => {
+  it("emits a failed shutdown record for an in-flight task and skips terminal ones", async () => {
+    const server = makeServer();
+    const l = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    l.handleEvent(zcodeEvent("session.updated", { taskId: "exec_live", status: "running" }));
+    l.handleEvent(zcodeEvent("session.updated", { taskId: "exec_done", status: "completed" }));
+    await Promise.resolve();
+    server.calls.length = 0;
+
+    await l.emitShutdownRecords();
+
+    // Only the still-running task gets a record; the completed one is skipped.
+    expect(server.calls).toHaveLength(1);
+    const rec = server.calls[0]!.update;
+    expect(rec["sessionUpdate"]).toBe("tool_call_update");
+    expect(rec["status"]).toBe("failed");
+    const meta = rec["_meta"] as { backgroundTask: { shutdown: boolean } };
+    expect(meta.backgroundTask.shutdown).toBe(true);
+
+    // Idempotent: a second sweep finds nothing in flight.
+    server.calls.length = 0;
+    await l.emitShutdownRecords();
+    expect(server.calls).toHaveLength(0);
+  });
+
+  it("emits terminal_exit for a reused launch card on shutdown", async () => {
+    const server = makeServer();
+    server.terminalSentData.set("call_bash9", "bg launch text\n");
+    const l = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    l.handleEvent(
+      zcodeEvent("session.updated", {
+        taskId: "exec_shutdown",
+        toolCallId: "call_bash9",
+        status: "running",
+      }),
+    );
+    await Promise.resolve();
+    server.calls.length = 0;
+
+    await l.emitShutdownRecords();
+
+    expect(server.calls).toHaveLength(1);
+    const rec = server.calls[0]!.update;
+    expect(rec["toolCallId"]).toBe("call_bash9");
+    expect(rec["status"]).toBe("failed");
+    const meta = rec["_meta"] as {
+      backgroundTask: { shutdown: boolean };
+      terminal_exit: { exit_code: number };
+    };
+    expect(meta.backgroundTask.shutdown).toBe(true);
+    expect(meta.terminal_exit.exit_code).toBe(1);
+    expect(server.terminalSentData.has("call_bash9")).toBe(false);
+  });
+});
