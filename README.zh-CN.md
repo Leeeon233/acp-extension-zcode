@@ -136,7 +136,7 @@ ZCode CLI 内置于桌面应用中，默认不会加到 `PATH`。用 `ZCODE_BIN`
 ## 统一 CLI（zcode-acp）
 
 本包所有能力收敛在一条命令下：交互式终端聊天 REPL（原生滚动回溯）、套餐
-用量卡片（`zcode-acp quota`，GLM + Opencode Go）、远程 hub 守护进程
+用量卡片（`zcode-acp quota`，GLM + Opencode Go + Ollama Cloud）、远程 hub 守护进程
 （`zcode-acp hub`）以及编辑器调用的 stdio server（`zcode-acp server`）。
 REPL 按键、补全、历史与配额配置详见 [docs/CLI.md](docs/CLI.md)。
 

@@ -8,14 +8,17 @@
  *
  * The response mirrors the CLI card's data model so clients can reproduce it
  * exactly: one GLM section (plan level + per-window items with per-model
- * details) and one Opencode Go section (rolling/weekly/monthly windows, the
- * relative reset countdown converted to an absolute timestamp). Provider
- * failures are reported per-section as `kind` strings rather than throwing —
- * the client renders the same status line the CLI would (a `not_configured`
- * Go section is simply omitted, matching the CLI).
+ * details), one Opencode Go section (rolling/weekly/monthly windows, the
+ * relative reset countdown converted to an absolute timestamp), and one
+ * Ollama Cloud section (session/weekly fractions as percents — the API
+ * exposes no reset timestamps). Provider failures are reported per-section as
+ * `kind` strings rather than throwing — the client renders the same status
+ * line the CLI would (a `not_configured` section is simply omitted, matching
+ * the CLI).
  */
 
 import { queryCombined } from "../quota/combined.js";
+import type { OcQueryResult } from "../quota/ollama-cloud/types.js";
 import type { GoQueryResult, GoWindowKey } from "../quota/opencode-go/types.js";
 import type { QuotaItem, QuotaResult } from "../quota/types.js";
 
@@ -40,9 +43,23 @@ export interface GoUsageStats {
   windows?: GoWindowEntry[];
 }
 
+/** One Ollama Cloud window — percent only, no reset (the API has none). */
+export interface OcWindowEntry {
+  key: "session" | "weekly" | "monthly";
+  label: string;
+  usagePercent: number;
+}
+
+/** Ollama Cloud section — `windows` present only on success. */
+export interface OcUsageStats {
+  kind: OcQueryResult["kind"];
+  windows?: OcWindowEntry[];
+}
+
 export interface UsageStatsResult {
   glm: GlmUsageStats;
   opencode: GoUsageStats;
+  ollama: OcUsageStats;
 }
 
 /** Window labels matching the CLI's card (`5h` / `Week` / `Month`). */
@@ -81,8 +98,25 @@ function toGoStats(result: GoQueryResult, now = Date.now()): GoUsageStats {
   return { kind: "success", windows };
 }
 
-/** `account/usage_stats` handler — both providers, queried in parallel. */
+/**
+ * Ollama windows as percents — the API's 0..1 fractions converted once here
+ * so remote clients can render the same bar the CLI does. Which windows exist
+ * depends on the plan (legacy: session+weekly; credit: monthly). No reset
+ * field: ollama.com returns no reset timestamps.
+ */
+function toOcStats(result: OcQueryResult): OcUsageStats {
+  if (result.kind !== "success") return { kind: result.kind };
+  const LABELS = { session: "5h", weekly: "Week", monthly: "Month" } as const;
+  const windows = (["session", "weekly", "monthly"] as const).flatMap((key) =>
+    result[key] !== undefined
+      ? [{ key, label: LABELS[key], usagePercent: result[key]! * 100 }]
+      : [],
+  );
+  return { kind: "success", windows };
+}
+
+/** `account/usage_stats` handler — all providers, queried in parallel. */
 export async function accountUsageStats(): Promise<UsageStatsResult> {
-  const { glm, go } = await queryCombined("all");
-  return { glm: toGlmStats(glm), opencode: toGoStats(go) };
+  const { glm, go, oc } = await queryCombined("all");
+  return { glm: toGlmStats(glm), opencode: toGoStats(go), ollama: toOcStats(oc) };
 }

@@ -166,7 +166,7 @@ the primary client. Discovery API, tunnels, auth, and semantics:
 ## Unified CLI (`zcode-acp`)
 
 One command for every surface: an interactive terminal chat TUI (`zcode-acp`,
-powered by Martty), plan quota cards (`zcode-acp quota`, GLM + Opencode Go),
+powered by Martty), plan quota cards (`zcode-acp quota`, GLM + Opencode Go + Ollama Cloud),
 the remote hub daemon (`zcode-acp hub`), and the stdio server editors invoke
 (`zcode-acp server`). TUI keys and quota setup: [docs/CLI.md](docs/CLI.md).
 
@@ -205,7 +205,7 @@ The server is organised in layers that mirror the ACP protocol:
 - `handlers/` — ACP method handlers (`session/new`, `session/prompt`, ...) and the turn engine
 - `config/` — model / mode / thought-level configOptions and runtime model switching
 - `remote/` — opt-in remote access: loopback ACP endpoint, multi-client broadcast, hub registration
-- `quota/` — GLM Coding Plan / Opencode Go usage API client (`/quota` command, `zcode-acp quota` subcommand)
+- `quota/` — GLM Coding Plan / Opencode Go / Ollama Cloud usage API client (`/quota` command, `zcode-acp quota` subcommand)
 - `server.ts` — shared state and handler registration
 - `index.ts` — stdio wiring via the ACP SDK
 

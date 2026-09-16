@@ -76,6 +76,35 @@ describe("loadUserConfig", () => {
     expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({});
   });
 
+  it("parses the quota section (all credential fields, trimmed)", () => {
+    writeConfig(
+      JSON.stringify({
+        quota: {
+          ollamaApiKey: " sk-123 ",
+          opencodeGoWorkspaceId: " wrk_x ",
+          opencodeGoAuthCookie: " Fe26.2**y ",
+        },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      quota: {
+        ollamaApiKey: "sk-123",
+        opencodeGoWorkspaceId: "wrk_x",
+        opencodeGoAuthCookie: "Fe26.2**y",
+      },
+    });
+  });
+
+  it("quota section alongside remote; blank ollamaApiKey dropped", () => {
+    writeConfig(JSON.stringify({ remote: { enabled: true }, quota: { ollamaApiKey: "  " } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ remote: { enabled: true } });
+  });
+
+  it("non-object quota section is ignored with the remote section intact", () => {
+    writeConfig(JSON.stringify({ remote: { enabled: true }, quota: "nope" }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ remote: { enabled: true } });
+  });
+
   it("non-object JSON (array/scalar) reads as empty", () => {
     writeConfig("[1,2,3]");
     expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({});

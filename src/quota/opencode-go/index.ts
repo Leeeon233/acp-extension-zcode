@@ -11,6 +11,7 @@
  * line) — so users who only care about GLM see no noise.
  */
 
+import { loadUserConfig } from "../../config/user-config.js";
 import { log } from "../../utils.js";
 import { getCached, setCached } from "./cache.js";
 import { ENV_AUTH_COOKIE, ENV_WORKSPACE_ID, readConfigFile } from "./config.js";
@@ -25,16 +26,24 @@ const COOKIE_PREFIX = "Fe26.2**";
 /**
  * Resolve & validate credentials.
  *
- * Environment variables take precedence over `~/.pi/agent/opencode-go.json`,
- * merged field-by-field: env overrides the same field from the file, but a
- * field present only in the file still counts. Returns `null` when the
- * resolved pair is incomplete or malformed — `queryGoUsage` maps that to
- * `not_configured`.
+ * Three sources, merged field-by-field with the standard user-config
+ * precedence (highest first):
+ *   1. `quota.opencodeGoWorkspaceId` / `quota.opencodeGoAuthCookie` in
+ *      `~/.config/zcode-acp/config.json` (our own config — preferred home).
+ *   2. `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE` env vars.
+ *   3. `~/.pi/agent/opencode-go.json` (legacy — the @beyona/pi-zai-usage Pi
+ *      extension convention, kept so existing setups keep working).
+ *
+ * A field present in a higher-precedence source overrides the same field
+ * below it; a field present only lower down still counts. Returns `null`
+ * when the resolved pair is incomplete or malformed — `queryGoUsage` maps
+ * that to `not_configured`.
  */
 function loadCredentials(): { workspaceId: string; authCookie: string } | null {
+  const own = loadUserConfig().quota;
   const file = readConfigFile();
-  const workspaceId = process.env[ENV_WORKSPACE_ID] ?? file.workspaceId;
-  const authCookie = process.env[ENV_AUTH_COOKIE] ?? file.authCookie;
+  const workspaceId = own?.opencodeGoWorkspaceId ?? process.env[ENV_WORKSPACE_ID] ?? file.workspaceId;
+  const authCookie = own?.opencodeGoAuthCookie ?? process.env[ENV_AUTH_COOKIE] ?? file.authCookie;
 
   if (!workspaceId || !authCookie) return null;
   if (!RE_WORKSPACE.test(workspaceId)) {

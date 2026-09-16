@@ -329,8 +329,8 @@ Fetch once after attach and on demand; quota changes are slow, there is no
 push.
 
 Both channels return the same payload, mirroring the `zcode-acp quota` CLI card's
-data model — one GLM section plus one Opencode Go section — so clients can
-reproduce the CLI layout exactly:
+data model — one GLM section, one Opencode Go section, and one Ollama Cloud
+section — so clients can reproduce the CLI layout exactly:
 
 ```json
 → { "id": 7, "method": "account/usage_stats", "params": {} }
@@ -354,6 +354,13 @@ reproduce the CLI layout exactly:
           { "key": "weekly", "label": "Week", "usagePercent": 25,
             "resetsAt": 1724071200000 }
         ]
+      },
+      "ollama": {
+        "kind": "success",
+        "windows": [
+          { "key": "session", "label": "5h", "usagePercent": 31 },
+          { "key": "weekly", "label": "Week", "usagePercent": 67.5 }
+        ]
       }
     } }
 ```
@@ -369,6 +376,13 @@ reproduce the CLI layout exactly:
   countdown is resolved to an absolute `resetsAt` (epoch ms). `not_configured`
   means the user never set OpenCode Go credentials — omit the section, like
   the CLI does.
+- `ollama` (`kind`: `success` | `not_configured` | `auth_error` |
+  `unavailable`): on success, `windows` carries whichever entries the
+  account's plan exposes — legacy plans: `session` (`5h`) + `weekly`
+  (`Week`); current credit plans: `monthly` (`Month`) — each with
+  `usagePercent` (0–100). There is no `resetsAt` — ollama.com exposes no
+  reset timestamps. `not_configured` means no Ollama API key is set — omit
+  the section, like the CLI does.
 - Provider failures are per-section `kind` strings, not JSON-RPC errors —
   render the same status line the CLI would (e.g. auth expired) and retry
   later. Only transport-level failures reject the request.

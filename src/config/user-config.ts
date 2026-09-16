@@ -49,8 +49,19 @@ export interface RemoteUserConfig {
   terminal?: TerminalPrefs;
 }
 
+/** The `quota` section of the user config file. */
+export interface QuotaUserConfig {
+  /** Ollama Cloud API key for the `zcode-acp quota` card (cloud.ollama.ai). */
+  ollamaApiKey?: string;
+  /** Opencode Go workspace id (`wrk_…`) — see the quota CLI docs. */
+  opencodeGoWorkspaceId?: string;
+  /** Opencode Go `auth` cookie value (`Fe26.2**…`). */
+  opencodeGoAuthCookie?: string;
+}
+
 export interface UserConfig {
   remote?: RemoteUserConfig;
+  quota?: QuotaUserConfig;
 }
 
 /** Resolve the config file path: $XDG_CONFIG_HOME/zcode-acp or ~/.config/zcode-acp. */
@@ -90,11 +101,35 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
     return {};
   }
   const remote = parsed["remote"];
-  if (remote === undefined) return {};
-  if (!isPlainObject(remote)) {
+  if (remote === undefined && parsed["quota"] === undefined) return {};
+  const result: UserConfig = {};
+  if (remote !== undefined && isPlainObject(remote)) {
+    result.remote = parseRemoteSection(remote, file);
+  } else if (remote !== undefined) {
     warn(`config: "remote" in ${file} is not an object — ignoring the section`);
-    return {};
   }
+  const quota = parsed["quota"];
+  if (quota !== undefined) {
+    if (!isPlainObject(quota)) {
+      warn(`config: "quota" in ${file} is not an object — ignoring the section`);
+    } else {
+      const q: QuotaUserConfig = {};
+      for (const [jsonKey, prop] of [
+        ["ollamaApiKey", "ollamaApiKey"],
+        ["opencodeGoWorkspaceId", "opencodeGoWorkspaceId"],
+        ["opencodeGoAuthCookie", "opencodeGoAuthCookie"],
+      ] as const) {
+        const v = quota[jsonKey];
+        if (typeof v === "string" && v.trim()) q[prop] = v.trim();
+      }
+      if (Object.keys(q).length > 0) result.quota = q;
+    }
+  }
+  return result;
+}
+
+/** Parse the validated `remote` section object into {@link RemoteUserConfig}. */
+function parseRemoteSection(remote: Record<string, unknown>, file: string): RemoteUserConfig {
   const out: RemoteUserConfig = {};
   if (typeof remote["enabled"] === "boolean") out.enabled = remote["enabled"];
   if (typeof remote["token"] === "string" && remote["token"].trim())
@@ -132,5 +167,5 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
   } else if (terminal !== undefined) {
     warn(`config: remote.terminal in ${file} is not an object — ignoring`);
   }
-  return { remote: out };
+  return out;
 }

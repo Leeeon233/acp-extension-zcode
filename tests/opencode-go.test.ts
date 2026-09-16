@@ -22,6 +22,16 @@ vi.mock("../src/quota/opencode-go/client.js", () => ({
   dashboardUrl: (id: string) => `https://opencode.ai/workspace/${id}/go`,
 }));
 
+// Control the own-config side of credential resolution (quota.opencodeGo*
+// in ~/.config/zcode-acp/config.json).
+const { loadUserConfigMock } = vi.hoisted(() => ({ loadUserConfigMock: vi.fn() }));
+vi.mock("../src/config/user-config.js", async () => {
+  const actual = await vi.importActual<typeof import("../src/config/user-config.js")>(
+    "../src/config/user-config.js",
+  );
+  return { ...actual, loadUserConfig: loadUserConfigMock };
+});
+
 // Compute the config path here (not via import) so the fs mock factory below
 // can reference it without worrying about vitest mock-hoist ordering. This
 // must match src/quota/opencode-go/config.ts::CONFIG_PATH exactly.
@@ -273,6 +283,8 @@ describe("queryGoUsage orchestration", () => {
     setClock(() => 5000);
     mockedFetch.mockReset();
     mockFiles.clear();
+    loadUserConfigMock.mockReset();
+    loadUserConfigMock.mockReturnValue({});
   });
   afterEach(() => {
     clearCache();
@@ -428,6 +440,8 @@ describe("queryGoUsage credential merging", () => {
     setClock(() => 5000);
     mockedFetch.mockReset();
     mockFiles.clear();
+    loadUserConfigMock.mockReset();
+    loadUserConfigMock.mockReturnValue({});
     // Dynamic mock: finalUrl must contain the workspaceId passed in, or the
     // orchestrator's redirect-to-login check will misfire.
     mockedFetch.mockImplementation(async (workspaceId: string) => ({
@@ -485,5 +499,69 @@ describe("queryGoUsage credential merging", () => {
     mockFiles.set(CONFIG_PATH, "{broken");
     expect((await queryGoUsage()).kind).toBe("not_configured");
     expect(mockedFetch).not.toHaveBeenCalled();
+  });
+});
+
+// --- own-config (quota.opencodeGo*) precedence ------------------------------
+
+describe("own-config credential precedence", () => {
+  beforeEach(() => {
+    clearCache();
+    setClock(() => 5000);
+    mockedFetch.mockReset();
+    mockFiles.clear();
+    loadUserConfigMock.mockReset();
+    loadUserConfigMock.mockReturnValue({});
+    mockedFetch.mockImplementation(async (workspaceId: string) => ({
+      status: 200,
+      text: dashboardHtml({ rolling: { usagePercent: 1, resetInSec: 1 } }),
+      finalUrl: `https://opencode.ai/workspace/${workspaceId}/go`,
+    }));
+  });
+  afterEach(() => {
+    clearCache();
+    setClock(undefined);
+    delete process.env.OPENCODE_GO_WORKSPACE_ID;
+    delete process.env.OPENCODE_GO_AUTH_COOKIE;
+    mockFiles.clear();
+  });
+
+  it("quota.opencodeGo* in the own config is used when env/pi-file are absent", async () => {
+    loadUserConfigMock.mockReturnValue({
+      quota: { opencodeGoWorkspaceId: "wrk_OWN", opencodeGoAuthCookie: "Fe26.2**own" },
+    });
+    expect((await queryGoUsage()).kind).toBe("success");
+    expect(mockedFetch).toHaveBeenCalledWith("wrk_OWN", "Fe26.2**own");
+  });
+
+  it("own config overrides env and the legacy pi file (highest precedence)", async () => {
+    process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_ENV";
+    process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**env";
+    mockFiles.set(
+      CONFIG_PATH,
+      JSON.stringify({ workspaceId: "wrk_PI", authCookie: "Fe26.2**pi" }),
+    );
+    loadUserConfigMock.mockReturnValue({
+      quota: { opencodeGoWorkspaceId: "wrk_OWN", opencodeGoAuthCookie: "Fe26.2**own" },
+    });
+    await queryGoUsage();
+    expect(mockedFetch).toHaveBeenCalledWith("wrk_OWN", "Fe26.2**own");
+  });
+
+  it("own config fills one field; the other still falls through to env/pi-file", async () => {
+    process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**env";
+    loadUserConfigMock.mockReturnValue({ quota: { opencodeGoWorkspaceId: "wrk_OWN" } });
+    await queryGoUsage();
+    expect(mockedFetch).toHaveBeenCalledWith("wrk_OWN", "Fe26.2**env");
+  });
+
+  it("env still overrides the legacy pi file when own config is absent", async () => {
+    mockFiles.set(
+      CONFIG_PATH,
+      JSON.stringify({ workspaceId: "wrk_PI", authCookie: "Fe26.2**pi" }),
+    );
+    process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_ENV";
+    await queryGoUsage();
+    expect(mockedFetch).toHaveBeenCalledWith("wrk_ENV", "Fe26.2**pi");
   });
 });

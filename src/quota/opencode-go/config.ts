@@ -1,18 +1,18 @@
 /**
- * Opencode Go credential discovery.
+ * Opencode Go credential discovery — the LEGACY `~/.pi/agent/opencode-go.json`
+ * fallback source.
  *
- * Credentials may come from two sources, merged field-by-field with
- * **environment variables taking precedence** over the config file:
- *   1. `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE` env vars
+ * Full precedence (highest first), resolved in ../index.ts:
+ *   1. `quota.opencodeGoWorkspaceId` / `quota.opencodeGoAuthCookie` in
+ *      `~/.config/zcode-acp/config.json` (our own config).
+ *   2. `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE` env vars
  *      (best for CI / scripts / temporary overrides).
- *   2. `~/.pi/agent/opencode-go.json` — `{ workspaceId, authCookie }`
- *      (the convention used by the @beyona/pi-zai-usage Pi extension, so users
- *      who already configured it there get reuse for free).
+ *   3. `~/.pi/agent/opencode-go.json` — `{ workspaceId, authCookie }`
+ *      (the convention used by the @beyona/pi-zai-usage Pi extension, kept so
+ *      users who already configured it there get reuse for free).
  *
- * A field present in env overrides the same field from the file; a field only
- * in the file is still used. This lets a user keep their stable workspaceId in
- * the file while rotating the cookie via env, etc. Both fields must resolve to
- * a valid pair — a missing/invalid one yields `not_configured`.
+ * Both fields must resolve to a valid pair — a missing/invalid one yields
+ * `not_configured`.
  */
 
 import { readFileSync } from "node:fs";
