@@ -6,7 +6,8 @@
  *      accepted, case-insensitive)
  *   2. The ZCode desktop app's language choice — `localePreference` (explicit
  *      user pick), falling back to `locale` (effective), in
- *      ~/.zcode/v2/setting.json; absent when the app was never installed
+ *      <zcode-home>/v2/setting.json (the ZCode data root — `~/.zcode`, or
+ *      `$ZCODE_HOME` when set); absent when the app was never installed
  *   3. LC_ALL / LC_MESSAGES / LANG — POSIX locale sniff ("zh*" → zh)
  *   4. English (the project ships bilingual READMEs; international default)
  *
@@ -17,8 +18,9 @@
  */
 
 import { readFileSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
+import { zcodeHomeDir } from "./utils.js";
 
 export type Lang = "en" | "zh";
 
@@ -54,7 +56,7 @@ function appLocale(): string | undefined {
     appLocaleRead = true;
     let locale: string | undefined;
     try {
-      const raw = readFileSync(path.join(os.homedir(), ".zcode", "v2", "setting.json"), "utf8");
+      const raw = readFileSync(path.join(zcodeHomeDir(), "v2", "setting.json"), "utf8");
       // Editors saving UTF-8 with a BOM leave \uFEFF in the string; JSON.parse
       // rejects it, which would silently fall the bridge back to English.
       const bomless = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;

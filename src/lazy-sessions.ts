@@ -35,7 +35,7 @@ import {
 import path from "node:path";
 import process from "node:process";
 
-import { warn } from "./utils.js";
+import { warn, zcodeHomeDir } from "./utils.js";
 
 /** Placeholder alias record persisted in the store. */
 export interface LazySessionRecord {
@@ -51,10 +51,9 @@ const STORE_FILENAME = "acp-lazy-sessions.json";
 /** NEVER-USED placeholders expire after 30 days; materialized records never do. */
 const TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
-/** Resolved at call time so tests can stub HOME without re-importing. */
+/** Resolved at call time so tests can stub HOME/ZCODE_HOME without re-importing. */
 function storePath(): string {
-  const home = process.env.HOME || process.env.USERPROFILE || "~";
-  return path.join(home, ".zcode", "v2", STORE_FILENAME);
+  return path.join(zcodeHomeDir(), "v2", STORE_FILENAME);
 }
 
 /** Parse and validate the table. No side effects — never rewrites the file. */

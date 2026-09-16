@@ -3,8 +3,11 @@
  * ZCode uses, so `/mcp` can show users exactly which servers are available.
  *
  * Sources:
- *   1. ~/.zcode/cli/config.json → mcp.servers (user-configured)
+ *   1. <zcode-home>/cli/config.json → mcp.servers (user-configured)
  *   2. Enabled plugin .mcp.json files (two formats: flat and nested)
+ *
+ * `<zcode-home>` is the ZCode data root (`~/.zcode`, or `$ZCODE_HOME` when
+ * set — see `zcodeHomeDir()`).
  *
  * The ZCode backend loads these automatically and exposes their tools to the
  * model. This module is purely informational — it lists what's configured so
@@ -12,11 +15,10 @@
  */
 
 import { existsSync, readFileSync, readdirSync, statSync } from "node:fs";
-import { homedir } from "node:os";
 import path from "node:path";
 
 import { messages } from "../i18n.js";
-import { compareVersions, log } from "../utils.js";
+import { compareVersions, log, zcodeCliConfigPath, zcodePluginCacheDir } from "../utils.js";
 
 /** Information about a discovered MCP server. */
 export interface McpServerInfo {
@@ -44,10 +46,6 @@ interface McpServerConfig {
   url?: string;
 }
 
-const HOME = homedir();
-const CLI_CONFIG_PATH = path.join(HOME, ".zcode", "cli", "config.json");
-const PLUGIN_CACHE_DIR = path.join(HOME, ".zcode", "cli", "plugins", "cache");
-
 /**
  * Discover all MCP servers from config.json and enabled plugins.
  *
@@ -58,8 +56,9 @@ export function loadMcpServers(): McpServerInfo[] {
 
   let config: CliConfig | null = null;
   try {
-    if (existsSync(CLI_CONFIG_PATH)) {
-      config = JSON.parse(readFileSync(CLI_CONFIG_PATH, "utf8")) as CliConfig;
+    const cliConfigPath = zcodeCliConfigPath();
+    if (existsSync(cliConfigPath)) {
+      config = JSON.parse(readFileSync(cliConfigPath, "utf8")) as CliConfig;
     }
   } catch (e) {
     log(`mcp-discovery: config read failed (${e instanceof Error ? e.message : String(e)})`);
@@ -88,7 +87,7 @@ export function loadMcpServers(): McpServerInfo[] {
     const pluginName = pluginKey.slice(0, atIdx);
     const marketplace = pluginKey.slice(atIdx + 1);
 
-    const pluginDir = path.join(PLUGIN_CACHE_DIR, marketplace, pluginName);
+    const pluginDir = path.join(zcodePluginCacheDir(), marketplace, pluginName);
     if (!existsSync(pluginDir)) continue;
 
     // Find the latest version directory.

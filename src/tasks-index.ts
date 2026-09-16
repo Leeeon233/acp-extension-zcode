@@ -17,11 +17,11 @@
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { DEFAULT_MODEL_ID } from "./config/options.js";
-import { warn, ZCODE_CREDS_PATH } from "./utils.js";
+import { warn, zcodeHomeDir, ZCODE_CREDS_PATH } from "./utils.js";
 
 // Precise DatabaseSync constructor type from @types/node, captured without a
 // runtime import (type position only). node:sqlite's API is prepared-statement
@@ -342,18 +342,13 @@ export interface KnownWorkspace {
  * Whether a recorded workspace path may be offered for remote session
  * creation. Excludes: degenerate roots, system temp trees (macOS /tmp is a
  * symlink to /private/tmp — both spellings; $TMPDIR lives under /var/folders),
- * and ~/.zcode itself (the config home, not a project). The directory must
- * still exist — a moved/deleted project disappears from the list.
+ * and the ZCode data root itself (the config home, not a project). The
+ * directory must still exist — a moved/deleted project disappears from the
+ * list.
  */
 export function isSelectableWorkspace(p: string): boolean {
   if (!p || p === "/") return false;
-  const excluded = [
-    "/tmp",
-    "/private/tmp",
-    "/var/folders",
-    tmpdir(),
-    path.join(homedir(), ".zcode"),
-  ];
+  const excluded = ["/tmp", "/private/tmp", "/var/folders", tmpdir(), zcodeHomeDir()];
   for (const ex of excluded) {
     if (p === ex || p.startsWith(ex + path.sep)) return false;
   }
