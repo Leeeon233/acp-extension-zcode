@@ -36,8 +36,11 @@ export interface ZcodeCredentials {
 export function loadZcodeCredentials(): ZcodeCredentials {
   try {
     const cfg = JSON.parse(readFileSync(ZCODE_CREDS_PATH, "utf8")) as ZcodeConfig;
-    for (const [, p] of Object.entries(cfg.provider ?? {})) {
-      if (p?.enabled) {
+    // ZCODE_PROVIDER pins the provider by id; unset keeps the historical
+    // "first enabled provider wins" behaviour.
+    const pinned = process.env.ZCODE_PROVIDER;
+    for (const [providerId, p] of Object.entries(cfg.provider ?? {})) {
+      if (p?.enabled && (!pinned || providerId === pinned)) {
         const opts = p.options ?? {};
         const models = p.models ?? {};
         return {

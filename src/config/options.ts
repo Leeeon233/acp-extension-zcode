@@ -101,7 +101,10 @@ export function loadAllModels(): ModelRef[] {
   try {
     const cfg = readConfig() as ConfigShape;
     const out: ModelRef[] = [];
+    // ZCODE_PROVIDER pins the dropdown to one provider id.
+    const pinned = process.env.ZCODE_PROVIDER;
     for (const [pid, p] of Object.entries(cfg.provider ?? {})) {
+      if (pinned && pid !== pinned) continue;
       if (!providerSelectable(pid, p)) continue;
       const providerName = p.name ?? pid;
       for (const modelId of Object.keys(p.models ?? {})) {

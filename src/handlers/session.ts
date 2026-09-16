@@ -45,7 +45,7 @@ import {
   startQuotaRefresher,
 } from "../quota/live.js";
 import { buildProviderRegistry } from "../config/provider-registry.js";
-import { buildResumeRuntimeModel } from "../config/runtime-model.js";
+import { applyModelSwitch, buildResumeRuntimeModel } from "../config/runtime-model.js";
 import { messages } from "../i18n.js";
 import {
   lookupLazySession,
@@ -534,6 +534,17 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
 
     server.pendingSessions.delete(acpSid);
     server.registerSession(acpSid, sid);
+    // With both ZCODE_PROVIDER and ZCODE_MODEL set, the session is pinned to
+    // that pair right after create. Fail loudly: a silent fallback would run
+    // the turn on whatever model the backend picked instead.
+    const pinnedProvider = process.env.ZCODE_PROVIDER;
+    const pinnedModel = process.env.ZCODE_MODEL;
+    if (pinnedProvider && pinnedModel) {
+      const selected = formatModelValue(pinnedProvider, pinnedModel);
+      if (!(await applyModelSwitch(server, sid, selected))) {
+        throw new Error(`zcode refused configured model ${selected}`);
+      }
+    }
     // session/create loads the session into this backend process.
     server.markBackendLoaded(acpSid);
     // Keep the durable alias in sync so a later bridge restart can still
