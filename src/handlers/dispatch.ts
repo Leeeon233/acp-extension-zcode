@@ -27,7 +27,7 @@ import { messages } from "../i18n.js";
 import type { InternalEvent } from "../translators/types.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { clientConnectionRoot, warn } from "../utils.js";
-import { sendSessionUpdate, sendSessionUpdateToOthers } from "./io.js";
+import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "./io.js";
 
 /** True once the EPERM hint fired for this process — throttled to one shot. */
 let sandboxEpermHinted = false;
@@ -154,8 +154,10 @@ async function dispatchConfigChanged(
     };
     await sendSessionUpdate(cx, acpSid, configUpdate);
     // Settings are per-session: the CLI's /model or the phone's dropdown must
-    // reach every OTHER attached client too.
-    sendSessionUpdateToOthers(server, cx, acpSid, configUpdate);
+    // reach every OTHER attached client too. The broadcast proxy already
+    // reached everyone with the send above — an "others" leg on it would
+    // double-deliver (it has no connectionContext to exclude anyone by).
+    if (!isBroadcastSource(cx)) sendSessionUpdateToOthers(server, cx, acpSid, configUpdate);
     if (ev.mode !== undefined) {
       // Mirror the advertised mode so turn-completion reconciliation
       // (emitModeIfChanged) doesn't re-emit the same value.
@@ -165,7 +167,7 @@ async function dispatchConfigChanged(
         currentModeId: ev.mode,
       };
       await sendSessionUpdate(cx, acpSid, modeUpdate);
-      sendSessionUpdateToOthers(server, cx, acpSid, modeUpdate);
+      if (!isBroadcastSource(cx)) sendSessionUpdateToOthers(server, cx, acpSid, modeUpdate);
     }
   } catch (e) {
     warn(`dispatch: ConfigChanged failed (${e instanceof Error ? e.message : String(e)})`);

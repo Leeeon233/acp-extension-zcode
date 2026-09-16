@@ -11,17 +11,22 @@
  * check error). Only the genuine per-method differences are spelled out:
  * fork's new sid mapping, compact/goal(set)'s internal-turn lock wait, and
  * setModel rerouting through updateRuntimeModelConfig.
+ *
+ * The settings methods (setModel/setThoughtLevel/setMode/updateRuntimeModel-
+ * Config) emit the config_option_update broadcast afterwards: session settings
+ * are per-SESSION, so a switch from any attached client must refresh the
+ * others (phone ↔ CLI window). They receive the broadcast-proxy cx, whose
+ * notify already fans out to every connection.
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
 
 import { emitInitialUsage } from "../config/model-cache.js";
 import { applyModelSwitch } from "../config/runtime-model.js";
-import { buildConfigOptions, buildModes } from "../config/options.js";
+import { emitConfigOptionUpdate } from "../config/options.js";
 import { ProjectionDiffer } from "../translators/projection-differ.js";
-import { clientConnectionRoot, log, warn } from "../utils.js";
+import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
-import { sendSessionUpdate } from "./io.js";
 import { ensureRealSession } from "./session.js";
 
 /** Build the zcode `target` object from ACP params (checkpoint or latest). */
@@ -170,6 +175,7 @@ export async function cancelBackgroundTask(
 export async function setThoughtLevel(
   server: ZcodeAcpServer,
   params: ExtensionParams,
+  cx: acp.AgentContext,
 ): Promise<Result> {
   const zcodeSid = await resolveSidOrThrow(server, params);
   // 3.3.0 marks thoughtLevel optional (omitting it resets to the model's
@@ -181,6 +187,10 @@ export async function setThoughtLevel(
     .request(server.nextId(), "session/setThoughtLevel", zcParams, 15000);
   if (resp.error) throw new Error(`setThoughtLevel failed: ${resp.error.message}`);
   log("session/setThoughtLevel → ok");
+  // Session settings are per-session, not per-connection: a switch from the
+  // phone must refresh the CLI window's dropdown (and vice versa) — emit the
+  // config_option_update to every attached client, not just the switcher.
+  await emitConfigOptionUpdate(server, cx, params.sessionId, zcodeSid, "thought");
   return (resp.result ?? {}) as Result;
 }
 
@@ -188,6 +198,7 @@ export async function setThoughtLevel(
 export async function updateRuntimeModelConfig(
   server: ZcodeAcpServer,
   params: ExtensionParams,
+  cx: acp.AgentContext,
 ): Promise<Result> {
   const zcodeSid = await resolveSidOrThrow(server, params);
   const runtimeModel = params.runtimeModel;
@@ -200,17 +211,25 @@ export async function updateRuntimeModelConfig(
     .request(server.nextId(), "session/updateRuntimeModelConfig", zcParams, 15000);
   if (resp.error) throw new Error(`updateRuntimeModelConfig failed: ${resp.error.message}`);
   log("session/updateRuntimeModelConfig → ok");
+  // Broadcast so the other attached clients' model context bar follows.
+  await emitConfigOptionUpdate(server, cx, params.sessionId, zcodeSid, "model");
   return (resp.result ?? {}) as Result;
 }
 
 /** session/setModel → applyModelSwitch (runtime overlay, not persistence). */
-export async function setModel(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
+export async function setModel(
+  server: ZcodeAcpServer,
+  params: ExtensionParams,
+  cx: acp.AgentContext,
+): Promise<Result> {
   const zcodeSid = await resolveSidOrThrow(server, params);
   const modelId = params.modelId as string;
   if (!modelId) throw new Error("setModel requires modelId");
   const ok = await applyModelSwitch(server, zcodeSid, modelId);
   if (!ok) throw new Error("setModel failed (model switch rejected)");
   log(`session/setModel → ${modelId} (updateRuntimeModelConfig)`);
+  // Broadcast so the other attached clients' dropdowns follow the switch.
+  await emitConfigOptionUpdate(server, cx, params.sessionId, zcodeSid, "model");
   return {};
 }
 
@@ -234,20 +253,12 @@ export async function setMode(
   if (resp.error) throw new Error(`setMode failed: ${resp.error.message}`);
   log(`session/setMode → ${mode}`);
   // Re-build configOptions (settings.mode.current is now updated) and emit
-  // config_option_update + current_mode_update so the editor UI reflects it.
-  const options = await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx));
-  await sendSessionUpdate(cx, acpSid, {
-    sessionUpdate: "config_option_update",
-    configOptions: options,
-  });
-  const modes = await buildModes(server, zcodeSid);
-  await sendSessionUpdate(cx, acpSid, {
-    sessionUpdate: "current_mode_update",
-    currentModeId: modes.currentModeId,
-  });
+  // config_option_update + current_mode_update to EVERY attached client, so
+  // the editor UI reflects it no matter which connection switched.
+  const { currentModeId } = await emitConfigOptionUpdate(server, cx, acpSid, zcodeSid, "mode");
   // Record the advertised mode so the turn-completion reconciliation knows the
   // client has already been told about this value.
-  server.lastMode.set(acpSid, modes.currentModeId);
+  if (currentModeId !== undefined) server.lastMode.set(acpSid, currentModeId);
   return (resp.result ?? {}) as Result;
 }
 

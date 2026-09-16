@@ -227,11 +227,15 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .onRequest("session/cancelBackgroundTask", extParams, (ctx) =>
         cancelBackgroundTask(server, ctx.params),
       )
-      .onRequest("session/setThoughtLevel", extParams, (ctx) => setThoughtLevel(server, ctx.params))
-      .onRequest("session/updateRuntimeModelConfig", extParams, (ctx) =>
-        updateRuntimeModelConfig(server, ctx.params),
+      .onRequest("session/setThoughtLevel", extParams, (ctx) =>
+        setThoughtLevel(server, ctx.params, server.clients.broadcast()),
       )
-      .onRequest("session/setModel", extParams, (ctx) => setModel(server, ctx.params))
+      .onRequest("session/updateRuntimeModelConfig", extParams, (ctx) =>
+        updateRuntimeModelConfig(server, ctx.params, server.clients.broadcast()),
+      )
+      .onRequest("session/setModel", extParams, (ctx) =>
+        setModel(server, ctx.params, server.clients.broadcast()),
+      )
       .onRequest("session/setMode", extParams, (ctx) =>
         setMode(server, ctx.params, server.clients.broadcast()),
       )

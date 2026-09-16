@@ -19,10 +19,11 @@ import {
   CONFIG_DISPATCH,
   CONFIG_META,
   log,
+  warn,
   ZCODE_CREDS_PATH,
 } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
-import { sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
+import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
 
 interface ProviderModelsJson {
   [modelId: string]: { limit?: { context?: number } } | undefined;
@@ -472,11 +473,22 @@ export async function setConfigOption(
 }
 
 /** Emit a config_option_update (+ current_mode_update for mode) after a change.
- *  Returns the rebuilt options so the caller can include them in the response.
+ *  Returns the rebuilt options (+ the advertised currentModeId for mode) so the
+ *  caller can include them in the response / mirror lastMode.
  *
- *  Every payload is ALSO broadcast to the other attached clients (the CLI
- *  window when the switch came from the phone, and vice versa) — a settings
- *  change is per-session state, not per-connection.
+ *  Every payload reaches EVERY attached client (the CLI window when the switch
+ *  came from the phone, and vice versa) — a settings change is per-session
+ *  state, not per-connection. Two shapes: a broadcast-proxy cx fans out to all
+ *  clients by itself, so the update is sent once PER SESSION ALIAS through it
+ *  (clients route by payload sessionId and drop ids they don't hold — a
+ *  client holding the conversation under another acpSid must still receive
+ *  it); a real per-connection cx sends to the initiator and then the rest via
+ *  sendSessionUpdateToOthers (which loops the aliases for the others). No
+ *  "others" leg on the proxy: it has no connectionContext to exclude anyone
+ *  by, so the leg would double-deliver.
+ *
+ *  Sends are best-effort: a dead initiator connection must not skip the
+ *  broadcast or fail the handler — the switch already succeeded backend-side.
  *
  *  For model switches, also emit a usage_update with the NEW model's context
  *  window (from config.json) so the editor's context bar refreshes immediately
@@ -487,22 +499,36 @@ export async function emitConfigOptionUpdate(
   acpSid: string,
   zcodeSid: string,
   kind: "model" | "mode" | "thought",
-): Promise<acp.SessionConfigOption[]> {
+): Promise<{ options: acp.SessionConfigOption[]; currentModeId?: string }> {
   const options = await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx));
+  const broadcastSource = isBroadcastSource(cx);
+  const send = (update: acp.SessionUpdate): Promise<void> => {
+    if (broadcastSource) {
+      return Promise.all(
+        server.sessionAliases(acpSid).map((sid) => sendSessionUpdate(cx, sid, update)),
+      ).then(() => undefined);
+    }
+    return sendSessionUpdate(cx, acpSid, update)
+      .then(() => sendSessionUpdateToOthers(server, cx, acpSid, update))
+      .catch((e: unknown) => {
+        warn(
+          `options: config update send failed (sid=${acpSid}): ${e instanceof Error ? e.message : String(e)}`,
+        );
+      });
+  };
   const configUpdate: acp.SessionUpdate = {
     sessionUpdate: "config_option_update",
     configOptions: options,
   };
-  await sendSessionUpdate(cx, acpSid, configUpdate);
-  sendSessionUpdateToOthers(server, cx, acpSid, configUpdate);
+  await send(configUpdate);
+  let currentModeId: string | undefined;
   if (kind === "mode") {
     const modes = await buildModes(server, zcodeSid);
-    const modeUpdate: acp.SessionUpdate = {
+    currentModeId = modes.currentModeId;
+    await send({
       sessionUpdate: "current_mode_update",
       currentModeId: modes.currentModeId,
-    };
-    await sendSessionUpdate(cx, acpSid, modeUpdate);
-    sendSessionUpdateToOthers(server, cx, acpSid, modeUpdate);
+    });
   }
   if (kind === "model") {
     // Refresh the context bar: the backend's projection.contextWindow lags
@@ -518,20 +544,18 @@ export async function emitConfigOptionUpdate(
       const modelOpt = options.find((o) => o.id === "model");
       const { providerId, modelId } = parseModelValue(String(modelOpt?.currentValue ?? ""));
       const size = modelContextWindow(providerId, modelId);
-      const usageUpdate: acp.SessionUpdate = {
+      await send({
         sessionUpdate: "usage_update",
         used,
         size,
-      };
-      await sendSessionUpdate(cx, acpSid, usageUpdate);
-      sendSessionUpdateToOthers(server, cx, acpSid, usageUpdate);
+      });
     } catch (e) {
       log(
         `options: usage_update after model switch failed (${e instanceof Error ? e.message : String(e)})`,
       );
     }
   }
-  return options;
+  return { options, ...(currentModeId !== undefined ? { currentModeId } : {}) };
 }
 
 // ---------- helpers ----------

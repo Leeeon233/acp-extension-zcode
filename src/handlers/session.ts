@@ -1862,7 +1862,13 @@ export async function setConfigOptionHandler(
   if (!result) {
     throw new Error(`unsupported config option or switch failed: ${params.configId}`);
   }
-  const options = await emitConfigOptionUpdate(server, cx, params.sessionId, zcodeSid, result.kind);
+  const { options } = await emitConfigOptionUpdate(
+    server,
+    cx,
+    params.sessionId,
+    zcodeSid,
+    result.kind,
+  );
   return { configOptions: options };
 }
 
