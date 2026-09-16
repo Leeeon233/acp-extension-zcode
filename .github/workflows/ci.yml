@@ -64,11 +64,6 @@ jobs:
       - name: Test
         run: pnpm test
 
-      - name: TUI smoke
-        # Headless wiring check (ADR-0020): martty --check-runtime spawns the
-        # built bridge and runs the ACP initialize handshake.
-        run: pnpm run smoke:tui
-
   bun-runtime:
     # Dual-runtime path (src/runtime.ts): with Bun >=1.4 on PATH the bridge
     # re-execs into `bun --smol` — keep that path covered so Node↔Bun drift
@@ -110,4 +105,3 @@ jobs:
         run: |
           bun --version
           node dist/cli.js server < /dev/null
-          node dist/cli.js tui --check

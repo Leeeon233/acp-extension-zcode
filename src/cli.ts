@@ -1,16 +1,16 @@
 #!/usr/bin/env node
 
 /**
- * Unified CLI entry (`zcode-acp`). Every operational surface is a subcommand;
- * bare invocation opens the interactive Martty TUI (ADR-0020). See docs/adr
- * 0007 for why the old `zcode-acp-hub` / `zcode-quota` bins were folded in
- * here and why `zcode-acp-server` remains as a compatibility bin alias
- * pointing at this same file.
+ * Unified CLI entry (`acp-extension-zcode`). Bare invocation starts the
+ * editor-facing ACP bridge over stdio; remaining subcommands cover quota,
+ * the remote hub, and headless serve/testing. See docs/adr 0007 for why the
+ * old `zcode-acp-hub` / `zcode-quota` bins were folded in here and why
+ * `zcode-acp-server` remains as a compatibility bin alias.
  *
  * The stdio-server alias is detected via argv[0]: npm/pnpm install bin names
- * as symlinks, so `acp-extension-zcode`, `zcode-acp`, and `zcode-acp-server`
- * resolve to dist/cli.js while Node keeps the invoked path in argv — basename
- * tells us which name the user (or editor config) actually typed.
+ * as symlinks, so `acp-extension-zcode` and `zcode-acp-server` resolve to
+ * dist/cli.js while Node keeps the invoked path in argv — basename tells us
+ * which name the user (or editor config) actually typed.
  */
 
 import { basename } from "node:path";
@@ -20,13 +20,11 @@ import { main as runHub } from "./bin/hub.js";
 import { main as runQuota } from "./bin/quota.js";
 import { main as runServer, runHeadless } from "./index.js";
 import { reexecToBunIfEligible } from "./runtime.js";
-import { checkTuiRuntime, runTui } from "./tui.js";
 import { AGENT_INFO } from "./utils.js";
 
 /** What the dispatcher decided to run. `args` are the tokens after the subcommand. */
 export type Invocation =
   | { kind: "help" }
-  | { kind: "tui"; explicit: boolean; check: boolean }
   | { kind: "server" }
   | { kind: "serve" }
   | { kind: "hub" }
@@ -38,19 +36,21 @@ export type Invocation =
  *
  * `invokedAs` is basename(argv[1]); `acp-extension-zcode` (and the legacy
  * `zcode-acp-server`) means we were spawned by an editor config that expects
- * the bridge to speak ACP on stdio with no subcommand prefix. Bare
- * `zcode-acp` opens the interactive Martty TUI; `repl` stays accepted as the
- * old spelling of `tui`.
+ * the bridge to speak ACP on stdio with no subcommand prefix. For the generic
+ * `zcode-acp`/`cli.js` entrypoint, bare invocation starts the same stdio
+ * server so editor shims and direct CLI runs keep working.
  */
+const SERVER_BIN_SUBCOMMANDS = new Set(["server", "serve", "hub", "quota", "-h", "--help", "help"]);
+
 export function resolveInvocation(invokedAs: string, argv: readonly string[]): Invocation {
-  if (invokedAs === "acp-extension-zcode" || invokedAs === "zcode-acp-server") {
+  if (invokedAs === "zcode-acp-server") {
+    return { kind: "server" };
+  }
+  if (invokedAs === "acp-extension-zcode" && !SERVER_BIN_SUBCOMMANDS.has(argv[0] ?? "")) {
     return { kind: "server" };
   }
   const sub = argv[0];
-  if (sub === undefined) return { kind: "tui", explicit: false, check: false };
-  if (sub === "repl" || sub === "tui") {
-    return { kind: "tui", explicit: true, check: argv.slice(1).includes("--check") };
-  }
+  if (sub === undefined) return { kind: "server" };
   if (sub === "-h" || sub === "--help" || sub === "help") {
     return { kind: "help" };
   }
@@ -68,15 +68,15 @@ export function resolveInvocation(invokedAs: string, argv: readonly string[]): I
   }
 }
 
-const HELP_TEXT = `Usage: zcode-acp [command] [options]
+const HELP_TEXT = `Usage: acp-extension-zcode [command] [options]
 
 The single entry point for every acp-extension-zcode surface. Bare invocation
-opens the interactive Martty TUI (agent chat in this terminal).
+starts the editor-facing ACP bridge over stdio.
 
 Commands:
-  (none) | tui       Interactive agent chat (Martty TUI): stream output,
-                      tool rows, model picker, session resume. /exit quits.
-                      'tui --check' runs a headless wiring check and exits.
+  (none) | server    The editor-facing ACP bridge over stdio (was
+                      zcode-acp-server; editors normally launch it via the
+                      acp-extension-zcode bin without this subcommand).
   quota [args...]   Plan usage cards (was the zcode-quota bin): -w watch,
                     -i <sec>, -d detail, -p plain, provider glm|go.
   hub               Run the remote-access hub daemon (was zcode-acp-hub;
@@ -85,16 +85,13 @@ Commands:
                     no stdio editor, lives for remote WS clients until idle.
                     Normally spawned by the hub, not run by hand (needs
                     ZCODE_ACP_REMOTE=1 + ZCODE_ACP_REMOTE_TOKEN).
-  server            The editor-facing ACP bridge over stdio (was
-                    zcode-acp-server; editors normally launch it via the
-                    acp-extension-zcode bin without this subcommand).
   -h, --help        Show this help.
   --version         Show the package version.
 
 Examples:
-  zcode-acp                                # chat interactively in this repo
-  zcode-acp quota -w                       # live usage monitor
-  zcode-acp server                         # stdio bridge (for testing)`;
+  acp-extension-zcode                      # stdio ACP bridge in this repo
+  acp-extension-zcode quota -w             # live usage monitor
+  acp-extension-zcode server               # stdio bridge (for testing)`;
 
 async function main(): Promise<void> {
   if (process.argv[2] === "--version") {
@@ -111,25 +108,6 @@ async function main(): Promise<void> {
   switch (invocation.kind) {
     case "help":
       process.stdout.write(HELP_TEXT + "\n");
-      return;
-    case "tui":
-      if (invocation.check) {
-        process.exitCode = (await checkTuiRuntime()) ? 0 : 1;
-        return;
-      }
-      if (process.stdin.isTTY && process.stdout.isTTY) {
-        await runTui();
-        return;
-      }
-      if (invocation.explicit) {
-        process.stderr.write("zcode-acp: interactive TUI needs a TTY — run it from a terminal.\n");
-        process.exit(2);
-      }
-      // Bare invocation without a TTY falls back to the stdio server: on
-      // Windows npm shims spawn `node ...\dist\cli.js`, so argv[0] loses the
-      // bin name and editors configured with either bin land here. Unix
-      // pipes get the same fallback (JSON-RPC on stdin, exit on EOF).
-      await runServer();
       return;
     case "server":
       await runServer();

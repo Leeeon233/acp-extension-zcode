@@ -407,37 +407,38 @@ export function resolveTerminalLaunches(prefs: TerminalPrefs): TerminalLaunch[] 
 /**
  * The .command script body. The incubation env MUST be embedded as exports:
  * the script runs in a fresh shell spawned by the terminal app, which
- * inherits launchd's environment — NOT the hub's — so without them the TUI
- * would boot as a plain local session and never register back (the
- * incubation would stall into its timeout). Everything ZCODE_ACP_* travels;
- * values are single-quoted.
+ * inherits launchd's environment — NOT the hub's — so without them the
+ * visible bridge would boot as a plain local session and never register back
+ * (the incubation would stall into its timeout). Everything ZCODE_ACP_*
+ * travels; values are single-quoted.
+ *
+ * The script runs the explicit `serve` subcommand: bare CLI invocations are
+ * reserved for the editor-facing stdio bridge now that the terminal TUI has
+ * been removed.
  */
 export function terminalTuiScript(cwd: string, cliJs: string, env: NodeJS.ProcessEnv): string {
   const exports = Object.keys(env)
-    // DSH_TUI_AUTOPROMPT is the one non-ZCODE_ACP_* passenger: the boot-resume
-    // banner handshake (martty reads it at its own process start).
     .filter((k) => k.startsWith("ZCODE_ACP_") || k === "DSH_TUI_AUTOPROMPT")
     .map((k) => `export ${k}=${shQuote(String(env[k]))}`);
   // Prefer bun --smol for the long-lived bridge (src/runtime.ts); the tokens
   // are quoted individually because the interpreter may carry flags.
   const rt = resolveRuntime();
-  const execLine = [rt.command, ...rt.preArgs, cliJs].map(shQuote).join(" ");
+  const execLine = [rt.command, ...rt.preArgs, cliJs, "serve"].map(shQuote).join(" ");
   return [
     "#!/bin/sh",
-    `# Hub-incubated TUI session (ADR-0016): closing this window ends the bridge.`,
+    `# Hub-incubated visible bridge (ADR-0016): closing this window ends the bridge.`,
     `cd ${shQuote(cwd)} || exit 1`,
     ...exports,
     // OSC 0 names the tab after the conversation — without it terminals show
     // the running process ("node"). printf reads the \033/\007 escapes from
-    // the format string; %s keeps the value itself shell-safe. martty never
-    // sets a terminal title, so this survives until the window closes.
+    // the format string; %s keeps the value itself shell-safe.
     ...(env.ZCODE_ACP_TAB_TITLE !== undefined
       ? [`printf '\\033]0;%s\\007' "$ZCODE_ACP_TAB_TITLE"`]
       : []),
     // $$ survives exec as the cli's pid — and as the terminal's foreground
-    // process-group leader it names the whole TUI tree (cli → martty → bridge).
-    // Remote session-close SIGTERMs this GROUP to tear the window's CLI down
-    // (see session-close-endpoint.ts); a bare pid would orphan the Rust host.
+    // process-group leader it names the whole bridge tree. Remote session-close
+    // SIGTERMs this GROUP to tear the window's CLI down (see
+    // session-close-endpoint.ts).
     `export ZCODE_ACP_TUI_CLI_PID=$$`,
     `exec ${execLine}`,
     "",
@@ -448,7 +449,7 @@ export function terminalTuiScript(cwd: string, cliJs: string, env: NodeJS.Proces
 const TUI_SCRIPT_MAX_AGE_MS = 60 * 60 * 1000;
 
 /**
- * Write the throwaway .command script for a terminal TUI incubation.
+ * Write the throwaway .command script for a visible terminal incubation.
  *
  * Preferred location: `<workspace>/.zcode/tmp/tui-XXXX.command`. Terminal apps
  * bind the new tab's project root to the script's PARENT directory (Warp's
@@ -526,14 +527,14 @@ export function writeTuiScript(workspace: string, cliJs: string, env: NodeJS.Pro
 }
 
 /**
- * Spawn session-create as a VISIBLE interactive TUI (ADR-0016): write a
- * throwaway .command script (`cd <project> && exec node cli.js`) and hand it
- * to ONE resolved terminal launch — the user gets a real terminal window
- * running the local CLI instead of an invisible daemon. The TUI's bridge
+ * Spawn session-create as a VISIBLE terminal bridge (ADR-0016): write a
+ * throwaway .command script (`cd <project> && exec node cli.js serve`) and
+ * hand it to ONE resolved terminal launch — the user gets a real terminal
+ * window running the local bridge instead of an invisible daemon. The bridge
  * child inherits the remote ENV, so the incubation registers exactly like a
- * serve bridge; closing the window ends the bridge (its lifetime follows
- * the terminal, the ADR-0001 anchor). Returns null when the launch fails —
- * platform without GUI support or the open erroring (pre-1.3 Ghostty,
+ * detached serve bridge; closing the window ends the bridge (its lifetime
+ * follows the terminal, the ADR-0001 anchor). Returns null when the launch
+ * fails — platform without GUI support or the open erroring (pre-1.3 Ghostty,
  * denied Automation permission) — and the CALLER walks down the terminal
  * preference list, falling back to the detached serve spawn only after the
  * list is exhausted.

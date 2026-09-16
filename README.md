@@ -9,11 +9,11 @@ A standalone [Agent Client Protocol](https://agentclientprotocol.com/) (ACP) ser
 
 The server launches the ZCode headless app-server (`zcode app-server --stdio`) as a subprocess, translates its internal event stream into ACP `session/update` notifications, and bridges ZCode's interaction channel to ACP — preferring `elicitation/create` when the client supports it, and falling back to `session/request_permission` otherwise — so an editor gets a first-class, native coding-agent experience.
 
-## Why zcode-acp
+## Why acp-extension-zcode
 
 - **Native editor experience** — streaming diffs, permission prompts and plan mode in Zed / JetBrains' own agent panel. No side-by-side terminal.
 - **The official harness, not a reimplementation** — drives the real `zcode app-server`: native tools, skills, MCP and slash commands, auto-compaction, session resume/fork.
-- **Beyond the editor** — an interactive terminal chat (`zcode-acp`, a [Martty](https://github.com/openma-ai/Martty)-powered TUI, works over SSH), phone/web access to the same sessions (`zcode-acp-remote`), opt-in writes-only sandbox. Credentials stay in `~/.zcode`.
+- **ACP-first surface** — bare `acp-extension-zcode` starts the stdio ACP server directly; optional phone/web access to the same sessions and opt-in writes-only sandbox remain available. Credentials stay in `~/.zcode`.
 
 Because it drives the real ZCode client, your GLM Coding Plan comes along untouched — current perks (the 150% quota bonus, priority routing over raw API) and the plan's flat-rate economics apply exactly as in the official app. No API keys in editor settings.
 
@@ -159,12 +159,14 @@ the primary client. Discovery API, tunnels, auth, and semantics:
 [docs/REMOTE.md](docs/REMOTE.md); the client integration contract:
 [docs/REMOTE-CLIENTS.md](docs/REMOTE-CLIENTS.md).
 
-## Unified CLI (`zcode-acp`)
+## CLI (`acp-extension-zcode`)
 
-One command for every surface: an interactive terminal chat TUI (`zcode-acp`,
-powered by Martty), plan quota cards (`zcode-acp quota`, GLM + Opencode Go),
-the remote hub daemon (`zcode-acp hub`), and the stdio server editors invoke
-(`zcode-acp server`). TUI keys and quota setup: [docs/CLI.md](docs/CLI.md).
+Bare `acp-extension-zcode` starts the stdio ACP server editors invoke.
+Optional subcommands cover plan quota cards (`acp-extension-zcode quota`,
+GLM + Opencode Go), the remote hub daemon (`... hub`), and a headless bridge
+for remote session-create (`... serve`). The interactive Martty TUI and its
+`zcode-acp-martty` dependency were removed; setup details:
+[docs/CLI.md](docs/CLI.md).
 
 ## ACP Registry
 
@@ -201,7 +203,7 @@ The server is organised in layers that mirror the ACP protocol:
 - `handlers/` — ACP method handlers (`session/new`, `session/prompt`, ...) and the turn engine
 - `config/` — model / mode / thought-level configOptions and runtime model switching
 - `remote/` — opt-in remote access: loopback ACP endpoint, multi-client broadcast, hub registration
-- `quota/` — GLM Coding Plan / Opencode Go usage API client (`/quota` command, `zcode-acp quota` subcommand)
+- `quota/` — GLM Coding Plan / Opencode Go usage API client (`/quota` command, `acp-extension-zcode quota` subcommand)
 - `server.ts` — shared state and handler registration
 - `index.ts` — stdio wiring via the ACP SDK
 
@@ -222,7 +224,7 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full architecture docum
 - [Protocol](docs/PROTOCOL.md) — ZCode JSON-RPC protocol details
 - [Sandbox](docs/SANDBOX.md) — full sandbox manual (switches, whitelist, popups, verification)
 - [Remote Access](docs/REMOTE.md) — hub, discovery API, tunnels, remote session-create
-- [Unified CLI](docs/CLI.md) — interactive TUI, quota cards, hub/server subcommands
+- [CLI](docs/CLI.md) — ACP server, quota cards, hub/serve subcommands
 - [Remote Clients](docs/REMOTE-CLIENTS.md) — remote access integration contract (discovery, transport, recovery)
 - [Replay Guide](docs/REPLAY-GUIDE.md) — building a client UI on tail replay
 - [Development](docs/DEVELOPMENT.md) — local development, debugging, adding extension methods
