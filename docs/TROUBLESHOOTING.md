@@ -92,6 +92,21 @@ builtin path verbatim when BOTH `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` and
    wart, not the switching bug. The success signal is the following
    `session.model.updated` event in the same log.
 
+### Switching to a GLM model works but every send fails / retries forever
+
+**Symptom:** the model picker shows the GLM model after switching, but sending a
+message errors immediately and retries; the backend log shows
+`model.request.failed` with `reason:"unknown"` on `account:bigmodel-…` providers.
+
+**Why:** the 3.12+ backend asks its host for provider runtime headers
+(`interaction/requestProviderRuntimeHeaders`) before EVERY model request on an
+account provider. A `headersApplied:false` answer makes the turn fail with
+-32031 and retry. The bridge (0.42.5+) answers with the coding plan's API key
+from `~/.zcode/v2/config.json` (`codingPlanRequestAuthFor`) — if sends still
+fail, check that the enabled `builtin:bigmodel-coding-plan` entry carries a
+non-empty `options.apiKey` in that file. Start-plan providers stay declined
+(Aliyun captcha — desktop app only, issue #123).
+
 ### Authentication / credential errors (401, provider auth failed)
 
 **Symptom:** turns fail with authentication errors (e.g. `401`, `provider auth failed`, `invalid api key`), or `~/.zcode/v2/config.json` is missing.

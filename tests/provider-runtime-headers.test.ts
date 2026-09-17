@@ -21,6 +21,18 @@ vi.mock("../src/handlers/io.js", () => ({
   sendSessionUpdate: vi.fn().mockResolvedValue(undefined),
 }));
 
+// Coding-plan request auth resolves against the user's real HOME files
+// (config.json + the builtin table); the hermetic tests mock both lookups.
+vi.mock("../src/config/account-provider.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/config/account-provider.js")>();
+  return {
+    ...actual,
+    codingPlanRequestAuthFor: vi.fn((providerId: string | undefined): { apiKey: string } | null =>
+      providerId === "account:bigmodel-individual-coding-plan" ? { apiKey: "test-key" } : null,
+    ),
+  };
+});
+
 import { handleServerRequests } from "../src/handlers/server-requests.js";
 
 function makeServer(): ZcodeAcpServer {
@@ -83,5 +95,34 @@ describe("interaction/requestProviderRuntimeHeaders", () => {
       headersApplied: false,
       errorMessage: "turn cancelled",
     });
+  });
+
+  it("serves the coding-plan API key for an individual-plan account provider", async () => {
+    const server = makeServer();
+    const backend = makeBackend([
+      {
+        id: 303,
+        method: "interaction/requestProviderRuntimeHeaders",
+        params: {
+          requestId: "zs1:provider-runtime-headers:2",
+          sessionId: "zs1",
+          providerId: "account:bigmodel-individual-coding-plan",
+          modelSelection: {
+            providerId: "account:bigmodel-individual-coding-plan",
+            modelId: "GLM-5.3",
+          },
+          reason: "model-request",
+        },
+      },
+    ]);
+    const cx = { request: vi.fn() } as unknown as acp.AgentContext;
+
+    const handled = await handleServerRequests(server, backend, cx, "s1");
+    expect(handled).toBe(true);
+    expect(backend.sendReply).toHaveBeenCalledWith(303, {
+      headersApplied: true,
+      requestAuth: { apiKey: "test-key" },
+    });
+    expect(cx.request).not.toHaveBeenCalled();
   });
 });

@@ -169,7 +169,21 @@ ZCode protocol types into ACP notifications directly — always translate.
   constraint failed") fires on EVERY setModel since at least 2026-09-14 —
   including working third-party switches — it is a backend-side persistence
   wart, NOT a switch failure (the following `session.model.updated` event is
-  the success signal); don't chase it as a switching bug.
+  the success signal); don't chase it as a switching bug. **Account turns
+  also need runtime headers**: the backend asks its host
+  `interaction/requestProviderRuntimeHeaders` before EVERY model request on a
+  `zhipu-account` provider and a `headersApplied:false` answer throws -32031
+  (every send on a GLM model dies in a retry loop — observed 2026-09-17 after
+  switching started working; the switch looked fine, sends never ran). The
+  bridge answers `headersApplied:true, requestAuth:{apiKey}` with the plan's
+  config.json key for individual coding plans
+  (`codingPlanRequestAuthFor`, server-requests.ts) — the same key the
+  pre-3.12 `builtin:` provider used; start-plan stays declined (Aliyun
+  captcha, #123). The backend's own "standalone" self-signing channel needs
+  an identity credential pair in its ENCRYPTED store
+  (`account-provider:…:account:<uid>:api-key` exists but the `…:identity`
+  half was never written on the observed machine), so the bridge cannot rely
+  on it.
 - **The backend ignores `session/stop`** (verified against app-server 0.16.5 —
   the model stream runs to its natural end no matter what). Cancel is therefore
   bridge-side only: the turn loop returns `cancelled` at once, and the next

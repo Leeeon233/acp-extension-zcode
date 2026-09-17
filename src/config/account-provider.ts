@@ -217,8 +217,44 @@ function entitledBuiltinProviders(): Set<string> {
   return out;
 }
 
-/** The `provider/updateAccountConfig` payload (schema-verified shape). */
-export interface AccountProviderPayload {
+/**
+ * The request auth the bridge can serve for an `account:*` coding-plan model,
+ * or null when it cannot answer.
+ *
+ * The 3.12+ backend asks its host for provider runtime headers before EVERY
+ * model request on a `zhipu-account` provider (bundle-verified: the only other
+ * suppliers are the desktop host and the CLI's own "standalone" credential
+ * pair, whose identity half this machine never wrote — the api-key half sits
+ * in the CLI's ENCRYPTED credential store, unreadable here). The desktop
+ * answers with the plan's API key; the bridge can serve the same plan's key
+ * from legacy config.json — the same key the pre-3.12 `builtin:` provider of
+ * that plan used. Only the individual coding plan is served: start-plan needs
+ * an Aliyun captcha (stays refused, issue #123), and team/off-peak keys are
+ * store-encrypted.
+ */
+export function codingPlanRequestAuthFor(
+  accountProviderId: string | undefined,
+): { apiKey: string } | null {
+  if (!accountProviderId?.startsWith("account:")) return null;
+  const rule = readBuiltinTable()?.table.config?.providerConfigRules?.providerRules?.find(
+    (r) => r.providerId === accountProviderId,
+  );
+  if (rule?.config?.access?.mode !== "individual-coding-plan") return null;
+  const legacyId = configProviderIdFor(accountProviderId);
+  if (legacyId === accountProviderId) return null;
+  if (!entitledBuiltinProviders().has(legacyId)) return null;
+  try {
+    const cfg = JSON.parse(readFileSync(ZCODE_CREDS_PATH, "utf8")) as {
+      provider?: Record<string, { enabled?: boolean; options?: { apiKey?: string } }>;
+    };
+    const apiKey = cfg.provider?.[legacyId]?.options?.apiKey?.trim();
+    return apiKey ? { apiKey } : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The `provider/updateAccountConfig` payload (schema-verified shape). */ export interface AccountProviderPayload {
   revision: string;
   basedOnZCodeBuiltinRevision: string;
   providers: Record<
