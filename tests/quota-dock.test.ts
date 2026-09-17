@@ -160,26 +160,26 @@ describe("formatOcDockSegment", () => {
   it("shows ONLY the largest window the plan exposes, with its reset stamp", () => {
     // Monthly wins when present (credit plans) — session/weekly are dropped.
     expect(
-      formatOcDockSegment(ocSuccess({ monthly: 0.3, monthlyResetAt: NOW + 5 * 86_400_000 })),
-    ).toBe(`oc mo 30% ${date(NOW + 5 * 86_400_000)}`);
+      formatOcDockSegment(ocSuccess({ monthly: 0.304, monthlyResetAt: NOW + 5 * 86_400_000 })),
+    ).toBe(`oc 30.4% ${date(NOW + 5 * 86_400_000)}`);
     // Weekly-only plans show the weekly window.
     expect(
       formatOcDockSegment(ocSuccess({ weekly: 0.42, weeklyResetAt: NOW + 2 * 86_400_000 })),
-    ).toBe(`oc wk 42% ${date(NOW + 2 * 86_400_000)}`);
+    ).toBe(`oc 42% ${date(NOW + 2 * 86_400_000)}`);
     // Legacy session window carries a clock-time reset.
     expect(
       formatOcDockSegment(ocSuccess({ session: 0.423, sessionResetAt: NOW + 3_600_000 })),
-    ).toBe(`oc 5h 42% ${clock(NOW + 3_600_000)}`);
+    ).toBe(`oc 42.3% ${clock(NOW + 3_600_000)}`);
   });
 
   it("omits the stamp when the reset moment is unknown (monthly /api/me failure)", () => {
-    expect(formatOcDockSegment(ocSuccess({ monthly: 0.6 }))).toBe("oc mo 60%");
-    expect(formatOcDockSegment(ocSuccess({ weekly: 0.2 }))).toBe("oc wk 20%");
+    expect(formatOcDockSegment(ocSuccess({ monthly: 0.603 }))).toBe("oc 60.3%");
+    expect(formatOcDockSegment(ocSuccess({ weekly: 0.2 }))).toBe("oc 20%");
   });
 
   it("clamps out-of-range fractions and nulls when nothing is usable", () => {
     expect(formatOcDockSegment(ocSuccess({ session: 1.4, sessionResetAt: NOW }))).toBe(
-      `oc 5h 100% ${clock(NOW)}`,
+      `oc 100% ${clock(NOW)}`,
     );
     expect(formatOcDockSegment(ocSuccess({}))).toBeNull();
     expect(formatOcDockSegment({ kind: "not_configured" })).toBeNull();
