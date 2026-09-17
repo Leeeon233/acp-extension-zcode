@@ -117,6 +117,53 @@ function discoverZcodeBin(): string | null {
   return null;
 }
 
+// ---------- provider-runtime env injection (3.12.3+ desktop bundles) ----------
+
+/**
+ * The CLI's built-in provider table. The desktop app's host resolves it as
+ * `<resources>/config/provider/zcode-builtin.json` and hands it to the CLI via
+ * `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` (verified in app.asar 3.12.3 — the env
+ * skips the CLI's own file lookup entirely). That lookup only knows the
+ * npm/dev layouts (`<entryDir>/provider/` and a five-up `config/` for the
+ * monorepo tree), so a .app-bundled `zcode.cjs` launched bare exits during
+ * boot with `无法定位 CLI ZCode Built-in Provider Config` (observed 2026-09:
+ * exit 1 in <1s, every bridge backend spawn dead until the CLI's
+ * `~zcode/v2/runtime/provider` sync happens to run — which itself needs a
+ * valid source, so post-update machines sit dead).
+ */
+const PROVIDER_CONFIG_NAME = "zcode-builtin.json";
+export const BUILTIN_PROVIDER_ENV = "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE";
+
+/**
+ * Env vars pointing the CLI at its built-in provider table, mirroring the
+ * desktop host's own injection. Locates the file next to the resolved CLI
+ * entry (sibling `provider/` — npm/dev layout — or `../config/provider/` —
+ * the .app bundle layout) and returns `{ZCODE_BUILTIN_PROVIDER_CONFIG_FILE}`;
+ * `{}` when the entry is not a JS file, is missing, or carries no provider
+ * config anywhere (old CLIs, PATH installs) — those boot without one.
+ *
+ * The derived value deliberately OVERRIDES any inherited ambient env: the
+ * host injects version-keyed runtime paths
+ * (`…/runtime/provider/<plat>/<appVersion>/endpoint-<hash>/zcode-builtin.json`)
+ * that go stale or vanish across app updates, while the derived path always
+ * matches the entry about to be launched. Only a {} result (no adjacent
+ * config) leaves the ambient value untouched — for a non-bundled CLI that
+ * ambient value is the best hint.
+ */
+export function builtinProviderEnv(entryArg?: string): NodeJS.ProcessEnv {
+  const entry = entryArg ?? process.env.ZCODE_BIN ?? discoverZcodeBin();
+  if (!entry || !/\.(cjs|mjs|js)$/.test(entry)) return {};
+  const abs = path.resolve(entry);
+  if (!existsSync(abs)) return {};
+  const dir = path.dirname(abs);
+  const candidates = [
+    path.join(dir, "provider", PROVIDER_CONFIG_NAME),
+    path.join(dir, "..", "config", "provider", PROVIDER_CONFIG_NAME),
+  ];
+  const found = candidates.find((c) => existsSync(c));
+  return found ? { [BUILTIN_PROVIDER_ENV]: found } : {};
+}
+
 /**
  * Happy Eyeballs (`autoSelectFamily`, on by default since Node 20.13) gives
  * each connect attempt a 250ms budget. On a network with no IPv6 route where

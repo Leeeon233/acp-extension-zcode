@@ -28,11 +28,24 @@
    - If not found, set: `export ZCODE_BIN=/path/to/zcode`
 
 3. Check the ZCode configuration:
+
    ```bash
    cat ~/.zcode/v2/config.json
    ```
    - Confirm a `provider` is enabled
    - Confirm `models` are defined
+
+4. Desktop-app CLI (3.12.3+) exits instantly with
+   `无法定位 CLI ZCode Built-in Provider Config`: the bundled CLI expects the
+   host to pass its provider table via `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`
+   (the desktop app does exactly that); launched bare, its own file lookup
+   cannot find the copy the bundle ships at `Resources/config/provider/`.
+   The bridge injects the env automatically (see `builtinProviderEnv` in
+   `src/backend/resolve.ts`), deriving the path from the CLI it launches —
+   the derived value also overrides an inherited ambient copy, which is
+   version-keyed and goes stale across app updates. To force a custom table,
+   point `ZCODE_BIN` at a CLI whose directory carries no adjacent
+   `zcode-builtin.json` and export the env var yourself.
 
 ### Authentication / credential errors (401, provider auth failed)
 
@@ -368,9 +381,11 @@ or a WS connect to it fails.
 
 1. Hard-killed bridges (Zed force-kill, crash) never unregister — the hub's
    heartbeat TTL drops them within ~30s.
-2. For an immediately-honest list, call `GET /api/instances?probe=1`: the hub
-   TCP-probes each registered port and prunes unreachable bridges first.
-   Clients should use this on refresh.
+2. For an honest list without waiting out the TTL, call
+   `GET /api/instances?probe=1`: the hub TCP-probes each registered port and
+   prunes bridges that stay unreachable ~8s (one failed probe only marks the
+   instance unhealthy — a busy bridge can stall past the probe timeout while
+   alive). Clients should use this on refresh.
 3. A few-seconds outage after upgrading the package is expected: a newer
    bridge triggers the hub's version-handshake restart, then re-spawns it.
 

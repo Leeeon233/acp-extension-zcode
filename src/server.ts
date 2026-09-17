@@ -10,6 +10,7 @@
 import type * as acp from "@agentclientprotocol/sdk";
 
 import {
+  builtinProviderEnv,
   loadZcodeCredentials,
   mergeEnvWithCreds,
   resolveZcodeCommand,
@@ -367,7 +368,9 @@ export class ZcodeAcpServer {
    */
   ensureBackend(): ZcodeBackend {
     if (this.backend && !this.backend.isDead) return this.backend;
-    const env = mergeEnvWithCreds(loadZcodeCredentials());
+    // builtinProviderEnv injects the CLI's built-in provider table the way the
+    // desktop host does — a bare .app-bundle CLI cannot find it on its own.
+    const env = { ...mergeEnvWithCreds(loadZcodeCredentials()), ...builtinProviderEnv() };
     let argv = resolveZcodeCommand();
     this.backendSandboxed = sandboxActive(this.sandboxRoots());
     if (this.backendSandboxed) {

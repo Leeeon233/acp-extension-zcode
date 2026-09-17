@@ -96,6 +96,30 @@ ZCode protocol types into ACP notifications directly — always translate.
 - **ZCode backend version drift**: the backend may change event payloads between
   releases. When diff display or event handling breaks, check the raw backend
   event with `ZCODE_ACP_DEBUG=1` before changing translator code.
+- **3.12.3+ desktop bundles pass the CLI's provider table via env, not the
+  filesystem** (observed 2026-09; the CLI still self-reports "0.16.5"): the
+  desktop host resolves `zcode-builtin.json` at `Resources/config/provider/`
+  and injects it as `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` (verified in
+  app.asar). The CLI's own lookup only knows `<entryDir>/provider/` and a
+  five-up `config/` for the dev monorepo tree — which lands on `/` under the
+  .app layout — so a bare bundle spawn exits in <1s (the
+  "无法定位 CLI ZCode Built-in Provider Config" error, code 1) and stays dead
+  after each app update until the CLI's
+  `~/.zcode/v2/runtime/provider/<plat>/<ver>/endpoint-<hash>/` sync happens
+  to run (itself needing a valid source). `builtinProviderEnv`
+  (src/backend/resolve.ts, merged in `ensureBackend`) mirrors the host's
+  injection: locate the config next to the CLI entry (sibling `provider/`, or
+  `../config/provider/`) and set the env for the spawn. The derived value
+  OVERRIDES any inherited ambient copy — the host injects version-keyed
+  runtime paths that go stale across app updates. Boot frames are queued, not
+  dropped, but a COLD first boot can exceed 20s (provider sync fetch) — a
+  one-off request timeout; the next attempt succeeds. The update is otherwise
+  compatible: session/create already speaks the `{workspace:{…}}` /
+  `result.session.*` shape the bridge uses, `startup/storageState`
+  notifications are boot noise, tasks-index.sqlite only grew defaulted
+  columns after our INSERT list, and unknown server→client requests
+  (`interaction/requestOfficialMcpAuthHeaders`) land safely in the
+  unhandled-request error path.
 - **The backend ignores `session/stop`** (verified against app-server 0.16.5 —
   the model stream runs to its natural end no matter what). Cancel is therefore
   bridge-side only: the turn loop returns `cancelled` at once, and the next
