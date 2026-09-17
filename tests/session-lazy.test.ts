@@ -102,6 +102,11 @@ function fakeBackend(
           };
         case "workspace/updateProviderRegistry":
           return { id, result: {} };
+        case "provider/updateAccountConfig":
+          return {
+            id,
+            result: { receivedRevision: "account:test", providerCount: 0, status: "received" },
+          };
         case "session/list":
           return { id, result: { sessions: listed } };
         case "session/read":
@@ -236,8 +241,11 @@ describe("ensureRealSession", () => {
 
     await expect(ensureRealSession(server, "acp_old_unused")).resolves.toBe("sess_lazy_1");
     expect(server.resolveSid("acp_old_unused")).toBe("sess_lazy_1");
-    expect(calls.filter((c) => c.method === "session/create")).toHaveLength(1);
-    expect(calls[0].params).toMatchObject({
+    const creates = calls.filter((c) => c.method === "session/create");
+    expect(creates).toHaveLength(1);
+    // Look the create up by method, not by index — the account-provider push
+    // (provider/updateAccountConfig) precedes it, so calls[0] is not the create.
+    expect(creates[0]!.params).toMatchObject({
       workspace: { workspacePath: "/tmp/ws", workspaceKey: "/tmp/ws" },
     });
   });

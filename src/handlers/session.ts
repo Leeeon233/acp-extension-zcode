@@ -45,6 +45,7 @@ import {
   startQuotaRefresher,
 } from "../quota/live.js";
 import { buildProviderRegistry } from "../config/provider-registry.js";
+import { pushAccountProviderConfig } from "../config/account-provider.js";
 import { applyModelSwitch, buildResumeRuntimeModel } from "../config/runtime-model.js";
 import { messages } from "../i18n.js";
 import {
@@ -160,6 +161,14 @@ function workspaceFromResumeResult(result: unknown): string | null {
  */
 async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promise<void> {
   try {
+    // Account-plan providers first: 3.12+ app-servers build their registry from
+    // the bundled table + personal config + an ACCOUNT snapshot the desktop
+    // host pushes (`provider/updateAccountConfig`). Headless launches have no
+    // host, so every `account:*` provider stays entitled:false and the GLM
+    // models the user's config selects never reach `settings.model.available`
+    // (verified 2026-09 — switches then fail with "Provider Registry 中不存在
+    // Model"). Pushing the snapshot restores desktop parity. Best-effort.
+    await pushAccountProviderConfig(server.ensureBackend(), () => server.nextId());
     const registry = buildProviderRegistry();
     if (registry.providers.length === 0) {
       // Every configured provider lacks models (or none are configured). The
@@ -179,7 +188,13 @@ async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promis
         10000,
       );
     if (resp.error) {
-      warn(`provider-registry: sync failed: ${resp.error.message}`);
+      // 3.12+ removed the method (the registry is built from the bundled table,
+      // personal config, and the account snapshot) — a no-op, not a failure.
+      if (resp.error.code === -32601) {
+        log("provider-registry: backend has no workspace/updateProviderRegistry (3.12+)");
+      } else {
+        warn(`provider-registry: sync failed: ${resp.error.message}`);
+      }
       return;
     }
     log("provider-registry: synced to backend");
@@ -562,6 +577,28 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
     const session = result.session ?? {};
     const sid = session.sessionId;
     if (!sid) throw new Error("zcode create returned no sessionId");
+
+    // Cache the FULL model-availability list: session/create is the only
+    // response carrying every model with its reasoning metadata. Model
+    // switches resolve a target's default level from here (the object form of
+    // session/setModel rejects level-bearing models without one).
+    type AvailEntry = {
+      ref?: { providerId?: string; modelId?: string };
+      reasoning?: { defaultLevel?: string; levels?: Array<{ value?: string }> };
+    };
+    const availability = ((result.settings ?? {}) as Record<string, unknown>).model as
+      { available?: AvailEntry[] } | undefined;
+    const avail = availability?.available ?? [];
+    if (avail.length > 0) {
+      server.modelAvailability.set(
+        sid,
+        avail.map((a) => ({
+          providerId: a.ref?.providerId,
+          modelId: a.ref?.modelId,
+          defaultLevel: a.reasoning?.defaultLevel ?? a.reasoning?.levels?.[0]?.value,
+        })),
+      );
+    }
 
     server.pendingSessions.delete(acpSid);
     server.registerSession(acpSid, sid);

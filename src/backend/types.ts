@@ -46,6 +46,22 @@ export interface ZcodeSessionInfo {
 
 export interface ZcodeCreateResult {
   session: ZcodeSessionInfo;
+  /**
+   * Session settings snapshot. `model.available` is the FULL registry listing
+   * (with per-model reasoning metadata) — only create/resume return it;
+   * `session/read` answers with the current model alone. See
+   * `server.modelAvailability`.
+   */
+  settings?: {
+    model?: {
+      current?: { providerId?: string; modelId?: string };
+      available?: Array<{
+        ref?: { providerId?: string; modelId?: string };
+        reasoning?: { defaultLevel?: string; levels?: Array<{ value?: string }> };
+      }>;
+    };
+    thoughtLevel?: { current?: string; defaultLevel?: string };
+  };
 }
 
 export interface ZcodeSessionListItem {

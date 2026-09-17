@@ -120,6 +120,40 @@ ZCode protocol types into ACP notifications directly — always translate.
   columns after our INSERT list, and unknown server→client requests
   (`interaction/requestOfficialMcpAuthHeaders`) land safely in the
   unhandled-request error path.
+- **3.12+ model switching: account-plan providers are HOST-pushed, and
+  `session/setModel` lost its `runtimeModel` overlay.** Two coupled changes
+  (both verified 2026-09 against the bare app-server): (1) the registry is
+  built from the bundled table + `provider_config.json` + an ACCOUNT snapshot
+  the desktop host computes and pushes over `provider/updateAccountConfig`;
+  headless launches have no host, so every `account:*` coding-plan provider
+  reads `entitled:false`, the GLM models never appear in
+  `settings.model.available`, and switches fail with "Provider Registry 中不存在
+  Model". The bridge now pushes that snapshot itself (`config/account-provider.ts`,
+  called from `syncProviderRegistry` before session/create). The payload's
+  `basedOnZCodeBuiltinRevision` MUST be `zcode-builtin:<file.revision>:<sha256(PATH)>`
+  — the hash covers the provider-table PATH, not the bytes, and a mismatch
+  makes the backend accept the push but silently ignore it; derive it from the
+  SAME path `ensureBackend` injects (reading the ambient env first points at a
+  version-keyed runtime copy and yields a rejected revision — that failure
+  mode is the trap). Entitlement comes from `coding-plan-cache.json`
+  (desktop's resolved availability verdict) → legacy `config.json`
+  (`builtin:*` enabled + apiKey); `setting.json`'s
+  `modelProviderFamilySelectedKeys` is a _selection_ record, not an
+  entitlement — only as a last resort when both are empty. (2) `session/setModel`
+  is now strict: `{sessionId, model:{providerId, modelId, options?}, persistAsWorkspaceLastUsed}`,
+  NO `runtimeModel` (`Unrecognized key`), and the OBJECT form requires
+  `options.reasoningLevel` for level-bearing models ("Reasoning level is
+  required for <p>/<m>") — the string form skips that check but carries no
+  level. Provider ids must also be translated to the registry's spelling
+  (`builtin:bigmodel-coding-plan` → `account:bigmodel-individual-coding-plan`,
+  `accountProviderIdFor`). `session/create` is the only response returning the
+  FULL `settings.model.available` list (with authoritative `reasoning.defaultLevel`);
+  `session/read` answers `"current"` only, so the create snapshot is cached in
+  `server.modelAvailability` for switch-time level resolution. `applyModelSwitch`
+  tries the modern shape then falls back once to the legacy overlay shape, so
+  the same bridge works on both builds. `workspace/updateProviderRegistry` is
+  GONE in 3.12+ (method-not-found) — the bridge logs it as a no-op, not a
+  failure.
 - **The backend ignores `session/stop`** (verified against app-server 0.16.5 —
   the model stream runs to its natural end no matter what). Cancel is therefore
   bridge-side only: the turn loop returns `cancelled` at once, and the next

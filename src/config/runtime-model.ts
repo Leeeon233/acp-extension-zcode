@@ -26,6 +26,7 @@
  * See provider-registry.ts.
  */
 
+import { accountProviderIdFor } from "./account-provider.js";
 import { buildModelElement, type ModelEntry } from "./provider-registry.js";
 import {
   findProviderConfig,
@@ -114,15 +115,19 @@ export function buildResumeRuntimeModel(): unknown | null {
  * `value` is the configOption value: either `"providerId\modelId"` (encoded) or
  * a legacy plain modelId (resolved to the first enabled builtin provider).
  *
- * Sends BOTH a `model` ref (the target) AND a `runtimeModel` (the full provider
- * definition). The runtimeModel lets the backend register the provider into its
- * workspace catalog (so even third-party / non-default models are recognised),
- * while `model` names the selection. `persistAsWorkspaceLastUsed:false` keeps
- * this a runtime-only change. Invalidates the model cache on success.
+ * 3.12+ schema (verified 2026-09 against the bare app-server): the body is
+ * `{sessionId, model: {providerId, modelId, options?}, persistAsWorkspaceLastUsed}`
+ * — STRICT. The old `runtimeModel` overlay is gone (`Unrecognized key`), and
+ * the object form REQUIRES `options.reasoningLevel` for models that declare
+ * levels ("Reasoning level is required for <p>/<m>"; a bare string form skips
+ * that check but cannot carry the level). We therefore send the target model's
+ * own default level, read from the account/registry entry when we have it, and
+ * fall back to omitting `options` for level-less models.
  *
- * NOTE: the older `session/updateRuntimeModelConfig` path returns `changed:false`
- * on current backends without applying — `session/setModel` is the working
- * protocol since the backend model-management refactor.
+ * Provider ids are translated to the registry's own spelling: config.json says
+ * `builtin:bigmodel-coding-plan` while the registry exposes
+ * `account:bigmodel-individual-coding-plan` (see account-provider.ts). An
+ * untranslated id fails with "Provider Registry 中不存在 Model".
  */
 export async function applyModelSwitch(
   server: ZcodeAcpServer,
@@ -130,29 +135,100 @@ export async function applyModelSwitch(
   value: string,
 ): Promise<boolean> {
   const { providerId, modelId } = parseModelValue(value);
-  const runtimeModel = buildRuntimeModel({ providerId, providerName: providerId, modelId });
-  if (runtimeModel === null) {
-    log(`runtime-model: cannot build overlay for "${value}" (provider not found)`);
-    return false;
-  }
   const backend = server.ensureBackend();
-  const resp = await backend.request(
+  const registryProviderId = accountProviderIdFor(providerId);
+  const model: Record<string, unknown> = { providerId: registryProviderId, modelId };
+  // The object form requires the level for level-bearing models; resolve the
+  // target's authoritative default from the captured create snapshot.
+  const level = resolveDefaultReasoningLevel(server, zcodeSid, registryProviderId, modelId);
+  if (level) model.options = { reasoningLevel: level };
+  // 3.12+ shape first: `{sessionId, model:{providerId, modelId, options?},
+  // persistAsWorkspaceLastUsed}`. `session/setModel` is strict in every build
+  // we know, so an OLDER app-server answers `Unrecognized key: "options"` (it
+  // predates `options`) or rejects a level-bearing model for the missing
+  // overlay. Both are schema drift, not a bad target — fall back to the legacy
+  // shape once (bare model ref + the `runtimeModel` provider overlay) so the
+  // same bridge works against either build.
+  const modern = await backend.request(
     server.nextId(),
     "session/setModel",
-    {
-      sessionId: zcodeSid,
-      model: { providerId, modelId },
-      runtimeModel,
-      persistAsWorkspaceLastUsed: false,
-    },
+    { sessionId: zcodeSid, model, persistAsWorkspaceLastUsed: false },
     15000,
   );
-  if (resp.error) {
-    warn(`runtime-model: switch failed: ${resp.error.message}`);
+  if (!modern.error) {
+    invalidateModelCache(server, zcodeSid);
+    return true;
+  }
+  const runtimeModel = buildRuntimeModel({ providerId, providerName: providerId, modelId });
+  if (runtimeModel !== null) {
+    const legacy = await backend.request(
+      server.nextId(),
+      "session/setModel",
+      {
+        sessionId: zcodeSid,
+        model: { providerId, modelId },
+        runtimeModel,
+        persistAsWorkspaceLastUsed: false,
+      },
+      15000,
+    );
+    if (!legacy.error) {
+      log(`runtime-model: switched via the legacy runtimeModel shape (${registryProviderId})`);
+      invalidateModelCache(server, zcodeSid);
+      return true;
+    }
+    warn(
+      `runtime-model: switch failed (modern: ${modern.error.message}; legacy: ${legacy.error.message})`,
+    );
     return false;
   }
-  invalidateModelCache(server, zcodeSid);
-  return true;
+  warn(`runtime-model: switch failed: ${modern.error.message}`);
+  return false;
+}
+
+/**
+ * The reasoning level a switch should start the model at.
+ *
+ * The object form REQUIRES a level for level-bearing models
+ * ("Reasoning level is required for <p>/<m>"), so one must be supplied. The
+ * backend's own answer is the only correct source: config.json's
+ * `reasoning.variants` go stale (observed 2026-09 — a third-party model
+ * configured `off/high/max` actually ran `low/high/max`). `session/create`'s
+ * captured availability list (server.modelAvailability) carries the
+ * authoritative `defaultLevel`; models that declare no levels yield null and
+ * callers omit `options` so they accept the switch.
+ */
+function resolveDefaultReasoningLevel(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+  providerId: string,
+  modelId: string,
+): string | null {
+  const cached = server.modelAvailability.get(zcodeSid) ?? [];
+  const hit = cached.find((a) => a.providerId === providerId && a.modelId === modelId);
+  if (hit?.defaultLevel) return hit.defaultLevel;
+  if (hit) return null; // present but level-less — omit options
+  // Not in the captured list (a model the registry gained after create):
+  // fall back to config.json's declaration rather than sending no level.
+  try {
+    const p = findProviderConfig(providerId);
+    const entry = (
+      p?.models as
+        | Record<
+            string,
+            { reasoning?: { enabled?: boolean; variants?: string[]; defaultVariant?: string } }
+          >
+        | undefined
+    )?.[modelId];
+    const reasoning = entry?.reasoning;
+    if (reasoning && reasoning.enabled !== false) {
+      if (reasoning.defaultVariant) return reasoning.defaultVariant;
+      if (reasoning.variants?.length) return reasoning.variants[0]!;
+    }
+  } catch {
+    // unreadable config — omit options
+  }
+  return null;
 }
 
 /** Invalidate the session-level model cache after a switch. */

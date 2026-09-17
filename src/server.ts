@@ -321,6 +321,18 @@ export class ZcodeAcpServer {
   /** Per-session model cache for configOptions model dropdown. */
   readonly modelCache = new Map<string, string>();
   /**
+   * Per-session (zcodeSid) FULL model-availability list, captured from the
+   * `session/create` snapshot (`settings.model.available`). Only create/resume
+   * return the complete list with authoritative `reasoning.defaultLevel` —
+   * `session/read` answers `modelAvailability:"current"` (just the active
+   * model). Model switches need a target's default reasoning level, so this
+   * cache is the lookup; an entry that declares no levels simply has none.
+   */
+  readonly modelAvailability = new Map<
+    string,
+    Array<{ providerId?: string; modelId?: string; defaultLevel?: string }>
+  >();
+  /**
    * Per-session (zcodeSid) background-task listeners. Registered once when a
    * session is created/resumed/loaded and lives across prompts, forwarding
    * background task status + result notifications to the client outside of

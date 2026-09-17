@@ -23,6 +23,7 @@ import {
   ZCODE_CREDS_PATH,
 } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
+import { configProviderIdFor } from "./account-provider.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
 
 interface ProviderModelsJson {
@@ -138,11 +139,15 @@ export function loadAllModels(): ModelRef[] {
   }
 }
 
-/** Look up a provider entry by id (any provider, not just enabled). */
+/** Look up a provider entry by id (any provider, not just enabled).
+ *
+ *  3.12+ registries spell coding-plan providers `account:<family>-<plan>` while
+ *  config.json keeps the legacy `builtin:<family>-<plan>` — normalize before
+ *  lookup so both spellings resolve. */
 export function findProviderConfig(providerId: string): ProviderEntry | null {
   try {
     const cfg = readConfig() as ConfigShape;
-    return cfg.provider?.[providerId] ?? null;
+    return cfg.provider?.[providerId] ?? cfg.provider?.[configProviderIdFor(providerId)] ?? null;
   } catch {
     return null;
   }
@@ -152,9 +157,9 @@ export function findProviderConfig(providerId: string): ProviderEntry | null {
 export function modelContextWindow(providerId: string, modelId: string): number {
   try {
     const cfg = readConfig() as ConfigShape;
-    const models = cfg.provider?.[providerId]?.models ?? {};
-    const entry = models[modelId];
-    return entry?.limit?.context ?? 0;
+    const entry = cfg.provider?.[configProviderIdFor(providerId)];
+    const models = entry?.models ?? {};
+    return models[modelId]?.limit?.context ?? 0;
   } catch {
     return 0;
   }
@@ -349,9 +354,12 @@ export async function buildConfigOptions(
       currentMode = (modeSet.current as string) ?? currentMode;
       const modelSet = (settings.model as Record<string, unknown>) ?? {};
       // settings.model.current is { providerId, modelId, variant? } — read BOTH so
-      // we can disambiguate same-named models across providers.
+      // we can disambiguate same-named models across providers. Normalize the
+      // provider spelling (3.12+ registries answer `account:<family>-<plan>`;
+      // config.json and the dropdown use `builtin:<family>-<plan>`) so the
+      // current value matches a dropdown entry instead of duplicating it.
       const cur = (modelSet.current as { providerId?: string; modelId?: string }) ?? {};
-      if (cur.providerId) currentProviderId = cur.providerId;
+      if (cur.providerId) currentProviderId = configProviderIdFor(cur.providerId);
       if (cur.modelId) currentModelId = cur.modelId;
       const tlSet = (settings.thoughtLevel as Record<string, unknown>) ?? {};
       // `current` is absent right after session/create — fall back to the
