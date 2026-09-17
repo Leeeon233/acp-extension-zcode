@@ -82,6 +82,12 @@ export interface HubOptions {
   token: string;
   /** Registration TTL before an instance is pruned (default 30s). */
   heartbeatTimeoutMs?: number;
+  /**
+   * How long an instance must stay probe-unreachable before ?probe=1 prunes it
+   * (default 8s). A single failed probe only marks it unhealthy — a busy
+   * bridge's event loop can stall past the connect timeout while fully alive.
+   */
+  probeGraceMs?: number;
   /** Idle time with zero instances and zero proxies before exit (default 10min). */
   idleExitMs?: number;
   /** WebSocket keepalive ping interval (default 30s; tunnels drop idle links). */
@@ -187,13 +193,29 @@ interface InstanceEntry {
    * to any nonce-less registration for them.
    */
   nonce?: string;
+  /** First failed ?probe=1 timestamp; a bridge alive enough to re-register clears it. */
+  unhealthySince?: number;
 }
 
 const HEARTBEAT_TIMEOUT_MS = 30_000;
 const IDLE_EXIT_MS = 10 * 60_000;
 const PING_INTERVAL_MS = 30_000;
-/** Per-instance TCP probe timeout for /api/instances?probe=1. */
-const PROBE_TIMEOUT_MS = 500;
+/**
+ * Per-instance TCP probe timeout for /api/instances?probe=1. Generous on
+ * purpose: the bridge is single-threaded and a busy event loop (large payload
+ * parse, sync fs) can delay accept() well past a tight timeout while the
+ * process is perfectly healthy.
+ */
+const PROBE_TIMEOUT_MS = 2_000;
+/**
+ * An instance must be probe-unreachable for at least this long before the
+ * probe prunes it. One failed probe only marks unhealthySince — the next
+ * ?probe=1 (clients poll every 3–5s) prunes only if the mark is older than
+ * this. A hard-killed bridge still disappears in ~2 polls instead of waiting
+ * out the 30s heartbeat TTL; a momentary event-loop stall no longer evicts a
+ * live instance and kicks attached clients ("Instance went away").
+ */
+const PROBE_GRACE_MS = 8_000;
 const MAX_BODY_BYTES = 1024 * 1024;
 
 /** Constant-time token compare (hash both to equal length first). */
@@ -936,6 +958,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     host,
     token,
     heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
+    probeGraceMs = PROBE_GRACE_MS,
     idleExitMs = IDLE_EXIT_MS,
     pingIntervalMs = PING_INTERVAL_MS,
     tuiRegisterTimeoutMs = TUI_REGISTER_TIMEOUT_MS,
@@ -1398,10 +1421,16 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         return;
       }
       // On-demand liveness probe (?probe=1): verify every registered bridge's
-      // loopback port and prune the unreachable ones before answering, so a
-      // client refresh gets an honest list instead of waiting out the
-      // heartbeat TTL (hard-killed bridges never unregister).
+      // loopback port before answering so a client refresh gets an honest
+      // list without waiting out the heartbeat TTL (hard-killed bridges never
+      // unregister). A single failed probe does NOT prune — a busy bridge's
+      // event loop can stall past the connect timeout while fully alive, and
+      // evicting it kicks every attached client. The first failure marks
+      // unhealthySince; only a probe failing after probeGraceMs of continuous
+      // unreachability prunes. A successful probe or a re-register (heartbeat)
+      // clears the mark.
       if (["1", "true"].includes((url.searchParams.get("probe") ?? "").toLowerCase())) {
+        const now = Date.now();
         const probes = await Promise.all(
           Array.from(instances.entries(), async ([id, entry]) => ({
             id,
@@ -1409,11 +1438,22 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           })),
         );
         for (const { id, ok } of probes) {
-          if (!ok) {
-            instances.delete(id);
-            idleSince = null; // re-arm the idle clock on membership change
-            log(`hub: pruned instance ${id} (probe: endpoint unreachable)`);
+          const entry = instances.get(id);
+          if (!entry) continue; // unregistered while probing
+          if (ok) {
+            delete entry.unhealthySince;
+            continue;
           }
+          const unhealthySince = entry.unhealthySince ?? now;
+          entry.unhealthySince = unhealthySince;
+          if (now - unhealthySince < probeGraceMs) {
+            log(`hub: instance ${id} probe failed — marked unhealthy (grace window)`);
+            continue;
+          }
+          instances.delete(id);
+          idleSince = null; // re-arm the idle clock on membership change
+          const unhealthyForS = Math.round((now - unhealthySince) / 100) / 10;
+          log(`hub: pruned instance ${id} (probe: unreachable for ${unhealthyForS}s)`);
         }
       }
       // Cross-instance session dedupe: every bridge of a workspace lists the
@@ -1901,6 +1941,8 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           return;
         }
         const prev = instances.get(id);
+        // A fresh entry drops any unhealthySince probe mark — a bridge alive
+        // enough to heartbeat is alive, whatever its port did during a stall.
         instances.set(id, {
           id,
           port: bridgePort,

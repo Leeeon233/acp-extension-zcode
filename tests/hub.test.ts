@@ -271,19 +271,45 @@ describe("hub on-demand probe", () => {
     return res.json();
   }
 
-  it("prunes dead-port instances on ?probe=1 but not on a plain list", async () => {
-    const hub = await startTestHub();
+  it("prunes dead-port instances only after the probe grace, not on the first failure", async () => {
+    const hub = await startTestHub({ probeGraceMs: 300 });
     await registerInstance(hub, registerBody()); // BASE_PORT: nothing listens
 
     const plain = (await (await listInstances(hub)).json()) as unknown[];
     expect(plain).toHaveLength(1); // no probe param = unverified list
 
+    // First failed probe only marks the instance unhealthy — a busy bridge's
+    // event loop can stall past the connect timeout while fully alive.
+    const first = (await listProbed(hub)) as unknown[];
+    expect(first).toHaveLength(1);
+
+    // The mark is not a prune: plain list still shows the instance.
+    const stillListed = (await (await listInstances(hub)).json()) as unknown[];
+    expect(stillListed).toHaveLength(1);
+
+    // After the grace expires, the next failing probe confirms and prunes.
+    await new Promise((r) => setTimeout(r, 400));
     const probed = (await listProbed(hub)) as unknown[];
     expect(probed).toEqual([]);
 
     // The prune is persistent: the plain list stays empty afterwards.
     const after = (await (await listInstances(hub)).json()) as unknown[];
     expect(after).toEqual([]);
+  });
+
+  it("a heartbeat re-register clears the unhealthy mark", async () => {
+    const hub = await startTestHub({ probeGraceMs: 100 });
+    await registerInstance(hub, registerBody()); // BASE_PORT: nothing listens
+
+    // Mark unhealthy, then let the grace fully expire while marked.
+    expect(((await listProbed(hub)) as unknown[]).length).toBe(1);
+    await new Promise((r) => setTimeout(r, 150));
+
+    // The heartbeat re-register proves liveness and must reset the mark, so
+    // the next failing probe starts a fresh grace instead of pruning.
+    await registerInstance(hub, registerBody());
+    const probed = (await listProbed(hub)) as unknown[];
+    expect(probed).toHaveLength(1);
   });
 
   it("keeps live instances when probing", async () => {

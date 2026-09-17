@@ -90,9 +90,12 @@ HTTP auth: `Authorization: Bearer <token>` or `?token=<token>`.
   `"serve"` (a headless bridge created via remote session-create — see
   below; older bridges send no field, treat as `"editor"`).
 - **On refresh, call `/api/instances?probe=1`**: the hub TCP-probes each
-  registered bridge's loopback port and prunes unreachable ones before
-  answering. A plain `GET` returns the heartbeat-based view, which can list a
-  hard-killed bridge for up to the 30s heartbeat TTL.
+  registered bridge's loopback port before answering. One failed probe only
+  marks the instance unhealthy; it is pruned after staying unreachable ~8s
+  (verified by a later probe). This keeps a busy-but-alive bridge (momentary
+  event-loop stall) listed instead of evicting it and kicking attached
+  clients, while a hard-killed bridge still disappears in ~2 refreshes instead
+  of waiting out the 30s heartbeat TTL.
 - `sessions[].sessionId` is the **ACP session id the editor uses** for that
   conversation (placeholder ids are stable across bridges — Zed stores them
   and the durable alias store records them). Attaching under it via
@@ -643,7 +646,7 @@ The stdio editor and every remote client are peers on the same sessions:
 | Symptom                                  | Cause                                                                                                                                                                                                                                                                    | Client action                                                                                       |
 | ---------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------- |
 | WS closes                                | bridge exited (editor closed) or network drop                                                                                                                                                                                                                            | Poll `/api/instances`; if the instance is gone, its sessions are gone too — drop it from the UI.    |
-| Instance missing from `/api/instances`   | Heartbeats stopped >30s, or `?probe=1` found the bridge port unreachable                                                                                                                                                                                                 | Remove the instance from the UI.                                                                    |
+| Instance missing from `/api/instances`   | Heartbeats stopped >30s, or `?probe=1` found the bridge port unreachable for ~8s straight                                                                                                                                                                                | Remove the instance from the UI.                                                                    |
 | `/api/instances/{id}/status` answers 502 | The instance is registered but its bridge port is unreachable — it is dying; the heartbeat TTL or your next `?probe=1` refresh will drop it                                                                                                                              | Fall back to the heartbeat `status` field, then re-discover.                                        |
 | Connect fails for a while                | Hub process died; a bridge re-spawns it on the next heartbeat (typically ≤10s, worst case ~1min under the spawn throttle). Also expected for a few seconds after a bridge upgrade: the hub notices a newer bridge, restarts, and is re-spawned from the upgraded install | Retry with backoff.                                                                                 |
 | Disconnect mid-turn                      | Mobile network flap, background suspension                                                                                                                                                                                                                               | The turn continues server-side. Reconnect and `session/load` — history replay is the recovery path. |

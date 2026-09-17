@@ -226,8 +226,11 @@ would keep running pre-upgrade code until its 10-minute idle exit.
 Discovery liveness has two layers: the heartbeat TTL (30s, pruned every 5s)
 drops bridges that stopped registering — the fallback for hard kills — and
 `GET /api/instances?probe=1` actively TCP-probes each registered loopback port
-on demand, so a client refresh gets an immediately-honest list with no
-background probing cost.
+on demand, so a client refresh gets an honest list with no background probing
+cost. A probe failure is not a verdict: the first one only marks the instance
+unhealthy, and ~8s of continuous unreachability (confirmed by a later probe)
+prunes it — a busy bridge's event loop can stall past the connect timeout
+while perfectly alive, and evicting it would kick every attached client.
 
 Session file access (ADR-0004) rides the same loopback server: the bridge
 serves read-only `GET /fs/list` + `GET /fs/file` scoped to each session's cwd,
