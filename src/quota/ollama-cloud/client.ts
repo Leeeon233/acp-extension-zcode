@@ -36,3 +36,31 @@ export async function fetchOcUsage(
   const text = await resp.text();
   return { status: resp.status, text };
 }
+
+/** The undocumented account-status endpoint (verified live 2026-09). */
+export const ME_URL = "https://ollama.com/api/me";
+
+/**
+ * Fetch the account-status JSON body (plan tier, subscription period end,
+ * suspended flag) — the only source for the monthly billing-period reset.
+ *
+ * Same contract as {@link fetchOcUsage}: throws on network errors/timeout,
+ * returns the status so the caller classifies 401/403.
+ */
+export async function fetchOcMe(
+  apiKey: string,
+  fetchImpl: typeof globalThis.fetch = globalThis.fetch,
+): Promise<{ status: number; text: string }> {
+  const resp = await fetchImpl(ME_URL, {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${apiKey}`,
+      Accept: "application/json",
+      "Content-Type": "application/json",
+    },
+    body: "{}",
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  });
+  const text = await resp.text();
+  return { status: resp.status, text };
+}

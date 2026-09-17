@@ -6,7 +6,13 @@
 
 import { describe, expect, it } from "vitest";
 
-import { composeQuotaDock, formatGoDockSegment, formatQuotaDock } from "../src/quota/format.js";
+import {
+  composeQuotaDock,
+  formatGoDockSegment,
+  formatOcDockSegment,
+  formatQuotaDock,
+} from "../src/quota/format.js";
+import type { OcQueryResult } from "../src/quota/ollama-cloud/types.js";
 import type { GoQueryResult } from "../src/quota/opencode-go/types.js";
 import type { QuotaItem, QuotaResult } from "../src/quota/types.js";
 
@@ -20,6 +26,12 @@ function item(overrides: Partial<QuotaItem> & { key: string }): QuotaItem {
 function clock(ms: number): string {
   const d = new Date(ms);
   return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+}
+
+/** Local MM-DD of an epoch-ms timestamp (weekly/monthly reset dates). */
+function date(ms: number): string {
+  const d = new Date(ms);
+  return `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
 }
 
 describe("formatQuotaDock", () => {
@@ -128,5 +140,50 @@ describe("formatGoDockSegment / composeQuotaDock", () => {
     expect(composeQuotaDock("45%", null)).toBe("45%");
     expect(composeQuotaDock(null, "go 8% 10-11")).toBe("go 8% 10-11");
     expect(composeQuotaDock(null, null)).toBeNull();
+  });
+});
+
+describe("formatOcDockSegment", () => {
+  const ocSuccess = (
+    windows: Partial<
+      Pick<
+        Extract<OcQueryResult, { kind: "success" }>,
+        "session" | "weekly" | "monthly" | "sessionResetAt" | "weeklyResetAt" | "monthlyResetAt"
+      >
+    >,
+  ): OcQueryResult => ({
+    kind: "success",
+    fetchedAt: NOW,
+    ...windows,
+  });
+
+  it("shows ONLY the largest window the plan exposes, with its reset stamp", () => {
+    // Monthly wins when present (credit plans) — session/weekly are dropped.
+    expect(
+      formatOcDockSegment(ocSuccess({ monthly: 0.3, monthlyResetAt: NOW + 5 * 86_400_000 })),
+    ).toBe(`oc mo 30% ${date(NOW + 5 * 86_400_000)}`);
+    // Weekly-only plans show the weekly window.
+    expect(
+      formatOcDockSegment(ocSuccess({ weekly: 0.42, weeklyResetAt: NOW + 2 * 86_400_000 })),
+    ).toBe(`oc wk 42% ${date(NOW + 2 * 86_400_000)}`);
+    // Legacy session window carries a clock-time reset.
+    expect(
+      formatOcDockSegment(ocSuccess({ session: 0.423, sessionResetAt: NOW + 3_600_000 })),
+    ).toBe(`oc 5h 42% ${clock(NOW + 3_600_000)}`);
+  });
+
+  it("omits the stamp when the reset moment is unknown (monthly /api/me failure)", () => {
+    expect(formatOcDockSegment(ocSuccess({ monthly: 0.6 }))).toBe("oc mo 60%");
+    expect(formatOcDockSegment(ocSuccess({ weekly: 0.2 }))).toBe("oc wk 20%");
+  });
+
+  it("clamps out-of-range fractions and nulls when nothing is usable", () => {
+    expect(formatOcDockSegment(ocSuccess({ session: 1.4, sessionResetAt: NOW }))).toBe(
+      `oc 5h 100% ${clock(NOW)}`,
+    );
+    expect(formatOcDockSegment(ocSuccess({}))).toBeNull();
+    expect(formatOcDockSegment({ kind: "not_configured" })).toBeNull();
+    expect(formatOcDockSegment({ kind: "auth_error" })).toBeNull();
+    expect(formatOcDockSegment({ kind: "unavailable" })).toBeNull();
   });
 });

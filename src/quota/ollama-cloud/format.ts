@@ -5,22 +5,28 @@
  * GLM and Opencode Go sections, so all sections read as one card in the
  * combined view. Which windows exist depends on the account's plan: legacy
  * plans expose session (5h) + weekly; current credit plans expose monthly.
- * The API exposes no reset timestamps, so — unlike the other providers — the
- * lines carry no reset stamp, just the percent.
+ * The API exposes no reset timestamps, so the reset moments are derived at
+ * query time (window anchoring, or /api/me's billing period for monthly) and
+ * rendered as the same `MM-DD HH:MM` trailing stamp the other providers use —
+ * absent when the monthly lookup fails.
  */
 
 import { pickOverlay, renderColorBar } from "../color.js";
-import { renderBar } from "../format.js";
+import { formatResetTime, renderBar } from "../format.js";
 import { roundTenth } from "../rounding.js";
 import type { OcQueryResult } from "./types.js";
 
 /** Label + window metadata, in display order. Which rows appear depends on
  *  the account's plan: legacy plans carry session (5h) + weekly; current
  *  credit plans carry monthly only. */
-const WINDOW_META: Array<{ key: "session" | "weekly" | "monthly"; label: string }> = [
-  { key: "session", label: "5h" },
-  { key: "weekly", label: "Week" },
-  { key: "monthly", label: "Month" },
+const WINDOW_META: Array<{
+  key: "session" | "weekly" | "monthly";
+  label: string;
+  resetKey: "sessionResetAt" | "weeklyResetAt" | "monthlyResetAt";
+}> = [
+  { key: "session", label: "5h", resetKey: "sessionResetAt" },
+  { key: "weekly", label: "Week", resetKey: "weeklyResetAt" },
+  { key: "monthly", label: "Month", resetKey: "monthlyResetAt" },
 ];
 
 /** A rendered section: a header line and zero or more body lines. */
@@ -55,11 +61,13 @@ export function formatOcSection(result: OcQueryResult, color = false): RenderedS
   const body = WINDOW_META.filter((m) => result[m.key] !== undefined).map((m) => {
     const fraction = result[m.key]!;
     const pct = roundTenth(fraction * 100);
+    const reset = formatResetTime(result[m.resetKey]);
+    const trailing = reset ? ` · ${reset}` : "";
     if (color) {
       const bar = renderColorBar(pct, { overlay: pickOverlay({ usedPercent: pct }) });
-      return `${m.label.padEnd(5)} ${bar}`;
+      return `${m.label.padEnd(5)} ${bar}${trailing}`;
     }
-    return `${m.label.padEnd(5)} ${renderBar(pct)}  ${String(pct).padStart(2)}%`;
+    return `${m.label.padEnd(5)} ${renderBar(pct)}  ${String(pct).padStart(2)}%${trailing}`;
   });
 
   return { header, body };

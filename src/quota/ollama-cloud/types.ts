@@ -5,7 +5,8 @@
  * `GET https://ollama.com/api/usage` endpoint with the user's API key. The
  * response carries two usage fractions (session = 5h rolling window, weekly =
  * 7d window) in [0, 1] and NO reset timestamps — the server does not expose
- * them, so the card shows bars + percents only (no countdown stamps).
+ * them, so reset moments are DERIVED client-side (see OcQueryResult) and the
+ * card shows them when available.
  *
  * Shape verified against live probes + the pi-multi-account reference client
  * (2026-09); see `.zcode/scratch/research-ollama-cloud-usage.md`. Undocumented
@@ -29,6 +30,14 @@ export type OcQueryResult =
       session?: number;
       weekly?: number;
       monthly?: number;
+      /** Derived reset moments (epoch ms). session/weekly are computed from
+       *  the window anchoring (epoch-aligned 5h buckets; Monday 00:00 UTC
+       *  weeks) — the API itself returns no timestamps. monthly comes from
+       *  POST /api/me's SubscriptionPeriodEnd when that lookup succeeds;
+       *  absent otherwise. */
+      sessionResetAt?: number;
+      weeklyResetAt?: number;
+      monthlyResetAt?: number;
       /** Epoch ms of the fetch (kept for symmetry with the other providers). */
       fetchedAt: number;
     }

@@ -151,8 +151,11 @@ variable:
   ```
 
 The card shows whatever usage windows the account's plan exposes — legacy
-plans get `5h` + `Week` bars, current credit plans get a `Month` bar (the
-server returns fractions only, no reset timestamps). Without a key, the
+plans get `5h` + `Week` bars, current credit plans get a `Month` bar. The
+server returns fractions only, so reset moments are derived client-side
+(epoch-aligned 5h buckets, Monday 00:00 UTC weeks, and for monthly the
+`/api/me` billing period end or — on new credit plans, which return only a
+`CreatedAt` — the next subscription-day anniversary). Without a key, the
 default mode silently skips the Ollama section; `zcode-acp quota oc` without
 a key prints a setup hint.
 

@@ -42,7 +42,9 @@ vi.mock("../src/quota/opencode-go/config.js", async () => {
 // real ~/.config/zcode-acp/config.json.
 vi.mock("../src/quota/ollama-cloud/client.js", () => ({
   fetchOcUsage: vi.fn(),
+  fetchOcMe: vi.fn(),
   USAGE_URL: "https://ollama.com/api/usage",
+  ME_URL: "https://ollama.com/api/me",
 }));
 vi.mock("../src/config/user-config.js", async () => {
   const actual = await vi.importActual<typeof import("../src/config/user-config.js")>(
@@ -114,7 +116,10 @@ describe("defaultGoWindows", () => {
 
 describe("formatCombinedCard — all mode", () => {
   it("renders both sections — no banner, sections separated by a blank line", () => {
-    const out = formatCombinedCardPlain({ glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE }, { provider: "all" });
+    const out = formatCombinedCardPlain(
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+      { provider: "all" },
+    );
     const lines = out.split("\n");
     // No "Quota Overview" banner and no top divider — the section headers
     // identify each provider on their own.
@@ -160,7 +165,10 @@ describe("formatCombinedCard — all mode", () => {
   });
 
   it("wraps in a ```text fence in formatCombinedCard", () => {
-    const fenced = formatCombinedCard({ glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE }, { provider: "all" });
+    const fenced = formatCombinedCard(
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+      { provider: "all" },
+    );
     expect(fenced.startsWith("```text\n")).toBe(true);
     expect(fenced.endsWith("\n```")).toBe(true);
   });
@@ -249,7 +257,10 @@ describe("formatCombinedCard — all mode", () => {
 
 describe("formatCombinedCard — glm mode", () => {
   it("renders only GLM (header + divider + body, no banner)", () => {
-    const out = formatCombinedCardPlain({ glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE }, { provider: "glm" });
+    const out = formatCombinedCardPlain(
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+      { provider: "glm" },
+    );
     const lines = out.split("\n");
     expect(lines[0]).toBe("GLM Coding Plan · Pro");
     expect(lines[1]).toMatch(/^─+$/);
@@ -380,7 +391,12 @@ describe("queryCombined orchestration", () => {
 });
 
 describe("formatCombinedCard — oc section", () => {
-  const OC_SUCCESS: OcQueryResult = { kind: "success", session: 0.31, weekly: 0.68, fetchedAt: 1000 };
+  const OC_SUCCESS: OcQueryResult = {
+    kind: "success",
+    session: 0.31,
+    weekly: 0.68,
+    fetchedAt: 1000,
+  };
 
   it("renders the Ollama Cloud section below Opencode Go in all mode", () => {
     const out = formatCombinedCardPlain(

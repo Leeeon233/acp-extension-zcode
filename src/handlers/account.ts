@@ -10,8 +10,9 @@
  * exactly: one GLM section (plan level + per-window items with per-model
  * details), one Opencode Go section (rolling/weekly/monthly windows, the
  * relative reset countdown converted to an absolute timestamp), and one
- * Ollama Cloud section (session/weekly fractions as percents — the API
- * exposes no reset timestamps). Provider failures are reported per-section as
+ * Ollama Cloud section (session/weekly/monthly fractions as percents, with
+ * the derived reset moments when available — the API itself returns none).
+ * Provider failures are reported per-section as
  * `kind` strings rather than throwing — the client renders the same status
  * line the CLI would (a `not_configured` section is simply omitted, matching
  * the CLI).
@@ -43,11 +44,16 @@ export interface GoUsageStats {
   windows?: GoWindowEntry[];
 }
 
-/** One Ollama Cloud window — percent only, no reset (the API has none). */
+/**
+ * One Ollama Cloud window with the derived reset moment (epoch ms) when
+ * available — the API returns no timestamps, so resets are computed at query
+ * time (window anchoring, or /api/me's billing period for monthly).
+ */
 export interface OcWindowEntry {
   key: "session" | "weekly" | "monthly";
   label: string;
   usagePercent: number;
+  resetsAt?: number;
 }
 
 /** Ollama Cloud section — `windows` present only on success. */
@@ -101,17 +107,29 @@ function toGoStats(result: GoQueryResult, now = Date.now()): GoUsageStats {
 /**
  * Ollama windows as percents — the API's 0..1 fractions converted once here
  * so remote clients can render the same bar the CLI does. Which windows exist
- * depends on the plan (legacy: session+weekly; credit: monthly). No reset
- * field: ollama.com returns no reset timestamps.
+ * depends on the plan (legacy: session+weekly; credit: monthly). The derived
+ * reset moments pass through when present.
  */
 function toOcStats(result: OcQueryResult): OcUsageStats {
   if (result.kind !== "success") return { kind: result.kind };
   const LABELS = { session: "5h", weekly: "Week", monthly: "Month" } as const;
-  const windows = (["session", "weekly", "monthly"] as const).flatMap((key) =>
-    result[key] !== undefined
-      ? [{ key, label: LABELS[key], usagePercent: result[key]! * 100 }]
-      : [],
-  );
+  const RESETS = {
+    session: "sessionResetAt",
+    weekly: "weeklyResetAt",
+    monthly: "monthlyResetAt",
+  } as const;
+  const windows = (["session", "weekly", "monthly"] as const).flatMap((key) => {
+    if (result[key] === undefined) return [];
+    const reset = result[RESETS[key]];
+    return [
+      {
+        key,
+        label: LABELS[key],
+        usagePercent: result[key]! * 100,
+        ...(typeof reset === "number" && { resetsAt: reset }),
+      },
+    ];
+  });
   return { kind: "success", windows };
 }
 

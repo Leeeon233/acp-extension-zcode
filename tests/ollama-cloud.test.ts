@@ -15,7 +15,9 @@ import process from "node:process";
 // (status, text) pair.
 vi.mock("../src/quota/ollama-cloud/client.js", () => ({
   fetchOcUsage: vi.fn(),
+  fetchOcMe: vi.fn(),
   USAGE_URL: "https://ollama.com/api/usage",
+  ME_URL: "https://ollama.com/api/me",
 }));
 
 // Control the config-file side of credential resolution: loadApiKey reads
@@ -30,12 +32,19 @@ vi.mock("../src/config/user-config.js", async () => {
 });
 
 import { clearCache, setClock } from "../src/quota/ollama-cloud/cache.js";
-import { fetchOcUsage } from "../src/quota/ollama-cloud/client.js";
+import { fetchOcMe, fetchOcUsage } from "../src/quota/ollama-cloud/client.js";
 import { formatOcSection } from "../src/quota/ollama-cloud/format.js";
-import { queryOcUsage } from "../src/quota/ollama-cloud/index.js";
+import {
+  nextMonthlyAnniversary,
+  nextSessionReset,
+  nextWeeklyReset,
+  queryOcUsage,
+  SESSION_WINDOW_MS,
+} from "../src/quota/ollama-cloud/index.js";
 import type { OcQueryResult } from "../src/quota/ollama-cloud/types.js";
 
 const mockedFetch = vi.mocked(fetchOcUsage);
+const mockedMe = vi.mocked(fetchOcMe);
 
 /** Set the config-file key (null = no quota section in the file). */
 function setFileKey(key: string | null): void {
@@ -43,11 +52,7 @@ function setFileKey(key: string | null): void {
 }
 
 /** Build a valid /api/usage response body. */
-function usageBody(
-  session: number | null,
-  weekly: number | null,
-  monthly?: number | null,
-): string {
+function usageBody(session: number | null, weekly: number | null, monthly?: number | null): string {
   const limits: Record<string, { usage: number }> = {};
   if (session !== null && session !== undefined) limits.session = { usage: session };
   if (weekly !== null && weekly !== undefined) limits.weekly = { usage: weekly };
@@ -58,16 +63,34 @@ function usageBody(
 // --- formatOcSection -------------------------------------------------------
 
 describe("formatOcSection", () => {
-  const success: OcQueryResult = { kind: "success", session: 0.314, weekly: 0.675, fetchedAt: 1000 };
+  const success: OcQueryResult = {
+    kind: "success",
+    session: 0.314,
+    weekly: 0.675,
+    fetchedAt: 1000,
+  };
 
-  it("renders both windows as percent bars (no reset stamps)", () => {
+  it("renders both windows as percent bars, no stamp without derived resets", () => {
     const sec = formatOcSection(success);
     expect(sec.header).toBe("Ollama Cloud");
     expect(sec.body).toHaveLength(2);
     expect(sec.body[0]).toMatch(/5h\s+█+░*\s+31\.4%/);
     expect(sec.body[1]).toMatch(/Week\s+█+░*\s+67\.5%/);
-    // The API carries no reset timestamps — no stamp column.
+    // No derived reset moments on the fixture — no stamp column.
     expect(sec.body[0]).not.toMatch(/\d{2}-\d{2} \d{2}:\d{2}/);
+  });
+
+  it("appends the derived reset stamp when the result carries one", () => {
+    const sec = formatOcSection({
+      kind: "success",
+      session: 0.3,
+      sessionResetAt: 1_800_000_000_000,
+      weekly: 0.5,
+      fetchedAt: 1,
+    });
+    expect(sec.body[0]).toMatch(/5h\s+[█░]+\s+30%\s+·\s+\d{2}-\d{2} \d{2}:\d{2}/);
+    // The weekly line carries no stamp of its own on this fixture.
+    expect(sec.body[1]).not.toMatch(/· \d{2}-\d{2}/);
   });
 
   it("non-success kinds render a single explanation line", () => {
@@ -91,17 +114,17 @@ describe("formatOcSection", () => {
       expect(stripAnsi(line)).not.toContain("░");
     });
 
-  it("renders only the windows the plan exposes (legacy vs credit plan)", () => {
-    const legacy = formatOcSection({ kind: "success", session: 0.2, weekly: 0.4, fetchedAt: 1 });
-    expect(legacy.body).toHaveLength(2); // 5h + Week
-    const credit = formatOcSection({ kind: "success", monthly: 0.006, fetchedAt: 1 });
-    expect(credit.body).toHaveLength(1);
-    expect(credit.body[0]).toMatch(/Month\s+[█░]+\s+0\.6%/);
-  });
+    it("renders only the windows the plan exposes (legacy vs credit plan)", () => {
+      const legacy = formatOcSection({ kind: "success", session: 0.2, weekly: 0.4, fetchedAt: 1 });
+      expect(legacy.body).toHaveLength(2); // 5h + Week
+      const credit = formatOcSection({ kind: "success", monthly: 0.006, fetchedAt: 1 });
+      expect(credit.body).toHaveLength(1);
+      expect(credit.body[0]).toMatch(/Month\s+[█░]+\s+0\.6%/);
+    });
 
-  it("color=false keeps the plain layout (no ANSI)", () => {
-    expect(formatOcSection(success, false).body[0]).not.toContain("\x1b[");
-  });
+    it("color=false keeps the plain layout (no ANSI)", () => {
+      expect(formatOcSection(success, false).body[0]).not.toContain("\x1b[");
+    });
   });
 });
 
@@ -112,6 +135,7 @@ describe("queryOcUsage orchestration", () => {
     clearCache();
     setClock(() => 5000);
     mockedFetch.mockReset();
+    mockedMe.mockReset();
     setFileKey(null);
   });
   afterEach(() => {
@@ -130,6 +154,97 @@ describe("queryOcUsage orchestration", () => {
     mockedFetch.mockResolvedValue({ status: 200, text: usageBody(0.051, 0.503) });
     const result = await queryOcUsage();
     expect(result).toMatchObject({ kind: "success", session: 0.051, weekly: 0.503 });
+    // Session/weekly resets derive from the window anchoring at fetch time.
+    if (result.kind !== "success") return;
+    expect(result.sessionResetAt).toBeGreaterThan(result.fetchedAt);
+    expect(result.sessionResetAt! - result.fetchedAt).toBeLessThanOrEqual(SESSION_WINDOW_MS);
+    expect(result.weeklyResetAt).toBeGreaterThan(result.fetchedAt);
+    // /api/me is only consulted when the monthly window exists.
+    expect(mockedMe).not.toHaveBeenCalled();
+  });
+
+  it("derives reset moments from the window anchoring (pure functions)", () => {
+    // 5h buckets are epoch-aligned: the next boundary after 2 buckets + 1ms
+    // is the start of bucket 3.
+    expect(nextSessionReset(2 * SESSION_WINDOW_MS + 1)).toBe(3 * SESSION_WINDOW_MS);
+    expect(nextSessionReset(3 * SESSION_WINDOW_MS)).toBe(4 * SESSION_WINDOW_MS);
+    // Weekly weeks anchor at Monday 00:00 UTC (epoch + 4d).
+    const anchor = 4 * 86_400_000;
+    const week = 7 * 86_400_000;
+    expect(nextWeeklyReset(anchor + 3 * week + 1000)).toBe(anchor + 4 * week);
+    expect(nextWeeklyReset(anchor + 4 * week)).toBe(anchor + 5 * week);
+  });
+
+  it("monthly plans fetch /api/me for the billing-period reset", async () => {
+    process.env.OLLAMA_API_KEY = "sk-test";
+    mockedFetch.mockResolvedValue({ status: 200, text: usageBody(null, null, 0.006) });
+    mockedMe.mockResolvedValue({
+      status: 200,
+      text: JSON.stringify({
+        Plan: "pro",
+        SubscriptionPeriodEnd: { Time: "2026-10-05T00:00:00Z", Valid: true },
+      }),
+    });
+    const result = await queryOcUsage();
+    expect(result).toMatchObject({
+      kind: "success",
+      monthly: 0.006,
+      monthlyResetAt: Date.parse("2026-10-05T00:00:00Z"),
+    });
+  });
+
+  it("new credit plans: monthly reset derives from CreatedAt's next anniversary", async () => {
+    // Live shape verified 2026-09-17 on a new Pro subscription: /api/me
+    // returns ID/CreatedAt/Email/Name/Plan — no SubscriptionPeriodEnd.
+    process.env.OLLAMA_API_KEY = "sk-test";
+    mockedFetch.mockResolvedValue({ status: 200, text: usageBody(null, null, 0.006) });
+    mockedMe.mockResolvedValue({
+      status: 200,
+      text: JSON.stringify({
+        ID: "09c296ae-ff2b-4043-8ea7-33875c996f82",
+        CreatedAt: "2026-09-12T13:38:00.308816Z",
+        Email: "user@example.com",
+        Plan: "pro",
+      }),
+    });
+    const result = await queryOcUsage();
+    expect(result).toMatchObject({ kind: "success", monthly: 0.006 });
+    if (result.kind !== "success" || result.monthlyResetAt === undefined) {
+      throw new Error("monthlyResetAt missing");
+    }
+    // Next monthly anniversary of the subscription day, within a month.
+    expect(result.monthlyResetAt).toBeGreaterThan(result.fetchedAt);
+    expect(result.monthlyResetAt - result.fetchedAt).toBeLessThanOrEqual(32 * 86_400_000);
+  });
+
+  it("nextMonthlyAnniversary: subscription-day monthly cycle with day clamping", () => {
+    const Y = (s: string): number => Date.parse(s);
+    // Mid-cycle: Sep 17 with a Sep 12 13:38 signup → Oct 12 13:38 UTC (the
+    // subscription's own time-of-day, not a fixed midnight).
+    expect(nextMonthlyAnniversary(Y("2026-09-12T13:38:00Z"), Y("2026-09-17T00:00:00Z"))).toBe(
+      Y("2026-10-12T13:38:00Z"),
+    );
+    // Before the anniversary moment on the day → later that same day.
+    expect(nextMonthlyAnniversary(Y("2026-09-12T13:38:00Z"), Y("2026-10-12T13:00:00Z"))).toBe(
+      Y("2026-10-12T13:38:00Z"),
+    );
+    // Past the anniversary moment → next month.
+    expect(nextMonthlyAnniversary(Y("2026-09-12T13:38:00Z"), Y("2026-10-12T14:00:00Z"))).toBe(
+      Y("2026-11-12T13:38:00Z"),
+    );
+    // A Jan-31 signup clamps to Feb 28 (2026 not a leap year).
+    expect(nextMonthlyAnniversary(Y("2026-01-31T09:15:00Z"), Y("2026-02-01T00:00:00Z"))).toBe(
+      Y("2026-02-28T09:15:00Z"),
+    );
+  });
+
+  it("monthly reset is omitted when /api/me fails (best-effort)", async () => {
+    process.env.OLLAMA_API_KEY = "sk-test";
+    mockedFetch.mockResolvedValue({ status: 200, text: usageBody(null, null, 0.006) });
+    mockedMe.mockRejectedValue(new Error("network down"));
+    const result = await queryOcUsage();
+    expect(result).toMatchObject({ kind: "success", monthly: 0.006 });
+    expect(result.kind === "success" && result.monthlyResetAt).toBeUndefined();
   });
 
   it("maps HTTP 401 to auth_error", async () => {

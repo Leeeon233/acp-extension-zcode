@@ -65,8 +65,14 @@ import { readCodeFingerprint } from "./code-fingerprint.js";
 import { remoteEnabledLive, remoteTerminalPrefs } from "./config.js";
 import { accountUsageStats, type UsageStatsResult } from "../handlers/account.js";
 import { BOOT_RESUME_TRIGGER } from "../handlers/session.js";
-import { composeQuotaDock, formatGoDockSegment, formatQuotaDock } from "../quota/format.js";
+import {
+  composeQuotaDock,
+  formatGoDockSegment,
+  formatOcDockSegment,
+  formatQuotaDock,
+} from "../quota/format.js";
 import { queryQuota } from "../quota/index.js";
+import { queryOcUsage } from "../quota/ollama-cloud/index.js";
 import { queryGoUsage } from "../quota/opencode-go/index.js";
 import { listKnownWorkspaces } from "../tasks-index.js";
 
@@ -707,9 +713,14 @@ function getQuotaDock(): Promise<{ formatted: string | null; fetchedAt: number }
   }
   return Promise.all([
     queryQuota().then(formatQuotaDock),
-    queryGoUsage().then(formatGoDockSegment).catch(() => null),
-  ]).then(([glm, go]) => {
-    dockCache = { formatted: composeQuotaDock(glm, go), at: Date.now() };
+    queryGoUsage()
+      .then(formatGoDockSegment)
+      .catch(() => null),
+    queryOcUsage()
+      .then(formatOcDockSegment)
+      .catch(() => null),
+  ]).then(([glm, go, oc]) => {
+    dockCache = { formatted: composeQuotaDock(glm, go, oc), at: Date.now() };
     return { formatted: dockCache.formatted, fetchedAt: dockCache.at };
   });
 }

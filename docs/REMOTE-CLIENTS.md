@@ -380,9 +380,11 @@ section — so clients can reproduce the CLI layout exactly:
   `unavailable`): on success, `windows` carries whichever entries the
   account's plan exposes — legacy plans: `session` (`5h`) + `weekly`
   (`Week`); current credit plans: `monthly` (`Month`) — each with
-  `usagePercent` (0–100). There is no `resetsAt` — ollama.com exposes no
-  reset timestamps. `not_configured` means no Ollama API key is set — omit
-  the section, like the CLI does.
+  `usagePercent` (0–100) and, when available, `resetsAt` (epoch ms,
+  derived client-side: epoch-aligned 5h buckets / Monday 00:00 UTC weeks /
+  the `/api/me` billing period or subscription-day anniversary for monthly).
+  `not_configured` means no
+  Ollama API key is set — omit the section, like the CLI does.
 - Provider failures are per-section `kind` strings, not JSON-RPC errors —
   render the same status line the CLI would (e.g. auth expired) and retry
   later. Only transport-level failures reject the request.

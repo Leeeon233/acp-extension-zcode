@@ -28,6 +28,11 @@ vi.mock("../src/handlers/account.js", () => ({
 const { queryQuotaMock } = vi.hoisted(() => ({ queryQuotaMock: vi.fn() }));
 vi.mock("../src/quota/index.js", () => ({ queryQuota: queryQuotaMock }));
 
+// Ollama Cloud dock segment — mock so an inherited OLLAMA_API_KEY cannot
+// reach the real usage API from tests.
+const { queryOcUsageMock } = vi.hoisted(() => ({ queryOcUsageMock: vi.fn() }));
+vi.mock("../src/quota/ollama-cloud/index.js", () => ({ queryOcUsage: queryOcUsageMock }));
+
 // The session-create endpoints read the known-project whitelist from
 // tasks-index; mock the module so no real sqlite/App store is touched.
 const { listKnownWorkspacesMock } = vi.hoisted(() => ({
@@ -486,6 +491,8 @@ describe("hub quota dock endpoint", () => {
 
   beforeEach(() => {
     queryQuotaMock.mockReset();
+    queryOcUsageMock.mockReset();
+    queryOcUsageMock.mockResolvedValue({ kind: "not_configured" });
     resetDockCacheForTest();
   });
 
