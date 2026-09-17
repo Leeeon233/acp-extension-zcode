@@ -220,6 +220,17 @@ function buildModelSelectOptions(models: ModelRef[]): Array<{ value: string; nam
  * builtin provider. A value with `\` is the current provider+model encoding.
  */
 export function parseModelValue(value: string): { providerId: string; modelId: string } {
+  // New-format (3.12+) agent-definition spelling: `custom:<urlencoded
+  // providerId>:<modelId>` — e.g. custom:account%3Abigmodel-individual-coding-plan:GLM-5.3
+  // (the provider id's colons are percent-encoded, so `[^:]+` splits cleanly).
+  const custom = /^custom:([^:]+):(.+)$/.exec(value);
+  if (custom) {
+    try {
+      return { providerId: decodeURIComponent(custom[1]!), modelId: custom[2]! };
+    } catch {
+      // malformed encoding — fall through to the legacy spellings
+    }
+  }
   const idx = value.indexOf("\\");
   if (idx < 0) {
     // Builtin plain modelId — resolve to the first enabled builtin provider

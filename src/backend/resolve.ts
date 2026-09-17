@@ -133,14 +133,29 @@ function discoverZcodeBin(): string | null {
  */
 const PROVIDER_CONFIG_NAME = "zcode-builtin.json";
 export const BUILTIN_PROVIDER_ENV = "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE";
+export const PERSONAL_PROVIDER_ENV = "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE";
 
 /**
- * Env vars pointing the CLI at its built-in provider table, mirroring the
- * desktop host's own injection. Locates the file next to the resolved CLI
+ * Env vars pointing the CLI at its provider tables, mirroring the desktop
+ * host's own injection. Locates the builtin file next to the resolved CLI
  * entry (sibling `provider/` — npm/dev layout — or `../config/provider/` —
- * the .app bundle layout) and returns `{ZCODE_BUILTIN_PROVIDER_CONFIG_FILE}`;
+ * the .app bundle layout) and returns BOTH
+ * `{ZCODE_BUILTIN_PROVIDER_CONFIG_FILE, ZCODE_PERSONAL_PROVIDER_CONFIG_FILE}`;
  * `{}` when the entry is not a JS file, is missing, or carries no provider
  * config anywhere (old CLIs, PATH installs) — those boot without one.
+ *
+ * BOTH vars are required: the CLI's provider bootstrap uses the injected
+ * builtin path VERBATIM only when the personal var is set too — with the
+ * builtin alone it re-syncs the table into a version-keyed runtime copy
+ * (`~/.zcode/v2/runtime/provider/<plat>/<version>/<endpoint dir>/zcode-builtin.json`)
+ * and rewires
+ * its configRevision to THAT copy's path. The account-config push's
+ * `basedOnZcodeBuiltinRevision` hashes the injected path, so any rewire
+ * silently voids the push and every account model answers "Provider
+ * Registry 中不存在 Model" (observed 2026-09: one terminal env took the
+ * re-sync path deterministically while another never did). The personal
+ * value is the CLI's own default location, just made explicit to unlock the
+ * verbatim branch.
  *
  * The derived value deliberately OVERRIDES any inherited ambient env: the
  * host injects version-keyed runtime paths
@@ -161,7 +176,11 @@ export function builtinProviderEnv(entryArg?: string): NodeJS.ProcessEnv {
     path.join(dir, "..", "config", "provider", PROVIDER_CONFIG_NAME),
   ];
   const found = candidates.find((c) => existsSync(c));
-  return found ? { [BUILTIN_PROVIDER_ENV]: found } : {};
+  if (!found) return {};
+  const personal = path.join(os.homedir(), ".zcode", "v2", "provider_config.json");
+  return existsSync(personal)
+    ? { [BUILTIN_PROVIDER_ENV]: found, [PERSONAL_PROVIDER_ENV]: personal }
+    : { [BUILTIN_PROVIDER_ENV]: found };
 }
 
 /**

@@ -135,7 +135,19 @@ ZCode protocol types into ACP notifications directly — always translate.
   makes the backend accept the push but silently ignore it; derive it from the
   SAME path `ensureBackend` injects (reading the ambient env first points at a
   version-keyed runtime copy and yields a rejected revision — that failure
-  mode is the trap). Entitlement comes from `coding-plan-cache.json`
+  mode is the trap). **Both env vars are load-bearing**: the CLI's provider
+  bootstrap uses the injected builtin path VERBATIM only when
+  `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` is set alongside
+  `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE`; with the builtin alone it re-syncs the
+  table into a version-keyed runtime copy (`~/.zcode/v2/runtime/provider/<plat>/<ver>/…`)
+  and rewires its configRevision to THAT copy's path — every account switch
+  then answers "Provider Registry 中不存在 Model" while probe environments
+  without the re-sync trigger look perfectly healthy (observed 2026-09-17:
+  the user's terminal took the re-sync path deterministically, the dev shell
+  never did; `builtinProviderEnv` now injects both vars). 3.12 also renamed
+  the config-file model spelling to `custom:<urlencoded providerId>:<modelId>`
+  (see `~/.zcode/agents/*.md`); `parseModelValue` accepts it. Entitlement
+  comes from `coding-plan-cache.json`
   (desktop's resolved availability verdict) → legacy `config.json`
   (`builtin:*` enabled + apiKey); `setting.json`'s
   `modelProviderFamilySelectedKeys` is a _selection_ record, not an
@@ -150,10 +162,14 @@ ZCode protocol types into ACP notifications directly — always translate.
   FULL `settings.model.available` list (with authoritative `reasoning.defaultLevel`);
   `session/read` answers `"current"` only, so the create snapshot is cached in
   `server.modelAvailability` for switch-time level resolution. `applyModelSwitch`
-  tries the modern shape then falls back once to the legacy overlay shape, so
-  the same bridge works on both builds. `workspace/updateProviderRegistry` is
+  tries the modern shape then falls back once to the legacy overlay shape, so the
+  same bridge works on both builds. `workspace/updateProviderRegistry` is
   GONE in 3.12+ (method-not-found) — the bridge logs it as a no-op, not a
-  failure.
+  failure. Also note `session.model_selection.persist_failed` ("FOREIGN KEY
+  constraint failed") fires on EVERY setModel since at least 2026-09-14 —
+  including working third-party switches — it is a backend-side persistence
+  wart, NOT a switch failure (the following `session.model.updated` event is
+  the success signal); don't chase it as a switching bug.
 - **The backend ignores `session/stop`** (verified against app-server 0.16.5 —
   the model stream runs to its natural end no matter what). Cancel is therefore
   bridge-side only: the turn loop returns `cancelled` at once, and the next
