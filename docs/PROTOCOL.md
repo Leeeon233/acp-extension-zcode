@@ -377,6 +377,17 @@ the ACP `session/prompt` result's `usage` field (UNSTABLE in
 agent-client-protocol), with `source`/`modelRequestCount`/web request counts
 riding in the result's `_meta.zcode.usage`.
 
+One field is normalized: the backend's `inputTokens` is cache-INCLUSIVE
+(OpenAI-style; verified `totalTokens == inputTokens + outputTokens` on live
+frames), while ACP's de-facto convention (claude-agent-acp, DeepSeek's
+dsh-token-meter four-bucket model) reports `inputTokens` EXCLUDING cache —
+clients compute hit rate as `cachedRead / (input + cachedRead + cachedWrite)`.
+The bridge therefore reports `inputTokens = backend inputTokens − cacheRead −
+cacheWrite` (clamped at 0) and keeps `totalTokens` verbatim (the backend's
+input+output sum equals the convention's four-bucket total). The untouched
+backend value rides in `_meta.zcode.usage.rawInputTokens` — present only when
+normalization actually changed the number.
+
 ```json
 {
   "method": "session/event",

@@ -2865,15 +2865,28 @@ function getOrCreateDiffer(server: ZcodeAcpServer, zcodeSid: string): Projection
  * reducer 0-fills them); the optional ones pass through as null when
  * unreported. Field renames: reasoningTokens→thoughtTokens,
  * cacheRead/cacheWriteTokens→cachedRead/cachedWriteTokens.
+ *
+ * The backend's inputTokens is OpenAI-style: it ALREADY contains the cache
+ * read+write tokens (verified live 2026-09-18: totalTokens == inputTokens +
+ * outputTokens on a real turn.completed frame). ACP's de-facto convention —
+ * claude-agent-acp passthrough and DeepSeek's dsh-token-meter four-bucket
+ * model alike — reports inputTokens EXCLUDING cache, and clients (martty's
+ * stats-view, Zed) compute cache hit rate as cachedRead / (input + cachedRead
+ * + cachedWrite). Forwarding the inclusive number double-counts the cache in
+ * their denominator, so normalize: inputTokens here is cache-exclusive,
+ * clamped at 0. totalTokens passes through unchanged — the backend's
+ * input+output sum IS the convention's four-bucket total, arithmetically.
  */
 export function toAcpTurnUsage(u: Record<string, unknown> | null): acp.Usage | undefined {
   if (!u) return undefined;
   const num = (k: string): number => (typeof u[k] === "number" ? (u[k] as number) : 0);
   const numOrNull = (k: string): number | null =>
     typeof u[k] === "number" ? (u[k] as number) : null;
+  const cacheRead = numOrNull("cacheReadTokens") ?? 0;
+  const cacheWrite = numOrNull("cacheWriteTokens") ?? 0;
   return {
     totalTokens: num("totalTokens"),
-    inputTokens: num("inputTokens"),
+    inputTokens: Math.max(0, num("inputTokens") - cacheRead - cacheWrite),
     outputTokens: num("outputTokens"),
     thoughtTokens: numOrNull("reasoningTokens"),
     cachedReadTokens: numOrNull("cacheReadTokens"),
@@ -2886,7 +2899,8 @@ export function toAcpTurnUsage(u: Record<string, unknown> | null): acp.Usage | u
  * turn's usage when the backend reported one (absent otherwise — no synthetic
  * zeros). Spec fields carry the standard counters; backend extras (source,
  * modelRequestCount, web request counts) ride in `_meta.zcode.usage` per the
- * bridge's extension policy.
+ * bridge's extension policy, plus `rawInputTokens` whenever normalization
+ * changed it (reconciliation/diagnostics).
  */
 export function turnResult(
   translator: EventTranslator,
@@ -2898,6 +2912,9 @@ export function turnResult(
   const extras: Record<string, unknown> = {};
   for (const k of ["source", "modelRequestCount", "webFetchRequests", "webSearchRequests"]) {
     if (raw[k] !== undefined) extras[k] = raw[k];
+  }
+  if (typeof raw["inputTokens"] === "number" && raw["inputTokens"] !== usage.inputTokens) {
+    extras.rawInputTokens = raw["inputTokens"];
   }
   return {
     stopReason,
