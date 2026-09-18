@@ -93,7 +93,11 @@ export type ZcodeEventType =
   // stay accurate.
   | "turn.steerQueued"
   | "turn.steerDrained"
-  | "turn.terminal";
+  | "turn.terminal"
+  // app-server 0.16.5 (verified live + schema-checked against the desktop
+  // 3.12.3 bundle, 2026-09-18): authoritative conversation-title pushes.
+  // Consumed by SessionTitleListener; see docs/PROTOCOL.md.
+  | "session.titleUpdated";
 
 export interface ZcodeEvent {
   sessionId: string;

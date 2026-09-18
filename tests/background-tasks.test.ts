@@ -28,6 +28,8 @@ interface FakeServer {
   /** Mirrors ZcodeAcpServer.terminalSentData — set by tests to simulate a
    *  tracked launch card so BackgroundTaskListener reuses it. */
   terminalSentData: Map<string, string>;
+  /** Mirrors ZcodeAcpServer.notifyTurnActiveSince (notification busy window). */
+  notifyTurnActiveSince: Map<string, number>;
 }
 type TestServer = FakeServer & Pick<ZcodeAcpServer, "notifyByZcodeSid">;
 
@@ -36,6 +38,7 @@ function makeServer(): TestServer {
   const server = {
     calls,
     terminalSentData: new Map<string, string>(),
+    notifyTurnActiveSince: new Map<string, number>(),
     async notifyByZcodeSid(zcodeSid: string, update: Record<string, unknown>): Promise<boolean> {
       calls.push({ zcodeSid, update });
       return true;
@@ -132,6 +135,8 @@ describe("BackgroundTaskListener", () => {
       zcodeEvent("turn.started", { inputSource: "background_task", turnId: "turn_bg1" }),
     );
     await Promise.resolve();
+    // The notification busy window opens with the turn.
+    expect(server.notifyTurnActiveSince.has("sess_test")).toBe(true);
     // Its text deltas are forwarded.
     l.handleEvent(zcodeEvent("model.streaming", { kind: "text_delta", delta: "result part 1 " }));
     l.handleEvent(zcodeEvent("model.streaming", { kind: "text_delta", delta: "part 2" }));
@@ -139,6 +144,8 @@ describe("BackgroundTaskListener", () => {
     // turn.completed ends the notification turn.
     l.handleEvent(zcodeEvent("turn.completed", { resultType: "success" }));
     await Promise.resolve();
+    // ...and the busy window closes with it.
+    expect(server.notifyTurnActiveSince.has("sess_test")).toBe(false);
     // Subsequent text_delta (no active bg turn) is NOT forwarded.
     l.handleEvent(zcodeEvent("model.streaming", { kind: "text_delta", delta: "leak" }));
     await Promise.resolve();
@@ -148,6 +155,19 @@ describe("BackgroundTaskListener", () => {
     expect((chunks[1]!.update["content"] as { text: string }).text).toBe("part 2");
     // All chunks share one messageId (the bg result message).
     expect(chunks[0]!.update["messageId"]).toBe(chunks[1]!.update["messageId"]);
+  });
+
+  it("turn.failed also closes the notification busy window", async () => {
+    const server = makeServer();
+    const l = new BackgroundTaskListener(server as unknown as ZcodeAcpServer, "sess_test");
+    l.handleEvent(
+      zcodeEvent("turn.started", { inputSource: "background_task", turnId: "turn_bg2" }),
+    );
+    await Promise.resolve();
+    expect(server.notifyTurnActiveSince.has("sess_test")).toBe(true);
+    l.handleEvent(zcodeEvent("turn.failed", { error: { code: "x" } }));
+    await Promise.resolve();
+    expect(server.notifyTurnActiveSince.has("sess_test")).toBe(false);
   });
 
   it("allocates a fresh messageId per background task (no cross-task reuse)", async () => {

@@ -999,6 +999,9 @@ export async function resumeIntoSession(
   // The adopted session's stored title wins over the placeholder's first-
   // prompt auto-title.
   server.titleEligibleSessions.delete(acpSid);
+  // Same for the user-rename pin: it belonged to the discarded placeholder
+  // thread, not the adopted conversation.
+  server.titleUserSetBy.delete(acpSid);
 
   const cwd = server.serveMode ? process.cwd() : authoritativeSessionCwd(server, acpSid);
   // Settled history when a resume flight ran (performer OR joiner — the
@@ -1558,7 +1561,22 @@ export async function runOneTurn(
           // resume path); the cold-start form is transient and retries below.
           throw new Error(`zcode send failed: ${sendResp.error.message ?? ""}`);
         }
-        const budget = isBusy ? SEND_RETRY_TIMEOUT_MS : WARMUP_RETRY_TIMEOUT_MS;
+        // A background NOTIFICATION turn (the model summarising a finished
+        // background task) holds the prompt lock and easily outlives the normal
+        // busy budget — it is a real model turn, and the send WILL be accepted
+        // once it drains (observed live 2026-09-18: -32010 "A prompt is already
+        // running for this session" while the notify turn ran). Extend the
+        // budget instead of failing the user's prompt. The window is bounded by
+        // freshness: if the listener never saw the notification turn's terminal
+        // event (dropped stream), the stale marker must not extend busy waits
+        // forever — a marker older than 10 minutes is ignored.
+        const NOTIFY_TURN_BUSY_TIMEOUT_MS = 180_000;
+        const NOTIFY_TURN_STALE_MS = 600_000;
+        const notifySince = server.notifyTurnActiveSince.get(zcodeSid);
+        const notifyActive =
+          notifySince !== undefined && Date.now() - notifySince < NOTIFY_TURN_STALE_MS;
+        const busyBudget = notifyActive ? NOTIFY_TURN_BUSY_TIMEOUT_MS : SEND_RETRY_TIMEOUT_MS;
+        const budget = isBusy ? busyBudget : WARMUP_RETRY_TIMEOUT_MS;
         if (Date.now() - sendT0 > budget) {
           throw new Error(
             `zcode send failed: ${isBusy ? "backend still busy" : "send keeps being rejected"} after ${Math.round(budget / 1000)}s (${sendResp.error.message ?? ""})`,
@@ -1774,6 +1792,11 @@ async function runPrompt(
   // Materialize a lazy session/new placeholder on first use. Placed after the
   // empty-prompt check so an invalid request doesn't create a backend session.
   const zcodeSid = await ensureRealSession(server, params.sessionId);
+  // Re-arm the session's out-of-band listeners (background tasks, backend
+  // titles): a mid-session backend respawn (sandbox flip, dynamic allow
+  // batches, dead-reader recovery) replaces the instance the listeners were
+  // registered on — ensureBackgroundListener re-registers on the current one.
+  server.ensureBackgroundListener(zcodeSid);
 
   // Slash-command interception: dispatches directly to ZCode methods and
   // returns end_turn without entering the turn loop. Known passthrough
