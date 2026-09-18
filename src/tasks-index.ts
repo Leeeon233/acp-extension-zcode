@@ -331,6 +331,27 @@ export async function updateSessionTitle(
 
 // ---------- known workspaces (remote session-create, ADR-0014) ----------
 
+/**
+ * Whether the tasks-index row marks this conversation's title as manually
+ * renamed (`title_overridden=1`, set by renameSessionTask). Read-only consult
+ * for the title listener: the bridge's in-memory rename pin is lost on
+ * restart, but the durable flag keeps a later backend `generated` title push
+ * from overriding the user's rename. False when the index or row is absent.
+ */
+export async function isTitleOverridden(taskId: string): Promise<boolean> {
+  if (!existsSync(TASKS_INDEX_PATH)) return false;
+  try {
+    const row = await withSqliteRetry(
+      (con) =>
+        con.prepare("SELECT title_overridden FROM tasks WHERE task_id=?").get(taskId) as
+          { title_overridden: number } | undefined,
+    );
+    return row?.title_overridden === 1;
+  } catch {
+    return false;
+  }
+}
+
 /** One known project workspace, as recorded by the App's tasks index. */
 export interface KnownWorkspace {
   workspacePath: string;

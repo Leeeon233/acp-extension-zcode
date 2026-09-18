@@ -15,8 +15,8 @@ importers:
         specifier: ^8.21.3
         version: 8.21.3
       zcode-acp-martty:
-        specifier: 0.2.39-zcode.4
-        version: 0.2.39-zcode.4
+        specifier: 0.2.39-zcode.5
+        version: 0.2.39-zcode.5
     devDependencies:
       '@eslint/js':
         specifier: ^9.0.0
@@ -1151,8 +1151,8 @@ packages:
     resolution: {integrity: sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q==}
     engines: {node: '>=10'}
 
-  zcode-acp-martty@0.2.39-zcode.4:
-    resolution: {integrity: sha512-uoJ7mc1wyXb8QUkghLVJodnpetNoQJ03148UxlWRzNslKaggcnuYTXj2bXrjRfPzYuYM2U9tqV3Tqb54tU9TJg==}
+  zcode-acp-martty@0.2.39-zcode.5:
+    resolution: {integrity: sha512-vuavheYIlF5ttagUf2N/lBQYyFIsmNlEtRuV6CJFABy+tyym7R6iN9hxTTbtRTgbhehANDvDcl0evPavduTS0g==}
     engines: {node: '>=18'}
     hasBin: true
 
@@ -2105,7 +2105,7 @@ snapshots:
 
   yocto-queue@0.1.0: {}
 
-  zcode-acp-martty@0.2.39-zcode.4:
+  zcode-acp-martty@0.2.39-zcode.5:
     dependencies:
       '@deepseek-ai/cordis': 4.0.2
       '@lobehub/icons-static-svg': 1.95.0

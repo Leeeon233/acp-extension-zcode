@@ -20,6 +20,7 @@ import { armSandboxArgv, collectSandboxWorkspaces, sandboxActive } from "./backe
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend } from "./handlers/io.js";
 import { SandboxRestartBatcher, flushSandboxGrants } from "./handlers/sandbox-allow.js";
+import { SessionTitleListener } from "./handlers/session-titles.js";
 import { ClientRegistry } from "./remote/broadcast.js";
 import { AGENT_INFO, clientConnectionRoot, PROTOCOL_VERSION, log, warn } from "./utils.js";
 
@@ -341,6 +342,31 @@ export class ZcodeAcpServer {
    */
   readonly backgroundListeners = new Map<string, BackgroundTaskListener>();
   /**
+   * Backend instance each session's out-of-band listeners were registered on.
+   * The backend can be REPLACED mid-session (sandbox arm-flip, dynamic allow
+   * batches, dead-reader recovery) and listeners are per-instance — when this
+   * map's entry differs from the current backend, ensureBackgroundListener
+   * re-registers (also called from the prompt path so a respawn heals on the
+   * next turn, not just on resume/load).
+   */
+  readonly backgroundListenerBackend = new Map<string, ZcodeBackend>();
+  /**
+   * Sessions (zcodeSid) whose background NOTIFICATION turn (the model
+   * summarising a finished background task) is currently running, → start
+   * time. Maintained by BackgroundTaskListener; read by the prompt path to
+   * extend the send busy-retry budget — a notification turn is a real model
+   * turn and easily outlives the normal 30s busy window, after which the
+   * user's prompt would fail outright (#194-adjacent UX).
+   */
+  readonly notifyTurnActiveSince = new Map<string, number>();
+  /**
+   * Sessions (acpSid) whose title was set by MANUAL user intent (the remote
+   * rename endpoint, or a `session.titleUpdated` push with source "custom"
+   * from another surface). The backend's later `generated` title pushes must
+   * not override these (SessionTitleListener).
+   */
+  readonly titleUserSetBy = new Set<string>();
+  /**
    * Per-Bash-callId stdout snapshot already streamed via terminal_output. Used
    * by dispatchTerminalUpdate for two dedup guards:
    *   - progress: diff cumulative stdoutTail snapshots, emit only the suffix.
@@ -561,12 +587,19 @@ export class ZcodeAcpServer {
    * backend's per-session listener Set.
    */
   ensureBackgroundListener(zcodeSid: string): BackgroundTaskListener {
-    const existing = this.backgroundListeners.get(zcodeSid);
-    if (existing) return existing;
     const backend = this.ensureBackend();
-    const listener = new BackgroundTaskListener(this, zcodeSid);
+    const existing = this.backgroundListeners.get(zcodeSid);
+    if (existing && this.backgroundListenerBackend.get(zcodeSid) === backend) return existing;
+    // Fresh session, or the backend was respawned since registration —
+    // (re-)register on the CURRENT instance; the old instance's listener set
+    // died with it, so there is no duplicate-registration risk.
+    const listener = existing ?? new BackgroundTaskListener(this, zcodeSid);
     this.backgroundListeners.set(zcodeSid, listener);
     backend.registerEventListener(zcodeSid, listener);
+    // The session-scoped title listener rides the same registration site and
+    // lifetime: one registration covers both out-of-band consumers.
+    backend.registerEventListener(zcodeSid, new SessionTitleListener(this, zcodeSid));
+    this.backgroundListenerBackend.set(zcodeSid, backend);
     log(`  [bg] background listener registered for ${zcodeSid}`);
     return listener;
   }

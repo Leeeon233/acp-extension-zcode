@@ -170,16 +170,17 @@ API only because the ZCode backend itself sends them for inference.
 
 ### `handlers/` — ACP method handling
 
-| File                  | Responsibility                                                                                                                                                                                          |
-| --------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `session.ts`          | session/new/list/resume/load/prompt/set_config_option/cancel                                                                                                                                            |
-| `extensions.ts`       | fork/rewind/rewindCascade/goal/compact/steer/cancelBackgroundTask/setModel/setMode/setThoughtLevel                                                                                                      |
-| `dispatch.ts`         | dispatchEvent single exit point: InternalEvent → ACP session/update                                                                                                                                     |
-| `background-tasks.ts` | Session-scoped `BackgroundTaskListener` — forwards background sub-agent status (`session.updated` taskId) + completion-notification turns to the client OUTSIDE request handlers (lives across prompts) |
-| `server-requests.ts`  | Handle zcode interaction/* requests (tool auth, ExitPlanMode, AskUserQuestion), protocol negotiation routing                                                                                            |
-| `io.ts`               | ACP notification helpers (including `sendAvailableCommandsDeferred` deferred notification)                                                                                                              |
-| `slash.ts`            | Interception of `/`-prefixed commands (/compact /goal /fork /rewind /steer /model /mode /thought); non-advertised `/x` prompts are neutralized into plain text (`neutralizeSlashText`)                  |
-| `account.ts`          | `account/usage_stats` — account-level plan quota for remote clients (Proposal 0002; quota pipeline + graceful error)                                                                                    |
+| File                  | Responsibility                                                                                                                                                                                                         |
+| --------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `session.ts`          | session/new/list/resume/load/prompt/set_config_option/cancel                                                                                                                                                           |
+| `extensions.ts`       | fork/rewind/rewindCascade/goal/compact/steer/cancelBackgroundTask/setModel/setMode/setThoughtLevel                                                                                                                     |
+| `dispatch.ts`         | dispatchEvent single exit point: InternalEvent → ACP session/update                                                                                                                                                    |
+| `background-tasks.ts` | Session-scoped `BackgroundTaskListener` — forwards background sub-agent status (`session.updated` taskId) + completion-notification turns to the client OUTSIDE request handlers (lives across prompts)                |
+| `session-titles.ts`   | Session-scoped `SessionTitleListener` — adopts backend `session.titleUpdated` pushes (`generated`/`custom` sources; manual renames win) into sessionTitles/tasks-index/terminal tab + broadcasts `session_info_update` |
+| `server-requests.ts`  | Handle zcode interaction/* requests (tool auth, ExitPlanMode, AskUserQuestion), protocol negotiation routing                                                                                                           |
+| `io.ts`               | ACP notification helpers (including `sendAvailableCommandsDeferred` deferred notification)                                                                                                                             |
+| `slash.ts`            | Interception of `/`-prefixed commands (/compact /goal /fork /rewind /steer /model /mode /thought); non-advertised `/x` prompts are neutralized into plain text (`neutralizeSlashText`)                                 |
+| `account.ts`          | `account/usage_stats` — account-level plan quota for remote clients (Proposal 0002; quota pipeline + graceful error)                                                                                                   |
 
 ### `interaction/` — Interaction bridging
 
