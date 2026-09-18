@@ -26,7 +26,11 @@ jobs:
 
   publish:
     needs: release-please
-    if: needs.release-please.outputs.release_created == 'true'
+    # workflow_dispatch is the manual escape hatch: when release-please cannot
+    # cut a release itself (e.g. its release PR was closed unmerged and the
+    # version bump already sits on main), a dispatch publishes main's
+    # package.json version — the tag/release must exist by then.
+    if: needs.release-please.outputs.release_created == 'true' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
