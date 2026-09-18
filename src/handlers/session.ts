@@ -468,35 +468,67 @@ function emitBootUsageUpdate(server: ZcodeAcpServer, acpSid: string): void {
 }
 
 /**
+ * Reload the session into the backend when the resident verification went
+ * stale — the backend evicts idle resident runtimes (~10min idle + LRU), and
+ * every session-scoped RPC on a non-resident session fails with "Session is
+ * not active". Skipped while a turn is in flight (a running turn proves the
+ * resident is live).
+ *
+ * Fail-safe on ordinary reload failures (the caller surfaces the backend's
+ * own error downstream, as before) — but a session the backend no longer
+ * STORES throws the actionable evicted-session error: continuing with the
+ * dead mapping would defer the failure to the next RPC with the misleading
+ * "Session is not active" wording (observed 2026-09-18: every model/thought
+ * switch on a deleted thread failed that way instead of saying the session
+ * was gone).
+ */
+async function ensureBackendResident(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  zcodeSid: string,
+): Promise<void> {
+  if (server.isBackendSessionLive(acpSid)) return;
+  const turnInFlight = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
+  if (turnInFlight) return;
+  try {
+    log(`ensureRealSession: ${acpSid} possibly evicted from backend — reloading`);
+    await reloadBackendSession(server, acpSid, zcodeSid);
+  } catch (e) {
+    if (isSessionGoneError(e)) {
+      warn(`ensureRealSession: ${acpSid} → backend session ${zcodeSid} no longer exists`);
+      throw new Error(messages().sessionEvicted(acpSid));
+    }
+    log(
+      `ensureRealSession: reload failed, continuing with existing mapping ` +
+        `(${e instanceof Error ? e.message : String(e)})`,
+    );
+  }
+}
+
+/**
  * Materialize a lazy `session/new` placeholder into a real backend session on
  * first use (prompt / set_config_option / extension methods). Idempotent:
  * returns the existing mapping for already-created sessions, and concurrent
  * first-uses share a single `session/create` via the pending entry's `creating`
  * promise. Unknown ids throw.
+ *
+ * `{ensureResident:false}` (resolveResumeTarget only) skips the eviction
+ * guard for store-recovered mappings — that caller resumes the session itself
+ * immediately after, and its resume must be the one carrying the client's
+ * freshly declared mcpServers (#193).
  */
-export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string): Promise<string> {
+export async function ensureRealSession(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  opts: { ensureResident?: boolean } = {},
+): Promise<string> {
   const existing = server.resolveSid(acpSid);
   if (existing) {
     // The mapping exists, but the backend may have evicted the resident
     // runtime since it was loaded (~10min idle timeout + LRU cap): every
     // session-scoped RPC would then fail with "Session is not active"
-    // (-32004). Reload via session/resume when the verification went stale
-    // and no turn is in flight (a running turn proves the resident is live).
-    // Fail-safe: a failed reload just returns the mapping — the subsequent
-    // RPC surfaces the backend's real error, same as before this guard.
-    if (server.isBackendSessionLive(acpSid)) return existing;
-    const turnInFlight = [...server.pendingTurns.values()].some((t) => t.zcodeSid === existing);
-    if (!turnInFlight) {
-      try {
-        log(`ensureRealSession: ${acpSid} possibly evicted from backend — reloading`);
-        await reloadBackendSession(server, acpSid, existing);
-      } catch (e) {
-        log(
-          `ensureRealSession: reload failed, continuing with existing mapping ` +
-            `(${e instanceof Error ? e.message : String(e)})`,
-        );
-      }
-    }
+    // (-32004). Reload via session/resume when the verification went stale.
+    await ensureBackendResident(server, acpSid, existing);
     return existing;
   }
   let pending = server.pendingSessions.get(acpSid);
@@ -519,6 +551,20 @@ export async function ensureRealSession(server: ZcodeAcpServer, acpSid: string):
     }
     if (record?.zcodeSid) {
       server.registerSession(acpSid, record.zcodeSid);
+      // Seed the cwd the reload's resume needs — this process never saw the
+      // session/new that recorded it, and the resume workspace would
+      // otherwise fall back to the bridge's own process cwd.
+      const recordCwd = server.serveMode ? process.cwd() : record.cwd;
+      if (recordCwd && recordCwd !== "/" && !server.sessionCwds.has(acpSid)) {
+        server.sessionCwds.set(acpSid, recordCwd);
+      }
+      // Same eviction guard as in-memory mappings: a store-recovered session
+      // is NOT resident in this backend until resumed — the first switch or
+      // prompt on it would fail with "Session is not active" (observed
+      // 2026-09-18: the first model switch after a bridge restart).
+      if (opts.ensureResident !== false) {
+        await ensureBackendResident(server, acpSid, record.zcodeSid);
+      }
       return record.zcodeSid;
     }
     if (record) {
@@ -745,8 +791,11 @@ async function resolveResumeTarget(
   if (record) {
     // ensureRealSession recovers the record: with a zcodeSid it re-registers
     // the alias (no create), without one it materializes a fresh session.
+    // The eviction guard is SKIPPED here ({ensureResident:false}): this
+    // caller resumes the session itself right below — and its resume is the
+    // one that carries the client's freshly declared mcpServers (#193).
     return {
-      zcodeSid: await ensureRealSession(server, acpSid),
+      zcodeSid: await ensureRealSession(server, acpSid, { ensureResident: false }),
       alreadyLive: !record.zcodeSid,
       origin: "placeholder",
     };
@@ -2647,13 +2696,27 @@ async function resumePreservingModel(
     try {
       result = await resumeBackendSession(server, zcParams);
     } catch (err) {
+      // A session the backend no longer stores cannot be repaired by ANY
+      // overlay — rethrow the honest cause instead of retrying (3.12+
+      // backends reject the runtimeModel key outright, so the retry would
+      // surface "Unrecognized key" and mask the real not-found failure).
+      if (isSessionGoneError(err)) throw err;
       const overlay = buildResumeRuntimeModel();
       if (overlay === null) throw err;
       warn(
         `resume failed (${err instanceof Error ? err.message : String(err)}); ` +
           `retrying with default-model overlay`,
       );
-      result = await resumeBackendSession(server, { ...zcParams, runtimeModel: overlay });
+      try {
+        result = await resumeBackendSession(server, { ...zcParams, runtimeModel: overlay });
+      } catch (overlayErr) {
+        // Schema drift (3.12+ "Unrecognized key: runtimeModel"): the overlay
+        // fallback is dead on that build — propagate the ORIGINAL failure.
+        if (overlayErr instanceof Error && /unrecognized key/i.test(overlayErr.message)) {
+          throw err;
+        }
+        throw overlayErr;
+      }
     }
     // The settle rides the flight (see the docstring): joiners awaiting this
     // promise are ordered after hydration, not merely after the RPC.
@@ -2768,6 +2831,18 @@ async function repairUnavailableModel(server: ZcodeAcpServer, zcodeSid: string):
 export function isTransientSendError(message: string): boolean {
   const m = message.toLowerCase();
   return m.includes("模型已不可用") || /model .*(unavailable|no longer available)/.test(m);
+}
+
+/**
+ * A failure proving the backend no longer STORES the session at all — as
+ * opposed to "Session is not active", which only means the resident runtime
+ * was evicted and a session/resume reloads it. Matches both spellings the
+ * builds in the wild produce ("Session not found: <sid>", "Session ID 不存在"),
+ * mirroring translateResumeFailure's match.
+ */
+export function isSessionGoneError(e: unknown): boolean {
+  const raw = e instanceof Error ? e.message : String(e);
+  return /不存在|not\s*found/i.test(raw);
 }
 
 /** Get or create the session-level ProjectionDiffer (persists across turns). */

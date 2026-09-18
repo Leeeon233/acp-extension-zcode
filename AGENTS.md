@@ -211,6 +211,24 @@ ZCode protocol types into ACP notifications directly — always translate.
   REAL window's process tree from a test (observed live 2026-09-08 — the run
   killed its own host window). Keep new tests store-safe by default and don't
   bypass the setup file.
+- **A store-recovered alias is NOT resident; "Session not found" ≠ "Session is
+  not active" (same -32004!)**: after a bridge restart, `ensureRealSession`'s
+  durable-store branch runs the SAME eviction guard as in-memory mappings
+  (`ensureBackendResident` in handlers/session.ts): resume-before-first-use,
+  seeding `sessionCwds` from the record cwd — except via `resolveResumeTarget`
+  (`{ensureResident:false}`), because load/resume do their own resume and THAT
+  one must carry the client's freshly declared mcpServers (#193). A backend
+  that no longer STORES the session answers resume with "Session not found"
+  but setModel/setThoughtLevel with "Session is not active" — identical error
+  codes, so `isSessionGoneError` matches on the message text; a gone session
+  throws the actionable `messages().sessionEvicted` error instead of deferring
+  to the misleading wording (observed 2026-09-18: every model/thought switch
+  on a deleted thread failed as "Session is not active"). Probed same day:
+  3.12+ `session/resume` rejects BOTH `runtimeModel` and `model` keys
+  ("Unrecognized key") — the resume overlay fallback is legacy-build-only, a
+  not-found resume never retries the overlay, and a schema-rejected overlay
+  rethrows the ORIGINAL failure (the old code masked "Session not found"
+  behind "Unrecognized key: runtimeModel").
 - **AGENTS.md is workspace-scoped**: the global `~/.zcode/AGENTS.md` also exists;
   this file takes precedence for this repo.
 - **WS proxy frame type**: the SDK's WS server drops non-text frames, and

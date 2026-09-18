@@ -19,6 +19,7 @@ import {
   newSession,
   reloadBackendSession,
   resumeSession,
+  setConfigOptionHandler,
 } from "../src/handlers/session.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
@@ -735,5 +736,140 @@ describe("serve mode cwd pinning (ADR-0014 hardening)", () => {
       workspace: { workspacePath: process.cwd() },
     });
     expect(server.sessionCwds.get("sess_real_2")).toBeUndefined();
+  });
+});
+
+describe("store-recovered sessions (bridge restart)", () => {
+  const stubCx = { notify: async () => {} } as unknown as acp.AgentContext;
+
+  /**
+   * Backend with real resident semantics: session state RPCs (setModel /
+   * setThoughtLevel) fail with -32004 "Session is not active" until a
+   * session/resume has loaded the session into THIS backend process.
+   */
+  function residentBackend(): ZcodeBackend & {
+    calls: Array<{ method: string; params: unknown }>;
+  } {
+    const calls: Array<{ method: string; params: unknown }> = [];
+    const resumed = new Set<string>();
+    const backend = {
+      isDead: false,
+      request: async (id: number, method: string, params: Record<string, unknown>) => {
+        calls.push({ method, params });
+        const sid = String(params.sessionId ?? "");
+        switch (method) {
+          case "session/resume":
+            resumed.add(sid);
+            return { id, result: {} };
+          case "session/setModel":
+          case "session/setThoughtLevel":
+            if (sid && !resumed.has(sid)) {
+              return { id, error: { code: -32004, message: `Session is not active: ${sid}` } };
+            }
+            return { id, result: {} };
+          case "session/read":
+            return { id, result: { projection: { contextUsed: 0 }, settings: {} } };
+          case "session/messages":
+            return { id, result: { messages: [] } };
+          default:
+            return { id, result: {} };
+        }
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    return { backend, calls };
+  }
+
+  it("ensureRealSession reloads a store-recovered mapping before first use", async () => {
+    mockStore.set("acp_restart", { cwd: "/tmp/ws", zcodeSid: "sess_restart", createdAt: 1 });
+    const server = new ZcodeAcpServer();
+    const { backend, calls } = residentBackend();
+    server.backend = backend;
+
+    await expect(ensureRealSession(server, "acp_restart")).resolves.toBe("sess_restart");
+
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(1);
+    // The resume workspace comes from the record's cwd, seeded for a process
+    // that never saw the session/new which recorded it.
+    expect(resumes[0]!.params).toMatchObject({
+      sessionId: "sess_restart",
+      workspace: { workspacePath: "/tmp/ws", workspaceKey: "/tmp/ws" },
+    });
+    expect(server.isBackendSessionLive("acp_restart")).toBe(true);
+  });
+
+  it("the FIRST model switch after a bridge restart succeeds (2026-09-18 regression)", async () => {
+    mockStore.set("acp_switch", { cwd: "/tmp/ws", zcodeSid: "sess_switch", createdAt: 1 });
+    const server = new ZcodeAcpServer();
+    const { backend, calls } = residentBackend();
+    server.backend = backend;
+
+    const resp = await setConfigOptionHandler(
+      server,
+      {
+        sessionId: "acp_switch",
+        configId: "model",
+        value: "builtin:bigmodel-coding-plan\\GLM-5.3",
+      } as acp.SetSessionConfigOptionRequest,
+      stubCx,
+    );
+
+    // The reload ran BEFORE the switch — setModel saw a resident session.
+    const resumeIdx = calls.findIndex((c) => c.method === "session/resume");
+    const setModelIdx = calls.findIndex((c) => c.method === "session/setModel");
+    expect(resumeIdx).toBeGreaterThanOrEqual(0);
+    expect(setModelIdx).toBeGreaterThan(resumeIdx);
+    const model = resp.configOptions.find((o) => o.id === "model");
+    expect(model?.currentValue).toBe("builtin:bigmodel-coding-plan\\GLM-5.3");
+  });
+
+  it("session/load on a store-recovered record resumes exactly once and carries fresh mcpServers", async () => {
+    mockStore.set("acp_load", { cwd: "/tmp/ws", zcodeSid: "sess_load", createdAt: 1 });
+    const server = new ZcodeAcpServer();
+    const { backend, calls } = residentBackend();
+    server.backend = backend;
+
+    await loadSession(
+      server,
+      {
+        sessionId: "acp_load",
+        mcpServers: [{ name: "srv", command: "echo" }],
+      } as acp.LoadSessionRequest,
+      stubCx,
+    );
+
+    // The eviction guard is skipped on the load/resume path (their resume is
+    // the one that must carry the client's freshly declared mcpServers, #193)
+    // — so exactly ONE resume, with those servers on it.
+    const resumes = calls.filter((c) => c.method === "session/resume");
+    expect(resumes).toHaveLength(1);
+    expect(resumes[0]!.params).toMatchObject({
+      mcpServers: [{ name: "srv", command: "echo" }],
+    });
+  });
+
+  it("a store-recovered mapping whose backend session was deleted fails with the evicted error", async () => {
+    mockStore.set("acp_dead", { cwd: "/tmp/ws", zcodeSid: "sess_dead", createdAt: 1 });
+    const server = new ZcodeAcpServer();
+    const calls: Array<{ method: string; params: unknown }> = [];
+    const backend = {
+      isDead: false,
+      request: async (id: number, method: string, params: Record<string, unknown>) => {
+        calls.push({ method, params });
+        if (method === "session/resume") {
+          return { id, error: { code: -32004, message: `Session not found: ${params.sessionId}` } };
+        }
+        return { id, result: {} };
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    server.backend = backend;
+
+    await expect(ensureRealSession(server, "acp_dead")).rejects.toThrow("acp_dead");
+    // No overlay retry for a deleted session.
+    expect(calls.filter((c) => c.method === "session/resume")).toHaveLength(1);
   });
 });
