@@ -122,6 +122,20 @@ describe("provider id mapping", () => {
     );
   });
 
+  it("falls back to the id convention when the bundled table is absent (headless Linux)", () => {
+    // Point the resolver at a path that does not exist — a Linux runner (or
+    // any machine without the desktop app bundle) has no table to read.
+    const missing = path.join(root, "config", "provider", "missing.json");
+    process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE = missing;
+    builtinProviderEnv.mockReturnValue({ ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: missing });
+    expect(configProviderIdFor("account:bigmodel-individual-coding-plan")).toBe(
+      "builtin:bigmodel-coding-plan",
+    );
+    expect(configProviderIdFor("account:zai-team-coding-plan")).toBe("builtin:zai-coding-plan");
+    // Unknown account shapes still pass through unchanged.
+    expect(configProviderIdFor("account:mystery-plan")).toBe("account:mystery-plan");
+  });
+
   it("passes unknown / third-party ids through unchanged", () => {
     expect(accountProviderIdFor("3acc4047-9ddf-43bd-9ed3-a7745f5022ad")).toBe(
       "3acc4047-9ddf-43bd-9ed3-a7745f5022ad",

@@ -143,9 +143,17 @@ export function configProviderIdFor(providerId: string): string {
   );
   const family = rule?.config?.access?.accountType;
   const mode = rule?.config?.access?.mode;
-  if (!family || !mode) return providerId;
-  const plan = mode === "individual-coding-plan" ? "coding-plan" : mode;
-  return `builtin:${family}-${plan}`;
+  if (family && mode) {
+    const plan = mode === "individual-coding-plan" ? "coding-plan" : mode;
+    return `builtin:${family}-${plan}`;
+  }
+  // Table-absent fallback (headless Linux: no desktop app bundle to read).
+  // The account/config id spellings are a stable convention —
+  // `account:<family>-(individual-|team-|start-)?coding-plan` →
+  // `builtin:<family>-coding-plan` — so model-limit lookups keep working
+  // without the table. Unknown shapes pass through unchanged.
+  const m = /^account:([a-z0-9]+)-(?:(?:individual|team|start)-)?coding-plan$/.exec(providerId);
+  return m ? `builtin:${m[1]}-coding-plan` : providerId;
 }
 
 /**
