@@ -5,6 +5,14 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.3](https://github.com/william0wang/zcode-acp/compare/v0.43.2...v0.43.3) (2026-09-18)
+
+
+### Bug Fixes
+
+* report cache-exclusive inputTokens in turn usage for correct cache hit rate ([056574a](https://github.com/william0wang/zcode-acp/commit/056574a86bcb725da77e218de9d130218f765596))
+* resume deleted sessions honestly and reload store-recovered sessions before first use ([ddafa66](https://github.com/william0wang/zcode-acp/commit/ddafa6677a55fc126b4c3305f691c2ab8b3df643))
+
 ## [0.43.2](https://github.com/william0wang/zcode-acp/compare/v0.43.1...v0.43.2) (2026-09-18)
 
 
