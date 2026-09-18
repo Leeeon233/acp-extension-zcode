@@ -5,6 +5,13 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.43.0](https://github.com/william0wang/zcode-acp/compare/v0.42.5...v0.43.0) (2026-09-18)
+
+
+### Features
+
+* adopt backend session titles and extend the busy window for background notification turns ([2cc671e](https://github.com/william0wang/zcode-acp/commit/2cc671e2c06111537e119bafd263605c0ea75167))
+
 ## [0.42.5](https://github.com/william0wang/zcode-acp/compare/v0.42.4...v0.42.5) (2026-09-17)
 
 
