@@ -362,17 +362,20 @@ async function dispatchUsageDelta(
   acpSid: string,
   ev: Extract<InternalEvent, { kind: "UsageDelta" }>,
 ): Promise<void> {
-  // The backend often returns contextWindow=0; fill from the model's
-  // config.json limit.context so the editor can render the context bar.
-  let size = ev.size;
-  if (!size) {
-    // Resolve to the real backend session id — `acpSid` may be a lazy
-    // session/new placeholder that the backend rejects with "Session is not
-    // active", wasting a 5s request timeout on every usage_update.
-    const zcodeSid = server.resolveSid(acpSid) ?? acpSid;
-    const { providerId, modelId } = parseModelValue(await currentModelCached(server, zcodeSid));
-    size = modelContextWindow(providerId, modelId);
-  }
+  // `size` precedence: the user's explicit config.json `limit.context` for the
+  // session's model FIRST, the backend event's contextWindow as fallback. The
+  // CLI's projection seeds contextWindow with a hardcoded 200K default and
+  // account-provider models carry no registry metadata (our account snapshot
+  // pushes model ids only), so the event value can be a placeholder — while
+  // config.json is the explicit per-model truth, and it is already what the
+  // boot/switch-time emissions use. Config-first keeps the gauge from
+  // flip-flopping between the two values across a session.
+  // Resolve to the real backend session id — `acpSid` may be a lazy
+  // session/new placeholder that the backend rejects with "Session is not
+  // active", wasting a 5s request timeout on every usage_update.
+  const zcodeSid = server.resolveSid(acpSid) ?? acpSid;
+  const { providerId, modelId } = parseModelValue(await currentModelCached(server, zcodeSid));
+  const size = modelContextWindow(providerId, modelId) || ev.size;
   await sendSessionUpdate(cx, acpSid, {
     sessionUpdate: "usage_update",
     used: ev.used,
