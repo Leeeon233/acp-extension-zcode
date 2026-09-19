@@ -79,6 +79,8 @@ function makeServer(root: string): never {
     goalLoops: new Map(),
     modelCache: new Map(),
     lastCancelledAt: new Map(),
+    // stopBackendTurn consults this (compaction kill guard) — mirror the shape.
+    autoCompactInFlight: new Set<string>(),
     sessionAliases: (sid: string) => [sid],
     clients: { broadcast: () => ({ notify: async () => undefined }) },
     ensureBackend: () => ({ request }),

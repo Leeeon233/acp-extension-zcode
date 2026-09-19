@@ -443,21 +443,42 @@ export class ZcodeAcpServer {
       // never be escaped from within.
       env.ZCODE_ACP_SANDBOX_ACTIVE = "1";
     }
-    this.backend = new ZcodeBackend(argv, env);
+    const backend = new ZcodeBackend(argv, env);
+    this.backend = backend;
     // Answer the provider runtime-headers handshake the moment it ARRIVES:
     // the backend asks before every model request on a zhipu-account provider,
     // and outside a turn loop (compact's internal turn, session/goal set) the
     // queued request went unanswered until the backend's 180s cap killed the
     // generation ("Captcha verification request timed out" — auto-compact
-    // silently failed this way; see answerProviderRuntimeHeaders).
-    this.backend.providerRuntimeHeadersResponder = (id, params) =>
-      answerProviderRuntimeHeaders(
-        this.backend!,
-        id,
-        "interaction/requestProviderRuntimeHeaders",
-        params,
-      );
-    return this.backend;
+    // silently failed this way; see answerProviderRuntimeHeaders). The reply
+    // work (config reads, CLI resolution) is deferred off the shared reader
+    // loop; the backend waits seconds for this handshake, a tick is free.
+    // Captures the LOCAL instance: a respawned backend must never receive
+    // replies for a frame the dying one asked.
+    backend.providerRuntimeHeadersResponder = (id, params) => {
+      setImmediate(() => {
+        try {
+          answerProviderRuntimeHeaders(
+            backend,
+            id,
+            "interaction/requestProviderRuntimeHeaders",
+            params,
+          );
+        } catch (e) {
+          warn(
+            `provider runtime headers responder threw, declining: ` +
+              `${e instanceof Error ? e.message : String(e)}`,
+          );
+          try {
+            backend.sendReply(id, { headersApplied: false, errorMessage: "bridge error" });
+          } catch {
+            /* backend gone — nothing to answer */
+          }
+        }
+      });
+      return true;
+    };
+    return backend;
   }
 
   /**

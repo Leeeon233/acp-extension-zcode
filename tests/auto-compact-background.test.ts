@@ -18,7 +18,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeEvent } from "../src/backend/types.js";
-import { prompt } from "../src/handlers/session.js";
+import { cancel, prompt } from "../src/handlers/session.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
 vi.mock("../src/tasks-index.js", () => ({
@@ -212,10 +212,28 @@ describe("detached auto-compact", () => {
       { sessionId: "sess_ac", running: false }, // turn 2 completes
     ]);
     // Compaction settled and the flag cleared; turn 2's own threshold read
-    // (post-compaction usage) did not re-arm a second compaction.
-    await vi.waitFor(() => expect(server.autoCompactInFlight.has("zs_ac")).toBe(false));
+    // (post-compaction usage) did not re-arm a second compaction. The settle
+    // rides a 2s probe gap — same explicit timeout as test 1.
+    await vi.waitFor(() => expect(server.autoCompactInFlight.has("zs_ac")).toBe(false), {
+      timeout: 10_000,
+    });
     expect(counts.get("session/compact")).toBe(1);
     // The waiting notice fired exactly once across all send retries.
     expect(texts.filter((t) => t.includes("auto-compact in progress"))).toHaveLength(1);
   }, 20_000);
+
+  it("ESC on a prompt parked in the compaction wait does not fire the stop pair at the compaction", async () => {
+    const { backend, sentFrames } = makeBackend();
+    const server = setup(backend);
+    server.autoCompactInFlight.add("zs_ac");
+    // A follow-up prompt registered but never started (no turn.started yet —
+    // its send is still waiting out the compaction's lock).
+    const turn = { zcodeSid: "zs_ac", cancelled: false };
+    server.pendingTurns.set(999, turn as never);
+
+    await cancel(server, { sessionId: "sess_ac" } as acp.CancelNotification);
+
+    expect(turn.cancelled).toBe(true); // the prompt itself IS cancelled
+    expect(killFrames(sentFrames)).toEqual([]); // …but nothing was stopped
+  });
 });

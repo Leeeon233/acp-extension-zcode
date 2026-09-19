@@ -1824,8 +1824,13 @@ export async function runOneTurn(
     // no turn to preempt (the compaction is untouchable housekeeping), and a
     // prompt racing it waits on the busy-retry instead of killing it.
     if (autoCompactDue) {
-      const { runAutoCompactDetached } = await import("../config/auto-compact.js");
-      runAutoCompactDetached(server, cx, acpSid, zcodeSid);
+      try {
+        const { runAutoCompactDetached } = await import("../config/auto-compact.js");
+        runAutoCompactDetached(server, cx, acpSid, zcodeSid);
+      } catch (e) {
+        // Never let the arming failure mask the completed turn's result.
+        warn(`auto-compact arming failed: ${e instanceof Error ? e.message : String(e)}`);
+      }
     }
   }
 }
@@ -2225,6 +2230,19 @@ function stopBackendTurn(
   zcodeSid: string,
   foregroundExecutionId?: string,
 ): void {
+  // A turn with NO execution id never started a generation of its own; while
+  // our detached compaction runs, the only thing foreground on this session
+  // is the compaction's internal turn — an unguarded stop here (ESPECIALLY
+  // the v4 stop, which "targets whatever is currently foreground") would
+  // kill it. ESC on a prompt parked in the compaction wait is exactly how
+  // that happens; skip the whole stop pair for a turn that has nothing to
+  // stop.
+  if (!foregroundExecutionId && server.autoCompactInFlight.has(zcodeSid)) {
+    log(
+      `  [stop] turn never started and a detached compaction is running for ${zcodeSid} — skipping the stop pair`,
+    );
+    return;
+  }
   try {
     server.ensureBackend().send("session/stop", { sessionId: zcodeSid });
   } catch (e) {

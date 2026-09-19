@@ -62,6 +62,8 @@ function makeFixtures(turn: PendingTurn, escalateAfterMs = 0): DrainFixtures {
     // fetchMessagesSettled maintains this marker (cap-truncation guard) —
     // same mirroring rule as resumeInFlight above.
     hydrationUnsettled: new Set<string>(),
+    // stopBackendTurn consults this (compaction kill guard) — same rule.
+    autoCompactInFlight: new Set<string>(),
   } as unknown as ZcodeAcpServer;
   const pollOnce = vi.fn();
   const listener = { resubscribe: vi.fn(async () => true) };
