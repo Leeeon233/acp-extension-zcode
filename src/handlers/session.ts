@@ -844,14 +844,14 @@ async function replayResumeHistory(
   acpSid: string,
   zcodeSid: string,
 ): Promise<void> {
-  // Plain fetch (callers only invoke this after a resume flight settled the
-  // store — see resumePreservingModel) INSIDE the batch: the guard must be
-  // held across the session/messages RPC. Fetched outside, a prompt landing
-  // in that window dispatches live turn updates through the lock-free fast
-  // path (enqueueSessionSend) and the TUI renders the new turn ABOVE the
-  // history that arrives afterwards.
+  // Guarded fetch (a resume flight settles the store, but a capped flight
+  // leaves hydration running — fetchMessagesForReplay re-settles then) INSIDE
+  // the batch: the guard must be held across the session/messages RPC.
+  // Fetched outside, a prompt landing in that window dispatches live turn
+  // updates through the lock-free fast path (enqueueSessionSend) and the TUI
+  // renders the new turn ABOVE the history that arrives afterwards.
   await withReplayBatch(acpSid, async () => {
-    const messages = await fetchMessages(server, zcodeSid);
+    const messages = await fetchMessagesForReplay(server, zcodeSid);
     if (messages.length === 0) return;
     const slice = sliceTail(messages, MARTTY_RESUME_TAIL);
     await replayMessages(cx, acpSid, slice.batch, { toolTurnWindow: MARTTY_TOOL_TURN_WINDOW });
@@ -968,8 +968,9 @@ export async function resumeSession(
   // first: microtasks (the SDK's response send) drain before immediates.
   if (isMarttyClient(server)) {
     setImmediate(() => {
-      // Plain fetch, no settle: any resume flight already settled the store
-      // before this session/resume returned (the settle rides the flight).
+      // The replay's fetch is marker-guarded (see fetchMessagesForReplay): a
+      // resume flight settles the store before this session/resume returned,
+      // and a capped flight leaves the marker for the replay to re-settle.
       replayResumeHistory(server, cx, acpSid, zcodeSid).catch((e) => {
         warn(
           `session/resume: TUI history replay failed (non-fatal): ` +
@@ -1087,7 +1088,7 @@ export async function resumeIntoSession(
   // Fetch inside the batch (see replayResumeHistory): the guard must cover
   // the history RPC, or a concurrent prompt renders above the replay.
   await withReplayBatch(acpSid, async () => {
-    const history = settledHistory ?? (await fetchMessages(server, zcodeTarget));
+    const history = settledHistory ?? (await fetchMessagesForReplay(server, zcodeTarget));
     if (history.length > 0) server.markSessionActive(acpSid);
     const slice = fullSlice(history);
     await replayMessages(cx, acpSid, slice.batch, {
@@ -1222,7 +1223,8 @@ export async function loadSession(
   // Named `history` — a local `messages` would shadow the i18n `messages()`
   // helper (TDZ crash from a catch block). A resume flight's SETTLED snapshot
   // is the mid-hydration guard; only an already-live session (no flight) falls
-  // back to a plain read — its store is stable.
+  // back to a plain read — which fetchMessagesForReplay upgrades to a settle
+  // poll when the last flight capped out mid-hydration.
   let slice: ReplaySlice;
   if (opts.replayHistory === false) {
     // Boot-resume interception (session/new): the terminal TUI client does not
@@ -1230,7 +1232,7 @@ export async function loadSession(
     // and blocks on the response until the replay finishes — so skip the
     // dispatch. The differ baseline below still runs, so the next turn's
     // completion diff does not re-emit the historical messages.
-    const history = settledHistory ?? (await fetchMessages(server, zcodeSid));
+    const history = settledHistory ?? (await fetchMessagesForReplay(server, zcodeSid));
     // History on disk = real interaction (covers untitled sessions resumed from
     // a previous bridge lifetime) — make the session discoverable remotely.
     if (history.length > 0) server.markSessionActive(acpSid);
@@ -1243,7 +1245,7 @@ export async function loadSession(
     // a prompt landing while the history RPC is in flight must queue behind
     // the batch, not dispatch above the replayed history.
     slice = await withReplayBatch(acpSid, async () => {
-      const history = settledHistory ?? (await fetchMessages(server, zcodeSid));
+      const history = settledHistory ?? (await fetchMessagesForReplay(server, zcodeSid));
       if (history.length > 0) server.markSessionActive(acpSid);
       const batchSlice = limit === null ? fullSlice(history) : sliceTail(history, limit);
       await replayMessages(cx, acpSid, batchSlice.batch);
@@ -1443,7 +1445,9 @@ export async function runOneTurn(
   // Per-session ProjectionDiffer (persists across turns). The baseline mark_seen
   // prevents the differ from re-emitting history at turn completion.
   const differ = getOrCreateDiffer(server, zcodeSid);
-  const baselineMsgs = await fetchMessages(server, zcodeSid);
+  // Marker-guarded read: a prefix baseline during armed hydration would make
+  // the completion diff re-emit the messages hydration later appends.
+  const baselineMsgs = await fetchMessagesForReplay(server, zcodeSid);
   differ.markSeen(baselineMsgs);
 
   // Subscribe BEFORE send so we don't lose early turn.completed on short turns.
@@ -2741,7 +2745,7 @@ async function resumePreservingModel(
 /** Settle-poll gap after a fresh resume (see fetchMessagesSettled). */
 const RESUME_SETTLE_GAP_MS = 300;
 /** Cap for the settle poll — past this the largest snapshot seen wins. */
-const RESUME_SETTLE_CAP_MS = 2000;
+const RESUME_SETTLE_CAP_MS = 10000;
 /** Non-growing reads required to call the store settled (plateau guard). */
 const RESUME_SETTLE_STABLE_READS = 2;
 
@@ -2753,9 +2757,9 @@ const RESUME_SETTLE_STABLE_READS = 2;
  * is fine once hydration finished; big sessions hydrate slowly, hence
  * "often but not always"). Poll until the count has stopped growing for TWO
  * consecutive reads (a single equal pair can be a >gap plateau inside a slow
- * hydration), capped; on the cap the largest snapshot seen wins. Only fresh
- * resumes pay the extra round-trips — an already-live session's store is
- * stable.
+ * hydration), capped; on the cap the largest snapshot seen wins. A capped
+ * exit records the session in server.hydrationUnsettled so later replay
+ * reads re-settle (fetchMessagesForReplay); a stable exit clears it.
  */
 export async function fetchMessagesSettled(
   server: ZcodeAcpServer,
@@ -2769,13 +2773,41 @@ export async function fetchMessagesSettled(
     const next = await fetchMessages(server, zcodeSid);
     // Shrinking should not happen; never trade down either way.
     if (next.length <= messages.length) {
-      if (++stable >= RESUME_SETTLE_STABLE_READS) return messages;
+      // A failed read comes back EMPTY (fetchMessages swallows errors) — never
+      // let it vouch for stability while hydration may still be running.
+      const errored = next.length === 0 && messages.length > 0;
+      if (!errored && ++stable >= RESUME_SETTLE_STABLE_READS) {
+        server.hydrationUnsettled.delete(zcodeSid);
+        return messages;
+      }
     } else {
       stable = 0;
       messages = next;
     }
-    if (Date.now() >= deadline) return messages;
+    if (Date.now() >= deadline) {
+      server.hydrationUnsettled.add(zcodeSid);
+      warn(
+        `settle capped at ${RESUME_SETTLE_CAP_MS}ms for ${zcodeSid} still growing ` +
+          `(${messages.length} messages) — replaying the largest snapshot, ` +
+          `next load re-settles`,
+      );
+      return messages;
+    }
   }
+}
+
+/**
+ * History read for replay paths: plain unless the last settle for this
+ * session capped out mid-hydration — then re-settle first (the marker is
+ * maintained by fetchMessagesSettled). Stable sessions pay zero extra reads;
+ * a still-hydrating session gets the settle poll instead of a prefix.
+ */
+async function fetchMessagesForReplay(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+): Promise<ZcodeMessage[]> {
+  if (!server.hydrationUnsettled.has(zcodeSid)) return fetchMessages(server, zcodeSid);
+  return fetchMessagesSettled(server, zcodeSid);
 }
 
 /**

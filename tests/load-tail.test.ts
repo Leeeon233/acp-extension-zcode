@@ -469,6 +469,41 @@ describe("session/load_earlier", () => {
       loadEarlier(server, { sessionId: "sess_tail", limit: 2 } as never, cx),
     ).rejects.toThrow("before");
   });
+
+  it("marks every load_earlier update _meta.zcode.earlierPage; the load tail stays unmarked", async () => {
+    const server = new ZcodeAcpServer();
+    server.backend = fakeBackend(hist());
+    const { cx: loadCx, updates: loadUpdates } = collectCx();
+    const result = (await loadSession(
+      server,
+      loadParams({ _meta: { zcode: { limit: 2 } } }),
+      loadCx,
+    )) as { replayMeta: { cursor: string } };
+
+    // Tail replay (session/load) carries NO page marker — clients treat these
+    // as the normal attach transcript.
+    expect(loadUpdates.length).toBeGreaterThan(0);
+    for (const u of loadUpdates) {
+      expect(
+        (u as { _meta?: { zcode?: { earlierPage?: unknown } } })._meta?.zcode?.earlierPage,
+      ).toBeUndefined();
+    }
+
+    const { cx, updates } = collectCx();
+    await loadEarlier(
+      server,
+      { sessionId: "sess_tail", before: result.replayMeta.cursor, limit: 2 },
+      cx,
+    );
+    // Every paged update is marked so remote clients can route it into the
+    // older-page buffer instead of the live transcript.
+    expect(updates.length).toBeGreaterThan(0);
+    for (const u of updates) {
+      expect(
+        (u as { _meta?: { zcode?: { earlierPage?: unknown } } })._meta?.zcode?.earlierPage,
+      ).toBe(true);
+    }
+  });
 });
 
 describe("replayMeta.turnActive", () => {

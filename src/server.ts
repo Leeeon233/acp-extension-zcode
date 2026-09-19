@@ -144,6 +144,14 @@ export class ZcodeAcpServer {
    */
   readonly resumeInFlight = new Map<string, Promise<unknown>>();
   /**
+   * Backend session ids whose last settle poll hit RESUME_SETTLE_CAP_MS while
+   * hydration was still growing (see fetchMessagesSettled): a later plain
+   * session/messages read can still land mid-restore, so already-live load /
+   * resume paths re-settle before replaying (fetchMessagesForReplay). Cleared
+   * by any settle that reaches two stable reads.
+   */
+  readonly hydrationUnsettled = new Set<string>();
+  /**
    * Sandbox dynamic-allow state (ADR-0011): realpaths granted for this
    * bridge lifetime ("仅此一次" answers) — folded into the Seatbelt profile
    * on the next backend respawn in ensureBackend().

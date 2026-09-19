@@ -388,6 +388,14 @@ function collapseUserText(
  */
 export interface ReplayOptions {
   toolTurnWindow?: number;
+  /**
+   * Mark every update in this batch `_meta.zcode.earlierPage: true`. Set ONLY
+   * by load_earlier: a remote client collecting in-flight session/updates
+   * into an "older page" buffer cannot tell page replays from live-turn
+   * updates client-side, so the page rides a protocol-level marker (merged
+   * shallowly over any existing `_meta`); tail replays stay unmarked.
+   */
+  earlierPage?: boolean;
 }
 
 /**
@@ -417,6 +425,16 @@ export async function replayMessages(
   const lastTurn = starts.length - 1;
   const toolsKept = (i: number): boolean =>
     opts.toolTurnWindow === undefined || lastTurn - turnOf(i) < opts.toolTurnWindow;
+  // load_earlier pages are marked so clients can route them apart from
+  // live-turn updates (see ReplayOptions.earlierPage).
+  const markEarlierPage = (update: acp.SessionUpdate): acp.SessionUpdate => {
+    if (opts.earlierPage !== true) return update;
+    const meta = (update._meta ?? {}) as { zcode?: Record<string, unknown> };
+    return {
+      ...update,
+      _meta: { ...meta, zcode: { ...(meta.zcode ?? {}), earlierPage: true } },
+    };
+  };
   let replayed = 0;
   for (const [mi, m] of messages.entries()) {
     const info = m.info ?? {};
@@ -438,7 +456,7 @@ export async function replayMessages(
           if (collapse.kind === "tool-transcript" && !toolsKept(mi)) continue;
           await cx.notify("session/update", {
             sessionId: acpSid,
-            update: {
+            update: markEarlierPage({
               sessionUpdate: "tool_call",
               toolCallId: `histfold_${mid}`,
               title: collapse.title,
@@ -446,7 +464,7 @@ export async function replayMessages(
               status: "completed",
               content: [{ type: "content", content: { type: "text", text } }],
               _meta: collapsedMeta(collapse.kind),
-            },
+            }),
           });
         } else if (role === "user" && info.semantics?.transcriptVisibility === "hidden") {
           // Hidden harness plumbing that fits no collapse shape (plan-file
@@ -457,11 +475,11 @@ export async function replayMessages(
         } else {
           await cx.notify("session/update", {
             sessionId: acpSid,
-            update: {
+            update: markEarlierPage({
               sessionUpdate: role === "user" ? "user_message_chunk" : "agent_message_chunk",
               content: { type: "text", text },
               messageId: mid,
-            },
+            }),
           });
         }
       } else if (ptype === "reasoning") {
@@ -470,11 +488,11 @@ export async function replayMessages(
         if (text) {
           await cx.notify("session/update", {
             sessionId: acpSid,
-            update: {
+            update: markEarlierPage({
               sessionUpdate: "agent_thought_chunk",
               content: { type: "text", text },
               messageId: `thought_${mid}`,
-            },
+            }),
           });
         }
       } else if (ptype === "tool") {
@@ -508,7 +526,7 @@ export async function replayMessages(
         }
         await cx.notify("session/update", {
           sessionId: acpSid,
-          update: {
+          update: markEarlierPage({
             sessionUpdate: "tool_call",
             toolCallId: tp.id ?? `histtool_${randomUUID().slice(0, 8)}`,
             title: st.title ?? histToolName ?? i18nMessages().replayToolCallFallback,
@@ -516,7 +534,7 @@ export async function replayMessages(
             status: (st.status as acp.ToolCallStatus) ?? "completed",
             ...(content.length > 0 ? { content } : {}),
             ...(histToolName ? { _meta: { claudeCode: { toolName: histToolName } } } : {}),
-          },
+          }),
         });
       }
       // patch / step-start / other: skipped (history replay focuses on text + tool summary)
@@ -546,7 +564,9 @@ export async function loadEarlier(
 
   const messages = await fetchMessages(server, zcodeSid);
   const slice = sliceBefore(messages, params.before, params.limit ?? DEFAULT_EARLIER_LIMIT);
-  await withReplayBatch(acpSid, () => replayMessages(cx, acpSid, slice.batch));
+  await withReplayBatch(acpSid, () =>
+    replayMessages(cx, acpSid, slice.batch, { earlierPage: true }),
+  );
   log(`session/load_earlier: ${slice.meta.replayedMessages} messages before cursor`);
   return { replayMeta: slice.meta };
 }

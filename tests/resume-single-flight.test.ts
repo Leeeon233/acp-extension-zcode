@@ -17,7 +17,7 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeMessage } from "../src/backend/types.js";
@@ -222,5 +222,73 @@ describe("read-back settle (fetchMessagesSettled via loadSession)", () => {
     expect(counts.get("session/resume")).toBe(1);
     expect(chunks(cx2.updates)).toHaveLength(8);
     expect(server.resumeInFlight.size).toBe(0);
+  });
+});
+
+describe("cap-truncated settle + alreadyLive re-settle (hydration gap)", () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("a capped flight arms the unsettled marker; the next (alreadyLive) load re-settles and replays the FULL history", async () => {
+    // Hydration slower than the settle cap, then stable: the ladder grows on
+    // every read past the 10s cap, then flattens at 44 — the shape a long
+    // session shows on the App's cold-incubation first entry.
+    const ladder: ZcodeMessage[][] = [];
+    for (let n = 3; n <= 44; n++) ladder.push(hist(n));
+    ladder.push(hist(44), hist(44));
+    const { backend } = makeBackend({ messagesQueue: ladder });
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    const cx1 = collectCx();
+
+    const p1 = loadSession(server, loadParams(), cx1.cx);
+    await vi.advanceTimersByTimeAsync(10_600);
+    const r1 = await p1;
+
+    // Cap exit: the largest partial snapshot shipped AND the marker armed.
+    const total1 = (r1 as { replayMeta?: { totalMessages?: number } }).replayMeta?.totalMessages;
+    expect(total1).toBeGreaterThan(0);
+    expect(total1).toBeLessThan(44);
+    expect(server.hydrationUnsettled.has("sess_race")).toBe(true);
+
+    // Second client, alreadyLive (no resume flight): the plain read is
+    // marker-guarded — it re-settles through the remaining ladder and replays
+    // the COMPLETE history instead of another prefix.
+    const cx2 = collectCx();
+    const p2 = loadSession(server, loadParams(), cx2.cx);
+    await vi.advanceTimersByTimeAsync(4_000);
+    const r2 = await p2;
+
+    expect((r2 as { replayMeta?: { totalMessages?: number } }).replayMeta?.totalMessages).toBe(44);
+    expect(chunks(cx2.updates)).toHaveLength(44);
+    expect(server.hydrationUnsettled.size).toBe(0);
+  }, 15_000);
+
+  it("a stable session never arms the marker — alreadyLive loads do no settle poll", async () => {
+    const { backend, counts } = makeBackend({ messagesQueue: [hist(8)] });
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    const cx1 = collectCx();
+    const cx2 = collectCx();
+
+    const p1 = loadSession(server, loadParams(), cx1.cx);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await p1;
+    expect(server.hydrationUnsettled.size).toBe(0);
+    const readsAfterFirst = counts.get("session/messages") ?? 0;
+
+    // AlreadyLive + no marker: the replay does ONE plain read (+1 for
+    // buildSnapshot's differ baseline) and completes without a single timer
+    // tick — a settle poll would need two 300ms gaps and show up here as
+    // extra reads (or as a hang, with the 0ms advance above).
+    const p2 = loadSession(server, loadParams(), cx2.cx);
+    await vi.advanceTimersByTimeAsync(0);
+    await p2;
+    expect(counts.get("session/messages") ?? 0).toBe(readsAfterFirst + 2);
   });
 });
