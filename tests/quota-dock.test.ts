@@ -126,6 +126,13 @@ describe("formatGoDockSegment / composeQuotaDock", () => {
     expect(formatGoDockSegment(goSuccess(8))).toBe(`go 8% ${date}`);
   });
 
+  it("rounds raw micro-cents ratios to one decimal (console API precision)", () => {
+    const d = new Date(NOW + 2592000 * 1000);
+    const date = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    expect(formatGoDockSegment(goSuccess(13.156372333333334))).toBe(`go 13.2% ${date}`);
+    expect(formatGoDockSegment(goSuccess(84.25))).toBe(`go 84.3% ${date}`);
+  });
+
   it("null when Go fails or has no monthly window", () => {
     expect(formatGoDockSegment(goSuccess(null))).toBeNull();
     expect(formatGoDockSegment({ kind: "not_configured" })).toBeNull();

@@ -326,10 +326,14 @@ export function formatQuotaDock(result: QuotaResult): string | null {
  */
 export function formatGoDockSegment(go: GoQueryResult): string | null {
   if (go.kind !== "success" || !go.monthly) return null;
+  // The console API gives raw micro-cents ratios — round to one decimal like
+  // the oc segment (the legacy dashboard used to pre-round server-side).
+  const pct = roundTenth(Math.max(0, Math.min(100, go.monthly.usagePercent)));
+  const label = Number.isInteger(pct) ? String(pct) : pct.toFixed(1);
   const d = new Date(go.fetchedAt + go.monthly.resetInSec * 1000);
-  if (Number.isNaN(d.getTime())) return `go ${go.monthly.usagePercent}%`;
+  if (Number.isNaN(d.getTime())) return `go ${label}%`;
   const date = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-  return `go ${go.monthly.usagePercent}% ${date}`;
+  return `go ${label}% ${date}`;
 }
 
 /**

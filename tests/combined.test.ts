@@ -20,11 +20,10 @@ vi.mock("../src/backend/credentials.js", () => ({
 }));
 
 // Mock the Opencode Go HTTP client so the orchestration tests can feed a
-// deterministic finalUrl (undici's Response does not honour the init.url
-// option, so mocking at the client boundary is cleaner than fighting it).
+// deterministic (status, text) pair without touching the network.
 vi.mock("../src/quota/opencode-go/client.js", () => ({
-  fetchGoDashboard: vi.fn(),
-  dashboardUrl: (id: string) => `https://opencode.ai/workspace/${id}/go`,
+  fetchGoStatus: vi.fn(),
+  goStatusUrl: () => "https://opencode.ai/console/api/go/status",
 }));
 
 // Stub readConfigFile to return nothing — combined tests drive credentials via
@@ -55,7 +54,7 @@ vi.mock("../src/config/user-config.js", async () => {
 
 import { clearCache as clearGlmCache } from "../src/quota/cache.js";
 import { fetchOcUsage } from "../src/quota/ollama-cloud/client.js";
-import { fetchGoDashboard } from "../src/quota/opencode-go/client.js";
+import { fetchGoStatus } from "../src/quota/opencode-go/client.js";
 import {
   clearCache as clearGoCache,
   setClock as setGoClock,
@@ -74,7 +73,7 @@ import type { OcQueryResult } from "../src/quota/ollama-cloud/types.js";
 import type { GoQueryResult } from "../src/quota/opencode-go/types.js";
 import type { QuotaResult } from "../src/quota/types.js";
 
-const mockedGoFetch = vi.mocked(fetchGoDashboard);
+const mockedGoFetch = vi.mocked(fetchGoStatus);
 const mockedOcFetch = vi.mocked(fetchOcUsage);
 
 /** Default oc fixture: unconfigured → section silently dropped in all mode. */
@@ -330,12 +329,14 @@ describe("queryCombined orchestration", () => {
     setOcClock(undefined);
     delete process.env.OPENCODE_GO_WORKSPACE_ID;
     delete process.env.OPENCODE_GO_AUTH_COOKIE;
+    delete process.env.OPENCODE_GO_SESSION_TOKEN;
     delete process.env.OLLAMA_API_KEY;
   });
 
   it("queries both providers in parallel in all mode", async () => {
     process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
     process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**x";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_token";
     // GLM: a real success response via global fetch.
     glmFetchSpy.mockResolvedValue(
       new Response(
@@ -346,11 +347,26 @@ describe("queryCombined orchestration", () => {
         { status: 200 },
       ),
     );
-    // Go: mocked client returns a deterministic dashboard payload.
+    // Go: mocked client returns a deterministic status payload.
     mockedGoFetch.mockResolvedValue({
       status: 200,
-      text: "<script>rollingUsage:$R[2]={usagePercent:42,resetInSec:3600},weeklyUsage:$R[3]={usagePercent:17,resetInSec:604800}</script>",
-      finalUrl: "https://opencode.ai/workspace/wrk_abc/go",
+      text: JSON.stringify({
+        access: {
+          endsAt: "2026-10-03T02:03:01.000Z",
+          meters: {
+            fiveHour: {
+              resetsAt: null,
+              limitMicroCents: "1200000000",
+              usedMicroCents: "600000000",
+            },
+            week: {
+              resetsAt: "2026-09-21T04:00:00.000Z",
+              limitMicroCents: "3000000000",
+              usedMicroCents: "300000000",
+            },
+          },
+        },
+      }),
     });
 
     const combined = await queryCombined("all");
@@ -361,6 +377,7 @@ describe("queryCombined orchestration", () => {
   it("skips the Go fetch entirely in glm mode (no Go client call)", async () => {
     process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
     process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**x";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_token";
     glmFetchSpy.mockResolvedValue(
       new Response(JSON.stringify({ success: true, data: { limits: [] } }), { status: 200 }),
     );
@@ -371,10 +388,16 @@ describe("queryCombined orchestration", () => {
   it("skips the GLM fetch entirely in go mode", async () => {
     process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
     process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**x";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_token";
     mockedGoFetch.mockResolvedValue({
       status: 200,
-      text: "<script>rollingUsage:$R[2]={usagePercent:1,resetInSec:1}</script>",
-      finalUrl: "https://opencode.ai/workspace/wrk_abc/go",
+      text: JSON.stringify({
+        access: {
+          meters: {
+            fiveHour: { resetsAt: null, limitMicroCents: "1200000000", usedMicroCents: "1" },
+          },
+        },
+      }),
     });
     await queryCombined("go");
     expect(glmFetchSpy).not.toHaveBeenCalled();

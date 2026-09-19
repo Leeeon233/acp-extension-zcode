@@ -81,13 +81,14 @@ Providers:
 GLM credentials: read from ~/.zcode/v2/config.json (created by the ZCode app).
 Non-GLM credentials resolve per field, highest precedence first:
   1. ~/.config/zcode-acp/config.json "quota" section, e.g.
-     {"quota":{"ollamaApiKey":"…","opencodeGoWorkspaceId":"wrk_…","opencodeGoAuthCookie":"Fe26.2**…"}}
+     {"quota":{"ollamaApiKey":"…","opencodeGoWorkspaceId":"wrk_…","opencodeGoAuthCookie":"Fe26.2**…","opencodeGoSessionToken":"st_…"}}
   2. Environment variables (one-off overrides)
   3. ~/.pi/agent/opencode-go.json (legacy Pi-extension reuse, Opencode Go only)
-Opencode Go:
+Opencode Go (log in at https://opencode.ai/console first, then DevTools →
+Application → Cookies → opencode.ai):
   OPENCODE_GO_WORKSPACE_ID    e.g. wrk_abc123 (from the opencode.ai workspace URL)
   OPENCODE_GO_AUTH_COOKIE     the "auth" cookie value (starts with Fe26.2**)
-  Get the cookie via browser DevTools → Application → Cookies → opencode.ai.
+  OPENCODE_GO_SESSION_TOKEN   the "__Host-console_session" cookie value (st_…)
 Ollama Cloud:
   OLLAMA_API_KEY              an Ollama Cloud API key (cloud.ollama.ai → API keys)
 

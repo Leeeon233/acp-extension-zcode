@@ -57,6 +57,9 @@ export interface QuotaUserConfig {
   opencodeGoWorkspaceId?: string;
   /** Opencode Go `auth` cookie value (`Fe26.2**…`). */
   opencodeGoAuthCookie?: string;
+  /** Opencode Go `__Host-console_session` cookie value (`st_…`) — required
+   * since the 2026-09 console migration (the API 401s the auth cookie alone). */
+  opencodeGoSessionToken?: string;
 }
 
 export interface UserConfig {
@@ -118,6 +121,7 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
         ["ollamaApiKey", "ollamaApiKey"],
         ["opencodeGoWorkspaceId", "opencodeGoWorkspaceId"],
         ["opencodeGoAuthCookie", "opencodeGoAuthCookie"],
+        ["opencodeGoSessionToken", "opencodeGoSessionToken"],
       ] as const) {
         const v = quota[jsonKey];
         if (typeof v === "string" && v.trim()) q[prop] = v.trim();
