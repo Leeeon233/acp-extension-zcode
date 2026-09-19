@@ -152,6 +152,14 @@ export class ZcodeAcpServer {
    */
   readonly hydrationUnsettled = new Set<string>();
   /**
+   * Backend session ids with a DETACHED auto-compact in flight (see
+   * runAutoCompactDetached in config/auto-compact.ts). The turn that armed it
+   * has already returned — cancel/preempt must not touch the compaction, the
+   * drain gate must not escalate on it, and a concurrent prompt's busy-retry
+   * extends its budget to the compaction settle bound instead of failing.
+   */
+  readonly autoCompactInFlight = new Set<string>();
+  /**
    * Sandbox dynamic-allow state (ADR-0011): realpaths granted for this
    * bridge lifetime ("仅此一次" answers) — folded into the Seatbelt profile
    * on the next backend respawn in ensureBackend().

@@ -192,6 +192,20 @@ ZCode protocol types into ACP notifications directly — always translate.
   cancel — that made ESC feel dead for the whole remaining generation.
 - **`session/prompt` ordering**: subscribe to events BEFORE calling `session/send`
   — short turns can complete before a late subscribe catches them.
+- **Auto-compact runs DETACHED from the turn that armed it — do not re-couple
+  them**: `runOneTurn` arms it on end_turn; the `finally` starts it only AFTER
+  `pendingTurns` cleanup + `running:false` (`runAutoCompactDetached`). The old
+  blocking shape kept the FINISHED turn registered through the whole
+  compaction, so any cancel or follow-up prompt preempted it — stopBackendTurn
+  plus the drain gate's close escalation killed the compaction's internal AI
+  turn, `waitForTurnIdle` read the dead lock as "released", and the bridge
+  reported a FALSE "✓ compressed" while the context never shrank (observed
+  from the App 2026-09: compaction "failed" whenever the user stopped or
+  resent during the 🔄 window — the reply was done, the spinner wasn't, so
+  users ESC'd into the kill chain). Invariants that must stay: single-flight
+  per sid (`server.autoCompactInFlight`), drain gate exempt while it runs,
+  and the follow-up prompt's send-retry extends its busy budget to 330s with
+  a one-shot waiting notice (compact's own settle caps at 300s).
 - **Preempt lock**: concurrent prompts for the same session are serialized via
   `withPreemptLock`. Don't bypass it — two simultaneous turns corrupt the listener.
 - **The lazy-alias store (`~/.zcode/v2/acp-lazy-sessions.json`) is shared by

@@ -24,7 +24,11 @@ vi.mock("../src/handlers/extensions.js", () => ({
 }));
 
 // Import AFTER mocks are registered.
-import { autoCompactThreshold, maybeAutoCompact } from "../src/config/auto-compact.js";
+import {
+  autoCompactThreshold,
+  maybeAutoCompact,
+  runAutoCompactDetached,
+} from "../src/config/auto-compact.js";
 
 /** Mock AgentContext that records notify calls (sendTextChunk + emitInitialUsage). */
 function mockContext(notifySpy?: ReturnType<typeof vi.fn>): acp.AgentContext {
@@ -248,5 +252,31 @@ describe("maybeAutoCompact", () => {
     const notifySpy = vi.fn().mockResolvedValue(undefined);
     await maybeAutoCompact(server, mockContext(notifySpy), "acp_1", "zc_1");
     expect(chunkTexts(notifySpy)).toHaveLength(0);
+  });
+});
+
+describe("runAutoCompactDetached (single-flight)", () => {
+  it("swallows a second arm while one compaction runs, and clears the flag on settle", async () => {
+    process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD = "100000";
+    const { server, compactCalls } = makeServerWithProjection(150_000);
+    let release!: (v: unknown) => void;
+    const gate = new Promise((r) => (release = r));
+    compactCalls.mockReset();
+    compactCalls.mockReturnValue(gate.then(() => ({})));
+
+    // Two arms while the first still runs — one compaction, flag held.
+    runAutoCompactDetached(server, mockContext(), "acp_1", "zc_1");
+    runAutoCompactDetached(server, mockContext(), "acp_1", "zc_1");
+    await vi.waitFor(() => expect(compactCalls).toHaveBeenCalledTimes(1));
+    expect(server.autoCompactInFlight.has("zc_1")).toBe(true);
+
+    release({});
+    await vi.waitFor(() => expect(server.autoCompactInFlight.has("zc_1")).toBe(false));
+
+    // Flag cleared → a later arm runs again.
+    compactCalls.mockResolvedValue({});
+    runAutoCompactDetached(server, mockContext(), "acp_1", "zc_1");
+    await vi.waitFor(() => expect(compactCalls).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(server.autoCompactInFlight.has("zc_1")).toBe(false));
   });
 });

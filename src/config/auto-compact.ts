@@ -7,9 +7,14 @@
  * as the env fallback — 0/unset = disabled. The compaction target is decided
  * by the zcode backend — we only control *when* to trigger.
  *
- * Triggered from `prompt()` after a successful `end_turn`, before the response
- * returns. Failures are best-effort (logged, never thrown) so they never break
- * the prompt response.
+ * Armed by `prompt()` after a successful `end_turn`, but run DETACHED via
+ * runAutoCompactDetached once the turn's cleanup has landed (pendingTurns
+ * delete + running:false turnState): awaiting it inside the turn kept the
+ * FINISHED turn registered for the whole compaction, so any cancel or
+ * follow-up prompt preempted it — stopBackendTurn plus the drain gate's
+ * close escalation killed the compaction's internal AI turn, the dead lock
+ * read as "released", and the bridge reported a false "✓ compressed" while
+ * the context never shrank. Failures are best-effort (logged, never thrown).
  */
 
 import { randomUUID } from "node:crypto";
@@ -91,4 +96,26 @@ export async function maybeAutoCompact(
     );
     // Best-effort: never break the prompt response.
   }
+}
+
+/**
+ * Arm maybeAutoCompact as a session-level background task, single-flight per
+ * backend session id: an armed-but-still-running compaction swallows later
+ * arms (the running one covers them). MUST be called only after the arming
+ * turn's cleanup (pendingTurns delete + running:false) — runOneTurn's finally
+ * guarantees that ordering. Fire-and-forget; never rejects.
+ */
+export function runAutoCompactDetached(
+  server: ZcodeAcpServer,
+  cx: acp.AgentContext,
+  acpSid: string,
+  zcodeSid: string,
+): void {
+  if (server.autoCompactInFlight.has(zcodeSid)) return;
+  server.autoCompactInFlight.add(zcodeSid);
+  void maybeAutoCompact(server, cx, acpSid, zcodeSid)
+    .catch((e) => {
+      warn(`auto-compact: detached run failed (${e instanceof Error ? e.message : String(e)})`);
+    })
+    .finally(() => server.autoCompactInFlight.delete(zcodeSid));
 }

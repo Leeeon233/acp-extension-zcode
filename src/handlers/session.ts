@@ -1489,6 +1489,9 @@ export async function runOneTurn(
   // above. Kept as a binding only so the call fits the Promise-returning shape.
   void snapshot;
   backend.registerEventListener(zcodeSid, listener);
+  // Armed (not run) on a successful end_turn — the finally starts the detached
+  // compaction AFTER this turn's cleanup (see runAutoCompactDetached).
+  let autoCompactDue = false;
 
   try {
     // Transient turn failures (e.g. provider network blips surfaced as
@@ -1539,10 +1542,14 @@ export async function runOneTurn(
       const chunkMsgId = randomUUID();
 
       // Drain gate: a recent cancel/preempt means the backend side needs
-      // settling before the send — see drainBackendAfterCancel.
+      // settling before the send — see drainBackendAfterCancel. EXEMPT while a
+      // detached auto-compact runs: it legitimately holds the prompt lock, and
+      // the gate's close escalation would tear down the resident runtime and
+      // kill the compaction — the busy-retry below waits it out instead.
       const cancelledRecently =
         server.lastCancelledAt.get(zcodeSid) !== undefined &&
-        Date.now() - server.lastCancelledAt.get(zcodeSid)! < DRAIN_WINDOW_MS;
+        Date.now() - server.lastCancelledAt.get(zcodeSid)! < DRAIN_WINDOW_MS &&
+        !server.autoCompactInFlight.has(zcodeSid);
       if (cancelledRecently) {
         const drained = await drainBackendAfterCancel(server, {
           acpSid,
@@ -1575,6 +1582,10 @@ export async function runOneTurn(
           : { sessionId: zcodeSid, content: sendText };
       const sendT0 = Date.now();
       let sendAttempt = 0;
+      // One-shot "waiting for compaction" notice — a minutes-long busy window
+      // with no explanation reads as a hang (the very thing that made users
+      // ESC out of the old blocking auto-compact).
+      let compactWaitNotified = false;
       while (true) {
         if (turn.cancelled) {
           stopBackendTurn(server, zcodeSid, turn.foregroundExecutionId);
@@ -1630,8 +1641,21 @@ export async function runOneTurn(
         const notifySince = server.notifyTurnActiveSince.get(zcodeSid);
         const notifyActive =
           notifySince !== undefined && Date.now() - notifySince < NOTIFY_TURN_STALE_MS;
-        const busyBudget = notifyActive ? NOTIFY_TURN_BUSY_TIMEOUT_MS : SEND_RETRY_TIMEOUT_MS;
+        // A detached auto-compact is the same shape: a real model turn holding
+        // the lock for minutes. Extend the budget to its settle bound
+        // (waitForTurnIdle caps at 300s) and tell the user once.
+        const COMPACT_BUSY_TIMEOUT_MS = 330_000;
+        const compacting = server.autoCompactInFlight.has(zcodeSid);
+        const busyBudget = notifyActive
+          ? NOTIFY_TURN_BUSY_TIMEOUT_MS
+          : compacting
+            ? COMPACT_BUSY_TIMEOUT_MS
+            : SEND_RETRY_TIMEOUT_MS;
         const budget = isBusy ? busyBudget : WARMUP_RETRY_TIMEOUT_MS;
+        if (isBusy && compacting && !compactWaitNotified) {
+          compactWaitNotified = true;
+          await sendTextChunk(cx, acpSid, messages().autoCompactWaiting, randomUUID());
+        }
         if (Date.now() - sendT0 > budget) {
           throw new Error(
             `zcode send failed: ${isBusy ? "backend still busy" : "send keeps being rejected"} after ${Math.round(budget / 1000)}s (${sendResp.error.message ?? ""})`,
@@ -1673,21 +1697,21 @@ export async function runOneTurn(
         );
 
         // Auto-compact: if context usage exceeds the threshold, compact before
-        // returning so the next prompt has room. Configured via
+        // the NEXT prompt needs the room. Configured via
         // ZCODE_ACP_AUTO_COMPACT_THRESHOLD (absolute token count; 0/unset =
         // disabled). Only on end_turn — cancelled/max_turn_requests skips
         // compaction, as does a stall-recovered end_turn (the completion was
         // inferred by the stall heuristic, not confirmed by turn.completed —
         // compressing an in-flight task's would destroy the work).
-        // Best-effort: failures are logged inside maybeAutoCompact, never thrown.
-        if (
-          opts.autoCompact !== false &&
-          result.stopReason === "end_turn" &&
-          !turn.stallRecovered
-        ) {
-          const { maybeAutoCompact } = await import("../config/auto-compact.js");
-          await maybeAutoCompact(server, cx, acpSid, zcodeSid);
-        }
+        // ARMED here, RUN detached from the finally: awaiting it inside the
+        // turn kept the finished turn in pendingTurns for the whole
+        // compaction, so any cancel/follow-up preempt killed the compaction's
+        // internal turn (stop + drain close-escalation) while waitForTurnIdle
+        // still reported a false "✓ compressed". Detached, the response
+        // returns at once and the running indicator settles before the
+        // compaction too.
+        autoCompactDue =
+          opts.autoCompact !== false && result.stopReason === "end_turn" && !turn.stallRecovered;
 
         return result;
       } catch (e) {
@@ -1795,6 +1819,14 @@ export async function runOneTurn(
     // (preempt): the preempting turn's own running:true must survive.
     const stillBusy = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
     await emitTurnState(stillBusy);
+    // Start the armed auto-compact ONLY now, after deregistration and the
+    // running:false turnState: from here on a cancel or follow-up prompt finds
+    // no turn to preempt (the compaction is untouchable housekeeping), and a
+    // prompt racing it waits on the busy-retry instead of killing it.
+    if (autoCompactDue) {
+      const { runAutoCompactDetached } = await import("../config/auto-compact.js");
+      runAutoCompactDetached(server, cx, acpSid, zcodeSid);
+    }
   }
 }
 
