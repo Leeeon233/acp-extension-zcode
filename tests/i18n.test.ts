@@ -12,6 +12,10 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Fake settings-file content; null = file absent (ENOENT).
 let settingJson: string | null = null;
+// Fake user-config content (~/.config/zcode-acp/config.json), served only at
+// the fixed /fake-xdg XDG root the lang tests pass; null = absent.
+let userConfigJson: string | null = null;
+const FAKE_USER_CONFIG = path.join("/fake-xdg", "zcode-acp", "config.json");
 
 /** The settings path the bridge should consult for the CURRENT env — exact
  *  match, so a ZCODE_HOME test can serve content only at the overridden root
@@ -23,6 +27,9 @@ function expectedSettingsPath(): string {
 
 vi.mock("node:fs", () => ({
   readFileSync: (p: unknown) => {
+    if (userConfigJson !== null && String(p) === FAKE_USER_CONFIG) {
+      return userConfigJson;
+    }
     if (settingJson !== null && String(p) === expectedSettingsPath()) {
       return settingJson;
     }
@@ -37,6 +44,7 @@ async function freshModule() {
 
 beforeEach(() => {
   settingJson = null;
+  userConfigJson = null;
 });
 
 afterEach(() => {
@@ -54,6 +62,15 @@ describe("resolveLanguage", () => {
     settingJson = JSON.stringify({ locale: "zh-CN" });
     expect(resolveLanguage({ ZCODE_ACP_LANG: "en" })).toBe("en");
     expect(resolveLanguage({ ZCODE_ACP_LANG: "ZH_CN.UTF-8", LANG: "en_US" })).toBe("zh");
+  });
+
+  it("config-file lang wins over env, app locale, and POSIX", async () => {
+    const { resolveLanguage } = await freshModule();
+    userConfigJson = JSON.stringify({ lang: "zh" });
+    settingJson = JSON.stringify({ localePreference: "en-US" });
+    expect(
+      resolveLanguage({ XDG_CONFIG_HOME: "/fake-xdg", ZCODE_ACP_LANG: "en", LANG: "en_US" }),
+    ).toBe("zh");
   });
 
   it("inherits the app's localePreference, then locale", async () => {

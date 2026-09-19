@@ -21,6 +21,12 @@
  * reading them would treat the test worker as that TUI's bridge — signalling
  * the REAL window's process tree (observed live 2026-09-08: the run killed
  * its own host window). Tests that need them re-stub explicitly.
+ *
+ * XDG_CONFIG_HOME is DELETED for the same reason as HOME is redirected: the
+ * user config loader (~/.config/zcode-acp/config.json) prefers it, so a
+ * developer with it exported (Linux desktops, dotfile shells) would point
+ * the suite's file-config reads at their real config — e.g. a real
+ * `sandbox.enabled: true` would flip "sandbox stays off by default" tests.
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -31,6 +37,7 @@ import { afterAll } from "vitest";
 const home = mkdtempSync(path.join(tmpdir(), "zacp-test-home-"));
 process.env.HOME = home;
 delete process.env.ZCODE_HOME;
+delete process.env.XDG_CONFIG_HOME;
 delete process.env.ZCODE_ACP_REMOTE_ORIGIN;
 delete process.env.ZCODE_ACP_TUI_CLI_PID;
 

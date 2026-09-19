@@ -2,9 +2,10 @@
  * Auto-compact: when the session's context-window usage exceeds a threshold,
  * automatically invoke `session/compact` so the next prompt has room.
  *
- * Configured via `ZCODE_ACP_AUTO_COMPACT_THRESHOLD` (absolute token count;
- * 0/unset = disabled). The compaction target is decided by the zcode backend
- * — we only control *when* to trigger.
+ * The threshold lives in `autoCompact.threshold` (~/.config/zcode-acp/
+ * config.json; absolute token count) with `ZCODE_ACP_AUTO_COMPACT_THRESHOLD`
+ * as the env fallback — 0/unset = disabled. The compaction target is decided
+ * by the zcode backend — we only control *when* to trigger.
  *
  * Triggered from `prompt()` after a successful `end_turn`, before the response
  * returns. Failures are best-effort (logged, never thrown) so they never break
@@ -20,12 +21,10 @@ import { messages } from "../i18n.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { log, warn } from "../utils.js";
 import { sendTextChunk } from "../handlers/io.js";
+import { autoCompactThreshold } from "./settings.js";
 
-/** ENV: `ZCODE_ACP_AUTO_COMPACT_THRESHOLD` — absolute token count (0 = disabled). */
-export function autoCompactThreshold(): number {
-  const raw = Number(process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD ?? "0");
-  return Number.isFinite(raw) && raw > 0 ? raw : 0;
-}
+// Re-exported for existing importers (tests, docs); the merge lives in settings.ts.
+export { autoCompactThreshold };
 
 /**
  * If the threshold is configured and the session's current context usage meets

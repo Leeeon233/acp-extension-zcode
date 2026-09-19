@@ -40,6 +40,7 @@ import { emitConfigOptionUpdate } from "../config/options.js";
 import { formatMcpServers, loadMcpServers } from "../config/mcp-discovery.js";
 import { loadPluginCommands } from "../config/plugin-commands.js";
 import { loadSkillCommands } from "../config/skill-discovery.js";
+import { goalModeIsBackend } from "../config/settings.js";
 import { messages } from "../i18n.js";
 import { formatQuota, queryQuota } from "../quota/index.js";
 import { CONFIG_DISPATCH, SLASH_COMMANDS, warn } from "../utils.js";
@@ -281,9 +282,9 @@ export async function handleSlashCommand(
         // ACP clients never saw goal progress — only "goal set" plus untyped
         // leaked events the client renders as "Other" (issue #178). The loop
         // is validated against the real backend now, so /goal shares the
-        // /auto machinery. Escape hatch: ZCODE_ACP_GOAL_MODE=backend
-        // restores the legacy backend goal mode.
-        if (process.env.ZCODE_ACP_GOAL_MODE === "backend") {
+        // /auto machinery. Escape hatch: goal.mode "backend" (config file)
+        // or ZCODE_ACP_GOAL_MODE=backend restores the legacy backend goal mode.
+        if (goalModeIsBackend()) {
           if (!arg) throw new RequestError(-32602, messages().slashErrGoalArg);
           await goal(server, { sessionId: acpSid, action: "set", objective: arg });
           return ok(messages().slashGoalSet(arg));

@@ -46,6 +46,7 @@ import {
 } from "../interaction/adapter.js";
 import { codingPlanRequestAuthFor } from "../config/account-provider.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
+import { interactionTimeoutMs } from "../config/settings.js";
 import { messages } from "../i18n.js";
 import type { ClientLike } from "../remote/broadcast.js";
 import { clientConnectionRoot, log, warn } from "../utils.js";
@@ -905,20 +906,14 @@ async function askOnce(
  *   2. Connection close (`cx.signal` abort / `cx.closed` resolves) — the editor
  *      went away. This is the real crash signal and replaces the old timeout.
  *
- * An explicit timeout is kept as an opt-in escape hatch via the
+ * An explicit timeout is kept as an opt-in escape hatch via
+ * `interaction.timeoutMs` (~/.config/zcode-acp/config.json) or the
  * `ZCODE_ACP_INTERACTION_TIMEOUT_MS` env var (milliseconds; 0/unset = wait
- * forever). On any of these interrupts the caller replies `decline` to unlock
- * the backend AND flips `turn.cancelled` so the turn loop stops the backend
- * turn instead of auto-continuing.
+ * forever) — resolved once at bridge start. On any of these interrupts the
+ * caller replies `decline` to unlock the backend AND flips `turn.cancelled`
+ * so the turn loop stops the backend turn instead of auto-continuing.
  */
-const INTERACTION_TIMEOUT_MS = parseInteractionTimeout();
-
-function parseInteractionTimeout(): number {
-  const raw = process.env.ZCODE_ACP_INTERACTION_TIMEOUT_MS;
-  if (!raw) return 0; // 0 = wait indefinitely
-  const n = Number(raw);
-  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
-}
+const INTERACTION_TIMEOUT_MS = interactionTimeoutMs();
 
 /**
  * Marker returned when a wait was interrupted (connection close, env timeout,

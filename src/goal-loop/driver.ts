@@ -30,6 +30,7 @@ import { sendTextChunk } from "../handlers/io.js";
 import { messages } from "../i18n.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { log, warn } from "../utils.js";
+import { autoCompactThreshold, goalMaxTurns as settingsGoalMaxTurns } from "../config/settings.js";
 import {
   clearGoalState,
   type GoalLoopState,
@@ -52,14 +53,13 @@ import {
 
 /** ENV: ZCODE_ACP_GOAL_MAX_TURNS — hard round budget before a pause. */
 export function goalMaxTurns(): number {
-  const raw = Number(process.env.ZCODE_ACP_GOAL_MAX_TURNS ?? "0");
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 100;
+  return settingsGoalMaxTurns();
 }
 
-/** Goal-loop compaction threshold: the shared env var, else 80% of window. */
+/** Goal-loop compaction threshold: the shared threshold, else 80% of window. */
 export function goalCompactThreshold(contextWindow: number): number {
-  const raw = Number(process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD ?? "0");
-  if (Number.isFinite(raw) && raw > 0) return raw;
+  const raw = autoCompactThreshold();
+  if (raw > 0) return raw;
   return Math.floor(contextWindow * 0.8);
 }
 

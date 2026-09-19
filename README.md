@@ -122,7 +122,49 @@ most setups need no `ZCODE_BIN` at all — set it only for custom installs:
 > Get-ChildItem -Path $env:LOCALAPPDATA,$env:APPDATA,'C:\Program Files' -Recurse -Filter zcode.cjs -ErrorAction SilentlyContinue
 > ```
 
+## User config file
+
+All user preferences can be maintained in one place:
+`~/.config/zcode-acp/config.json` (or `$XDG_CONFIG_HOME/zcode-acp/config.json`).
+Per-field precedence is **config file > environment variable > built-in
+default** — every env var keeps working as a fallback, but the file is the
+recommended surface (GUI-launched editors and the hub daemon don't inherit
+your shell's env). Reads are live: an edit takes effect on the next use, no
+restart needed. The one exception is `interaction.timeoutMs`, resolved once
+at bridge start just like its env var.
+
+```jsonc
+{
+  "lang": "zh",                           // user-facing strings: "zh" | "en"
+  "debug": false,                         // verbose diagnostics (ZCODE_ACP_DEBUG=1)
+  "session": { "mode": "yolo" },          // initial mode: plan|build|edit|yolo|auto
+  "autoCompact": { "threshold": 240000 }, // compact once N tokens are used (unset = off)
+  "goal": {
+    "maxTurns": 100,                      // goal/auto loop round budget
+    "mode": "backend"                     // "backend" restores the legacy /goal routing
+  },
+  "interaction": { "timeoutMs": 0 },      // permission wait cap in ms (0 = wait forever)
+  "sandbox": { "enabled": false },        // global Seatbelt switch (per-project: sandbox.json)
+  "remote": { /* see Remote Access */ },
+  "quota": { /* quota card credentials */ }
+}
+```
+
+Invalid values are warned about on stderr and dropped — the env fallback
+applies — and the file is never rewritten by the bridge.
+
+Deliberately NOT file-configurable: per-process plumbing
+(`ZCODE_ACP_RESUME_SESSION`, `ZCODE_ACP_REMOTE_ORIGIN`,
+`ZCODE_ACP_REMOTE_PIN_CWD`, `ZCODE_ACP_TUI_CLI_PID`) and startup-time
+bootstrap variables (`ZCODE_BIN`, `ZCODE_NODE`, `ZCODE_HOME`,
+`ZCODE_PROVIDER`, `ZCODE_MODEL`, `ZCODE_BASE_URL`,
+`ZCODE_DISALLOWED_TOOLS`) — those carry per-run state or are resolved once
+before any config would be readable.
+
 ## Environment variables
+
+Every `ZCODE_ACP_*` preference variable in this table has a config-file
+field (see [User config file](#user-config-file)); the file value wins.
 
 | Variable                           | Default             | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
 | ---------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |

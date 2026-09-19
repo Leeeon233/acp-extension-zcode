@@ -8,6 +8,9 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { ZcodeAcpServer } from "../src/server.js";
@@ -43,17 +46,18 @@ interface FakeBackend {
 }
 
 /** Build a server with a fake backend that returns the given projection. */
-function makeServerWithProjection(
-  contextUsed: number | null,
-): { server: ZcodeAcpServer; backend: FakeBackend; compactCalls: typeof compactMock } {
+function makeServerWithProjection(contextUsed: number | null): {
+  server: ZcodeAcpServer;
+  backend: FakeBackend;
+  compactCalls: typeof compactMock;
+} {
   const backend: FakeBackend = {
     request: vi.fn(async (_id: number, method: string): Promise<ZcodeResponse> => {
       if (method === "session/read") {
         return {
           id: _id,
           result: {
-            projection:
-              contextUsed === null ? {} : { contextUsed, contextWindow: 200_000 },
+            projection: contextUsed === null ? {} : { contextUsed, contextWindow: 200_000 },
           },
         };
       }
@@ -151,13 +155,29 @@ describe("maybeAutoCompact", () => {
     expect(compactCalls).toHaveBeenCalledTimes(1);
   });
 
+  it("triggers compact when the threshold comes from the config file (no env var)", async () => {
+    delete process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD;
+    const cfgScratch = mkdtempSync(path.join(tmpdir(), "zacp-ac-cfg-"));
+    try {
+      mkdirSync(path.join(cfgScratch, "zcode-acp"), { recursive: true });
+      writeFileSync(
+        path.join(cfgScratch, "zcode-acp", "config.json"),
+        JSON.stringify({ autoCompact: { threshold: 100000 } }),
+      );
+      vi.stubEnv("XDG_CONFIG_HOME", cfgScratch);
+      const { server, compactCalls } = makeServerWithProjection(150_000);
+      await maybeAutoCompact(server, mockContext(), "acp_1", "zc_1");
+      expect(compactCalls).toHaveBeenCalledTimes(1);
+    } finally {
+      rmSync(cfgScratch, { recursive: true, force: true });
+    }
+  });
+
   it("does not throw when compact fails (best-effort)", async () => {
     process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD = "100000";
     const { server, compactCalls } = makeServerWithProjection(150_000);
     compactCalls.mockRejectedValueOnce(new Error("compact failed: backend error"));
-    await expect(
-      maybeAutoCompact(server, mockContext(), "acp_1", "zc_1"),
-    ).resolves.toBeUndefined();
+    await expect(maybeAutoCompact(server, mockContext(), "acp_1", "zc_1")).resolves.toBeUndefined();
     expect(compactCalls).toHaveBeenCalledTimes(1);
   });
 
@@ -174,9 +194,7 @@ describe("maybeAutoCompact", () => {
     compactMock.mockReset();
     compactMock.mockResolvedValue({});
 
-    await expect(
-      maybeAutoCompact(server, mockContext(), "acp_1", "zc_1"),
-    ).resolves.toBeUndefined();
+    await expect(maybeAutoCompact(server, mockContext(), "acp_1", "zc_1")).resolves.toBeUndefined();
     expect(compactMock).not.toHaveBeenCalled();
   });
 

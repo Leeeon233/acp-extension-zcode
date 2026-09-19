@@ -8,6 +8,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import { debugEnabled } from "./config/settings.js";
+
 /** ACP protocol version this server speaks. */
 export const PROTOCOL_VERSION = 1;
 
@@ -164,10 +166,11 @@ export const CONFIG_DISPATCH: Record<string, { method: string; paramKey: string 
  * Never use `console.log` — it would corrupt the stdout protocol stream.
  */
 
-/** True when the user opted into verbose diagnostics.
- *  Read at call time so tests can flip it without re-importing the module. */
+/** True when the user opted into verbose diagnostics (config file `debug` or
+ *  `ZCODE_ACP_DEBUG=1`). Read at call time so tests can flip it without
+ *  re-importing the module. */
 function isDebug(): boolean {
-  return process.env.ZCODE_ACP_DEBUG === "1";
+  return debugEnabled();
 }
 
 /** Verbose diagnostic log. Only emitted when `ZCODE_ACP_DEBUG=1`. */

@@ -46,6 +46,7 @@ import {
 } from "../quota/live.js";
 import { buildProviderRegistry } from "../config/provider-registry.js";
 import { pushAccountProviderConfig } from "../config/account-provider.js";
+import { initialSessionMode } from "../config/settings.js";
 import { applyModelSwitch, buildResumeRuntimeModel } from "../config/runtime-model.js";
 import { messages } from "../i18n.js";
 import {
@@ -599,9 +600,10 @@ export async function ensureRealSession(
     // clash behaviour is the backend's own and unasserted here.
     const createParams: Record<string, unknown> = {
       workspace: workspaceFor(pending.cwd),
-      // ZCODE_ACP_MODE picks the mode a new session starts in; the default
-      // stays "yolo" (unrestricted), which is what the bridge always used.
-      mode: process.env.ZCODE_ACP_MODE || "yolo",
+      // The initial mode comes from the user config (session.mode) or
+      // ZCODE_ACP_MODE; the default stays "yolo" (unrestricted), which is
+      // what the bridge always used.
+      mode: initialSessionMode(),
     };
     if (pending.mcpServers && pending.mcpServers.length > 0) {
       createParams.mcpServers = pending.mcpServers;

@@ -2,8 +2,9 @@
  * Bridge-emitted user-facing strings (editor popups, status/hint lines).
  *
  * Language selection, first match wins:
- *   1. ZCODE_ACP_LANG  — explicit override ("zh", "en"; prefixes like "zh_CN"
- *      accepted, case-insensitive)
+ *   1. Explicit override — `lang` in ~/.config/zcode-acp/config.json, else
+ *      ZCODE_ACP_LANG ("zh", "en"; prefixes like "zh_CN" accepted,
+ *      case-insensitive)
  *   2. The ZCode desktop app's language choice — `localePreference` (explicit
  *      user pick), falling back to `locale` (effective), in
  *      <zcode-home>/v2/setting.json (the ZCode data root — `~/.zcode`, or
@@ -20,6 +21,7 @@
 import { readFileSync } from "node:fs";
 import path from "node:path";
 
+import { languageOverride } from "./config/settings.js";
 import { zcodeHomeDir } from "./utils.js";
 
 export type Lang = "en" | "zh";
@@ -36,7 +38,7 @@ export function resolveLanguage(env: NodeJS.ProcessEnv = process.env): Lang {
     return undefined;
   };
   return (
-    pick(env.ZCODE_ACP_LANG) ??
+    languageOverride(env) ??
     pick(appLocale()) ??
     pick(env.LC_ALL) ??
     pick(env.LC_MESSAGES) ??

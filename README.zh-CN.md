@@ -97,7 +97,46 @@ ZCode CLI 内置于桌面应用中，默认不会加到 `PATH`。用 `ZCODE_BIN`
 > Get-ChildItem -Path $env:LOCALAPPDATA,$env:APPDATA,'C:\Program Files' -Recurse -Filter zcode.cjs -ErrorAction SilentlyContinue
 > ```
 
+## 用户配置文件
+
+所有用户偏好都可以统一维护在 `~/.config/zcode-acp/config.json`(或
+`$XDG_CONFIG_HOME/zcode-acp/config.json`)。逐字段优先级:**配置文件 >
+环境变量 > 内置默认值**——环境变量全部保留为回退,但推荐用文件配置
+(GUI 启动的编辑器和 hub 守护进程继承不到 shell 的环境变量)。读取是
+实时的:改完下一次使用即生效,无需重启。唯一例外是
+`interaction.timeoutMs`——与它的环境变量一样,在 bridge 启动时解析一次。
+
+```jsonc
+{
+  "lang": "zh",                           // 用户可见文案语言:"zh" | "en"
+  "debug": false,                         // 详细诊断日志(ZCODE_ACP_DEBUG=1)
+  "session": { "mode": "yolo" },          // 新会话初始 mode:plan|build|edit|yolo|auto
+  "autoCompact": { "threshold": 240000 }, // 上下文用到 N token 时自动压缩(不设 = 关闭)
+  "goal": {
+    "maxTurns": 100,                      // goal/auto 循环回合预算
+    "mode": "backend"                     // "backend" 恢复旧的后端 /goal 路由
+  },
+  "interaction": { "timeoutMs": 0 },      // 权限请求等待上限,毫秒(0 = 一直等)
+  "sandbox": { "enabled": false },        // 全局 Seatbelt 开关(项目级: sandbox.json)
+  "remote": { /* 见远程访问 */ },
+  "quota": { /* quota 卡片凭据 */ }
+}
+```
+
+非法值会在 stderr 警告一次并丢弃(环境变量回退生效),bridge 绝不改写
+该文件。
+
+刻意不进文件的是:进程态变量(`ZCODE_ACP_RESUME_SESSION`、
+`ZCODE_ACP_REMOTE_ORIGIN`、`ZCODE_ACP_REMOTE_PIN_CWD`、
+`ZCODE_ACP_TUI_CLI_PID`)和启动引导变量(`ZCODE_BIN`、`ZCODE_NODE`、
+`ZCODE_HOME`、`ZCODE_PROVIDER`、`ZCODE_MODEL`、`ZCODE_BASE_URL`、
+`ZCODE_DISALLOWED_TOOLS`)——前者承载单次运行状态,后者在任何配置可读
+之前就已解析。
+
 ## 环境变量
+
+下表中所有 `ZCODE_ACP_*` 偏好类变量都有对应的配置文件字段(见
+[用户配置文件](#用户配置文件)),文件值优先。
 
 | 变量                               | 默认值           | 用途                                                                                                                                                                                                                                                                                |
 | ---------------------------------- | ---------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
