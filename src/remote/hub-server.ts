@@ -193,6 +193,13 @@ interface InstanceEntry {
    * to any nonce-less registration for them.
    */
   nonce?: string;
+  /**
+   * The incubated TUI tree this serve bridge lives in (ZCODE_ACP_TUI_CLI_PID —
+   * the .command script's $$, exec'd into the CLI; ADR-0016). Absent on
+   * headless serve bridges and editor bridges. Instance shutdown uses it to
+   * tear the whole window tree down — the bridge alone is only the leaf.
+   */
+  tuiPid?: number;
   /** First failed ?probe=1 timestamp; a bridge alive enough to re-register clears it. */
   unhealthySince?: number;
 }
@@ -1808,12 +1815,14 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       req.on("close", () => upstream.destroy());
       return;
     }
-    // POST /api/instances/{id}/shutdown — terminate an APP-incubated bridge
-    // (ADR-0016/0017): remote "close session window". Only instances this
-    // hub (or a remote app via it) brought up may be killed — a serve-origin
-    // bridge or any incubation-nonce carrier. An editor-origin bridge
-    // without a nonce lives inside the user's editor; killing it would take
-    // the editor's agent connection down, so those are refused (403).
+    // POST /api/instances/{id}/shutdown — the remote "close the session
+    // window" gesture (ADR-0016/0017). For a TUI-incubated instance it tears
+    // the whole window tree down (see the tuiPid note below); for a headless
+    // serve bridge it kills just the bridge. Only instances this hub (or a
+    // remote app via it) brought up may be killed — a serve-origin bridge or
+    // any incubation-nonce carrier. An editor-origin bridge without a nonce
+    // lives inside the user's editor; killing it would take the editor's
+    // agent connection down, so those are refused (403).
     const shutdownMatch = url.pathname.match(/^\/api\/instances\/([^/]+)\/shutdown$/);
     if (shutdownMatch && req.method === "POST") {
       req.resume(); // no body — drain so the client connection closes cleanly
@@ -1833,25 +1842,57 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         res.end("instance was not incubated remotely (editor bridge) — refusing shutdown");
         return;
       }
-      // Degenerate pids from a malformed registration must never reach kill():
-      // pid 0 signals the hub's own process group and pid 1 the launchd root.
-      if (!Number.isInteger(entry.pid) || entry.pid <= 1 || entry.pid === process.pid) {
+      // TUI-incubated instance: the registered bridge is only the LEAF of the
+      // window's tree (cli → martty → bridge); killing it alone leaves the
+      // terminal window alive on a dead-agent error page (observed live
+      // 2026-09-19: shutdown 200'd, the window stayed). tuiPid — the
+      // incubation script's $$, exec'd into the CLI — names the whole tree:
+      // the group signal covers session-leader terminals (Terminal.app), the
+      // direct signals tear tab-hosted launches (Ghostty/Warp, where the
+      // group ESRCHs) via tui.ts's SIGTERM forward to martty. Mirrors
+      // terminateAfterFlush in session-close-endpoint.ts. Headless serve
+      // bridges (no tuiPid) keep the plain bridge kill — they have no tree.
+      const tuiPid =
+        entry.tuiPid !== undefined &&
+        Number.isInteger(entry.tuiPid) &&
+        entry.tuiPid > 1 &&
+        entry.tuiPid !== process.pid
+          ? entry.tuiPid
+          : undefined;
+      const directPids = [...(tuiPid !== undefined ? [tuiPid] : []), entry.pid].filter(
+        (pid, i, all) =>
+          Number.isInteger(pid) && pid > 1 && pid !== process.pid && all.indexOf(pid) === i,
+      );
+      if (tuiPid !== undefined) {
+        try {
+          process.kill(-tuiPid, "SIGTERM");
+          log(`hub: instance ${entry.id} shutdown — SIGTERM to TUI process group ${tuiPid}`);
+        } catch {
+          // Tab-hosted launch: the group ESRCHs — the direct pids below
+          // still tear the tree down.
+        }
+      }
+      if (directPids.length === 0) {
         res.writeHead(409, { "Content-Type": "text/plain" });
         res.end(`instance has no killable pid (${entry.pid})`);
         return;
       }
-      try {
-        process.kill(entry.pid, "SIGTERM");
-      } catch (e) {
-        // ESRCH = already gone; anything else is a real failure to report.
-        if ((e as NodeJS.ErrnoException).code !== "ESRCH") {
-          warn(
-            `hub: shutdown of instance ${entry.id} (pid ${entry.pid}) failed: ` +
-              `${e instanceof Error ? e.message : String(e)}`,
-          );
-          res.writeHead(500, { "Content-Type": "text/plain" });
-          res.end("kill failed");
-          return;
+      for (const pid of directPids) {
+        try {
+          process.kill(pid, "SIGTERM");
+          log(`hub: instance ${entry.id} (pid ${pid}) shut down from remote`);
+        } catch (e) {
+          // ESRCH = already gone (e.g. the tree died with an earlier signal);
+          // anything else is a real failure to report.
+          if ((e as NodeJS.ErrnoException).code !== "ESRCH") {
+            warn(
+              `hub: shutdown of instance ${entry.id} (pid ${pid}) failed: ` +
+                `${e instanceof Error ? e.message : String(e)}`,
+            );
+            res.writeHead(500, { "Content-Type": "text/plain" });
+            res.end("kill failed");
+            return;
+          }
         }
       }
       instances.delete(entry.id);
@@ -1956,6 +1997,9 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           // bridges. A re-registration (heartbeat) refreshes it — a bridge's
           // nonce never changes, so this is inert in practice.
           ...(typeof body.nonce === "string" && body.nonce ? { nonce: body.nonce } : {}),
+          ...(typeof body.tuiPid === "number" && Number.isInteger(body.tuiPid) && body.tuiPid > 1
+            ? { tuiPid: body.tuiPid }
+            : {}),
         });
       } else {
         instances.delete(id);

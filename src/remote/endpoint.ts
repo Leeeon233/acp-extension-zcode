@@ -283,6 +283,17 @@ export async function startRemoteEndpoint(
   let unexpectedStatus: number | null = null;
   let spawnThrottledUntil = 0;
 
+  // The incubated TUI tree this bridge belongs to (ZCODE_ACP_TUI_CLI_PID —
+  // the .command script's $$, exec'd into the CLI): lets the hub's instance
+  // shutdown tear the whole window down, not just this leaf bridge. Serve
+  // origin only — an editor bridge inheriting the var from a TUI-launched
+  // shell must never name another tree.
+  const tuiPidRaw = Number.parseInt((process.env.ZCODE_ACP_TUI_CLI_PID ?? "").trim(), 10);
+  const tuiPid =
+    config.origin === "serve" && Number.isInteger(tuiPidRaw) && tuiPidRaw > 1
+      ? tuiPidRaw
+      : undefined;
+
   const payload = (sessions: AdvertisedSession[]) => ({
     token: config.token,
     id: instanceId,
@@ -293,6 +304,7 @@ export async function startRemoteEndpoint(
     // "editor" (stdio bridge) or "serve" (headless, hub-spawned, ADR-0014):
     // lets the hub dedupe headless instances per workspace and label them.
     origin: config.origin,
+    ...(tuiPid !== undefined ? { tuiPid } : {}),
     // Hub-incubation correlation (ADR-0016/0017): the hub generates a nonce
     // per spawn and matches its registration poll against it — several
     // incubations can race for one workspace, and without this one's poll
