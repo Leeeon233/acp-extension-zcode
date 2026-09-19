@@ -177,9 +177,17 @@ ZCode protocol types into ACP notifications directly — always translate.
   switching started working; the switch looked fine, sends never ran). The
   bridge answers `headersApplied:true, requestAuth:{apiKey}` with the plan's
   config.json key for individual coding plans
-  (`codingPlanRequestAuthFor`, server-requests.ts) — the same key the
+  (`answerProviderRuntimeHeaders`, server-requests.ts) — the same key the
   pre-3.12 `builtin:` provider used; start-plan stays declined (Aliyun
-  captcha, #123). The backend's own "standalone" self-signing channel needs
+  captcha, #123). **The answer is wired at frame ARRIVAL**
+  (`ZcodeBackend.providerRuntimeHeadersResponder`, set in ensureBackend), not
+  just the turn-loop queue: a headers ask that lands while no turn loop is
+  polling — compact's internal turn above all — used to sit unanswered until
+  the backend's 180s cap killed the generation as "Captcha verification
+  request timed out" (observed 2026-09-19: auto-compact "succeeded" per the
+  bridge for weeks while never compacting; backend log `~/.zcode/cli/log/`
+  carries the truth, `querySource: "compact"`). The backend's own
+  "standalone" self-signing channel needs
   an identity credential pair in its ENCRYPTED store
   (`account-provider:…:account:<uid>:api-key` exists but the `…:identity`
   half was never written on the observed machine), so the bridge cannot rely
@@ -202,10 +210,14 @@ ZCode protocol types into ACP notifications directly — always translate.
   reported a FALSE "✓ compressed" while the context never shrank (observed
   from the App 2026-09: compaction "failed" whenever the user stopped or
   resent during the 🔄 window — the reply was done, the spinner wasn't, so
-  users ESC'd into the kill chain). Invariants that must stay: single-flight
-  per sid (`server.autoCompactInFlight`), drain gate exempt while it runs,
-  and the follow-up prompt's send-retry extends its busy budget to 330s with
-  a one-shot waiting notice (compact's own settle caps at 300s).
+  users ESC'd into the kill chain). The DEEPER cause of "compacts but nothing
+  shrinks" was the unanswered runtime-headers ask (see the 3.12 bullet above)
+  — 3.12+ `session/compact` submits `/compact` as a background prompt and
+  swallows its failure into an event the bridge never saw; both layers are
+  now fixed. Invariants that must stay: single-flight per sid
+  (`server.autoCompactInFlight`), drain gate exempt while it runs, and the
+  follow-up prompt's send-retry extends its busy budget to 330s with a
+  one-shot waiting notice (compact's own settle caps at 300s).
 - **Preempt lock**: concurrent prompts for the same session are serialized via
   `withPreemptLock`. Don't bypass it — two simultaneous turns corrupt the listener.
 - **The lazy-alias store (`~/.zcode/v2/acp-lazy-sessions.json`) is shared by

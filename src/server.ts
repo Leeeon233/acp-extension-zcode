@@ -20,6 +20,7 @@ import { armSandboxArgv, collectSandboxWorkspaces, sandboxActive } from "./backe
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend } from "./handlers/io.js";
 import { SandboxRestartBatcher, flushSandboxGrants } from "./handlers/sandbox-allow.js";
+import { answerProviderRuntimeHeaders } from "./handlers/server-requests.js";
 import { SessionTitleListener } from "./handlers/session-titles.js";
 import { ClientRegistry } from "./remote/broadcast.js";
 import { AGENT_INFO, clientConnectionRoot, PROTOCOL_VERSION, log, warn } from "./utils.js";
@@ -443,6 +444,19 @@ export class ZcodeAcpServer {
       env.ZCODE_ACP_SANDBOX_ACTIVE = "1";
     }
     this.backend = new ZcodeBackend(argv, env);
+    // Answer the provider runtime-headers handshake the moment it ARRIVES:
+    // the backend asks before every model request on a zhipu-account provider,
+    // and outside a turn loop (compact's internal turn, session/goal set) the
+    // queued request went unanswered until the backend's 180s cap killed the
+    // generation ("Captcha verification request timed out" — auto-compact
+    // silently failed this way; see answerProviderRuntimeHeaders).
+    this.backend.providerRuntimeHeadersResponder = (id, params) =>
+      answerProviderRuntimeHeaders(
+        this.backend!,
+        id,
+        "interaction/requestProviderRuntimeHeaders",
+        params,
+      );
     return this.backend;
   }
 

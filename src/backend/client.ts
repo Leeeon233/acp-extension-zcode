@@ -61,6 +61,17 @@ export class ZcodeBackend {
   private sendIdCounter = 1_000_000_000;
   /** Watchdog process that kills the zcode group if this bridge dies (SIGKILL). */
   private watchdog: ChildProcess | null = null;
+  /**
+   * Arrival-time responder for `interaction/requestProviderRuntimeHeaders`.
+   * The backend asks before EVERY model request on a zhipu-account provider,
+   * and a request that lands while no turn loop is polling the server-request
+   * queue (compact's internal turn, session/goal set, any backend-owned
+   * generation) dies at the backend's 180s cap as "Captcha verification
+   * request timed out" — auto-compact silently failed that way (observed
+   * 2026-09-19). Wired by ZcodeAcpServer.ensureBackend to the coding-plan key
+   * answer; returning false falls back to queueing (turn-loop handling).
+   */
+  providerRuntimeHeadersResponder?: (id: number, params: Record<string, unknown>) => boolean;
 
   constructor(argv: string[], env: NodeJS.ProcessEnv) {
     this.proc = spawn(argv[0]!, argv.slice(1), {
@@ -184,6 +195,12 @@ export class ZcodeBackend {
           memoryEnabled: false,
           askUserQuestionAutoResolutionEnabled: false,
         });
+      } else if (
+        method === "interaction/requestProviderRuntimeHeaders" &&
+        this.providerRuntimeHeadersResponder?.(id, (msg.params ?? {}) as Record<string, unknown>)
+      ) {
+        // Answered at arrival — see providerRuntimeHeadersResponder. This is
+        // what keeps compact's internal model turn alive outside any turn loop.
       } else {
         this.serverRequests.push({
           id,

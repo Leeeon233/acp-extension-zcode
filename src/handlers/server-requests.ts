@@ -360,48 +360,8 @@ async function handleOne(
   const perm = isPermissionRequest(method);
   const epm = isExitPlanMode(params);
 
-  // Start Plan providers (zcode-plan endpoints) ask their host to solve an
-  // Aliyun captcha and inject X-Aliyun-Captcha-Verify-* headers before every
-  // model request; the desktop renderer does this from a browser environment.
-  // The headless bridge has neither a browser nor the captcha credential, so
-  // the only honest answer is headersApplied:false — the backend then fails
-  // with its -32031 error carrying our message. Without this, the request
-  // fell through to the generic unsupported-request error and the backend
-  // fell back to client signing with the provider's OAuth JWT, dying with the
-  // misleading "must contain one separator" invalid-config error (#123).
   if (isProviderRuntimeHeadersRequest(method)) {
-    // Individual coding-plan models: serve the plan's API key straight from
-    // config.json (the same key the pre-3.12 builtin: provider used). The
-    // backend asks before EVERY model request on a zhipu-account provider —
-    // declining here turns into a -32031 retry loop on every GLM turn
-    // (observed 2026-09-17: switch stuck, every send died with "unknown").
-    const sel = (params as { modelSelection?: { providerId?: string }; providerId?: string })
-      .modelSelection?.providerId;
-    const requestAuth = codingPlanRequestAuthFor(
-      sel ?? (params as { providerId?: string }).providerId,
-    );
-    if (requestAuth) {
-      log("  provider runtime headers: serving the coding-plan API key (config.json)");
-      sendZcodeReply(backend, zcodeReqId, { headersApplied: true, requestAuth });
-      return;
-    }
-    // Start Plan providers (zcode-plan endpoints) ask their host to solve an
-    // Aliyun captcha and inject X-Aliyun-Captcha-Verify-* headers before every
-    // model request; the desktop renderer does this from a browser environment.
-    // The headless bridge has neither a browser nor the captcha credential, so
-    // the only honest answer is headersApplied:false — the backend then fails
-    // with its -32031 error carrying our message. Without this, the request
-    // fell through to the generic unsupported-request error and the backend
-    // fell back to client signing with the provider's OAuth JWT, dying with the
-    // misleading "must contain one separator" invalid-config error (#123).
-    warn(
-      "  ⚠ provider runtime headers requested (Start Plan captcha session); " +
-        "the headless bridge cannot provide it — declining",
-    );
-    sendZcodeReply(backend, zcodeReqId, {
-      headersApplied: false,
-      errorMessage: PROVIDER_RUNTIME_HEADERS_UNAVAILABLE,
-    });
+    answerProviderRuntimeHeaders(backend, zcodeReqId, method, params as Record<string, unknown>);
     return;
   }
 
@@ -1176,6 +1136,61 @@ function isUserInputRequestUnchecked(method: string): boolean {
 /** @see handleOne — the Start Plan captcha-session request (issue #123). */
 function isProviderRuntimeHeadersRequest(method: string): boolean {
   return method === "interaction/requestProviderRuntimeHeaders";
+}
+
+/**
+ * Answer an `interaction/requestProviderRuntimeHeaders` request; returns false
+ * when `method` is not that request (caller keeps its own handling).
+ *
+ * Shared by the turn-loop queue path (handleOne) and the ARRIVAL-TIME
+ * responder wired onto the backend (ZcodeBackend.providerRuntimeHeadersResponder):
+ * the backend asks before EVERY model request on a zhipu-account provider, and
+ * a request that lands while no turn loop is polling the queue — compact's
+ * internal turn, session/goal set, any backend-owned generation — timed out at
+ * the backend's 180s cap as "Captcha verification request timed out" and the
+ * compaction silently failed while the bridge still reported "✓ compressed"
+ * (observed 2026-09-19, backend log `querySource: "compact"`).
+ */
+export function answerProviderRuntimeHeaders(
+  backend: ZcodeBackend,
+  reqId: number | string,
+  method: string,
+  params: Record<string, unknown>,
+): boolean {
+  if (!isProviderRuntimeHeadersRequest(method)) return false;
+  // Individual coding-plan models: serve the plan's API key straight from
+  // config.json (the same key the pre-3.12 builtin: provider used). The
+  // backend asks before EVERY model request on a zhipu-account provider —
+  // declining here turns into a -32031 retry loop on every GLM turn
+  // (observed 2026-09-17: switch stuck, every send died with "unknown").
+  const sel = (params as { modelSelection?: { providerId?: string }; providerId?: string })
+    .modelSelection?.providerId;
+  const requestAuth = codingPlanRequestAuthFor(
+    sel ?? (params as { providerId?: string }).providerId,
+  );
+  if (requestAuth) {
+    log("  provider runtime headers: serving the coding-plan API key (config.json)");
+    sendZcodeReply(backend, reqId, { headersApplied: true, requestAuth });
+    return true;
+  }
+  // Start Plan providers (zcode-plan endpoints) ask their host to solve an
+  // Aliyun captcha and inject X-Aliyun-Captcha-Verify-* headers before every
+  // model request; the desktop renderer does this from a browser environment.
+  // The headless bridge has neither a browser nor the captcha credential, so
+  // the only honest answer is headersApplied:false — the backend then fails
+  // with its -32031 error carrying our message. Without this, the request
+  // fell through to the generic unsupported-request error and the backend
+  // fell back to client signing with the provider's OAuth JWT, dying with the
+  // misleading "must contain one separator" invalid-config error (#123).
+  warn(
+    "  ⚠ provider runtime headers requested (Start Plan captcha session); " +
+      "the headless bridge cannot provide it — declining",
+  );
+  sendZcodeReply(backend, reqId, {
+    headersApplied: false,
+    errorMessage: PROVIDER_RUNTIME_HEADERS_UNAVAILABLE,
+  });
+  return true;
 }
 
 /**
