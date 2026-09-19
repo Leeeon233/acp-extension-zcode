@@ -790,19 +790,19 @@ describe("hub instance shutdown", () => {
     );
     await registerInstance(hub, bridge.pid!, { origin: "serve", tuiPid: cli.pid });
 
+    // Attach the exit listeners BEFORE the kill: 'exit' fires once and is not
+    // replayed for late listeners — on Linux the dummies die within
+    // milliseconds of the shutdown response, and attaching after an intervening
+    // await loses the event entirely (observed on CI: signalCode set, listener
+    // never called, /proc entry gone).
+    const cliExited = new Promise<void>((resolve) => cli.once("exit", () => resolve()));
+    const bridgeExited = new Promise<void>((resolve) => bridge.once("exit", () => resolve()));
+
     const res = await shutdown(hub);
     expect(res.status).toBe(200);
 
-    await withTimeout(
-      new Promise<void>((resolve) => cli.once("exit", () => resolve())),
-      5000,
-      "tui cli exit",
-    );
-    await withTimeout(
-      new Promise<void>((resolve) => bridge.once("exit", () => resolve())),
-      5000,
-      "bridge exit",
-    );
+    await withTimeout(cliExited, 5000, "tui cli exit");
+    await withTimeout(bridgeExited, 5000, "bridge exit");
     const list = await (await listInstances(hub)).json();
     expect(list).toHaveLength(0);
   }, 15_000);
