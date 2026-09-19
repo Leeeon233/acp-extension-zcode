@@ -41,6 +41,13 @@ export interface PendingTurn {
   /** Set once session/stop has been fired for this turn, to avoid re-sending. */
   stopSent?: boolean;
   /**
+   * True once the backend ACCEPTED this turn's session/send — the turn may
+   * own a running generation from that moment (its turn.started can lag or,
+   * on a deaf stream, never arrive). stopBackendTurn's compaction guard only
+   * spares turns whose send was NEVER accepted: those own nothing.
+   */
+  sendAccepted?: boolean;
+  /**
    * Foreground execution id from the backend's `turn.started` payload. The
    * v4/command stop targets it — session/stop alone is ignored by the Aug-28
    * app-server (its abort controller is never registered; see AGENTS.md).

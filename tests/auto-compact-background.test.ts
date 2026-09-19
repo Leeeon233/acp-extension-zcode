@@ -236,4 +236,21 @@ describe("detached auto-compact", () => {
     expect(turn.cancelled).toBe(true); // the prompt itself IS cancelled
     expect(killFrames(sentFrames)).toEqual([]); // …but nothing was stopped
   });
+
+  it("ESC on an ACCEPTED turn without an execution id still fires the stop pair (no unstoppable generation)", async () => {
+    const { backend, sentFrames } = makeBackend();
+    const server = setup(backend);
+    server.autoCompactInFlight.add("zs_ac");
+    // The backend accepted the send but turn.started (and its execution id)
+    // never arrived — a deaf stream. This turn may own a RUNNING generation:
+    // the compaction guard must not spare it, or ESC leaves the model
+    // unstoppable for up to the compaction's whole settle window.
+    const turn = { zcodeSid: "zs_ac", cancelled: false, sendAccepted: true };
+    server.pendingTurns.set(998, turn as never);
+
+    await cancel(server, { sessionId: "sess_ac" } as acp.CancelNotification);
+
+    expect(turn.cancelled).toBe(true);
+    expect(sentFrames.map((f) => f.method)).toEqual(["session/stop", "v4/command"]);
+  });
 });

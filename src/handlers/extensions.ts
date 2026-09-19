@@ -328,6 +328,14 @@ export async function waitForTurnIdle(
       continue;
     }
     if (resp.error) {
+      // A dead reader is NOT a release — the internal turn died with the
+      // backend, and reading it as "released" reported a false "✓ compressed"
+      // on backend loss (sandbox allow-restart, crash). Fail honestly; the
+      // next end_turn re-arms the compaction on the respawned backend.
+      if (errMsg.includes("backend reader exited")) {
+        log(`  [probe] #${probeCount} @${elapsed}s: backend reader DEAD → not released`);
+        return false;
+      }
       if (lockSeen) {
         log(
           `  [probe] #${probeCount} @${elapsed}s: NON-LOCK error after lock → released (err="${errMsg.slice(0, 50)}")`,

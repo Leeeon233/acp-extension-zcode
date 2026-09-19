@@ -1520,7 +1520,7 @@ export async function runOneTurn(
         // reconcile the differ baseline so the retried turn's new messages
         // aren't treated as already-seen, surface a retry hint, then back off.
         if (turn.cancelled) {
-          stopBackendTurn(server, zcodeSid, turn.foregroundExecutionId);
+          stopBackendTurn(server, zcodeSid, turn);
           return { stopReason: "cancelled" };
         }
         differ.markSeen(await fetchMessages(server, zcodeSid));
@@ -1588,7 +1588,7 @@ export async function runOneTurn(
       let compactWaitNotified = false;
       while (true) {
         if (turn.cancelled) {
-          stopBackendTurn(server, zcodeSid, turn.foregroundExecutionId);
+          stopBackendTurn(server, zcodeSid, turn);
           return { stopReason: "cancelled" };
         }
         sendAttempt++;
@@ -1603,14 +1603,19 @@ export async function runOneTurn(
         if (expectBusy) {
           await sleep(SEND_RETRY_INTERVAL_MS);
           if (turn.cancelled) {
-            stopBackendTurn(server, zcodeSid, turn.foregroundExecutionId);
+            stopBackendTurn(server, zcodeSid, turn);
             return { stopReason: "cancelled" };
           }
         }
         const sendResp = await backend.request(server.nextId(), "session/send", sendParams, 15000);
         if (!sendResp.error) {
           const accepted = (sendResp.result ?? {}) as { accepted?: boolean };
-          if (accepted.accepted) break; // backend took it → turn starts
+          if (accepted.accepted) {
+            // From this moment the turn may own a running generation —
+            // stopBackendTurn's compaction guard no longer spares it.
+            turn.sendAccepted = true;
+            break; // backend took it → turn starts
+          }
           throw new Error("zcode send not accepted");
         }
         const sendErrCode = sendResp.error.code;
@@ -1642,15 +1647,18 @@ export async function runOneTurn(
         const notifyActive =
           notifySince !== undefined && Date.now() - notifySince < NOTIFY_TURN_STALE_MS;
         // A detached auto-compact is the same shape: a real model turn holding
-        // the lock for minutes. Extend the budget to its settle bound
-        // (waitForTurnIdle caps at 300s) and tell the user once.
-        const COMPACT_BUSY_TIMEOUT_MS = 330_000;
+        // the lock for minutes. Extend the budget past its full worst case
+        // (settle cap 300s + startup + probe gaps) and tell the user once.
+        // Both flags can be true at once (a background notify turn AND a
+        // compaction queued behind it) — take the LARGER budget, never the
+        // smaller: the smaller fails the user's prompt mid-wait.
+        const COMPACT_BUSY_TIMEOUT_MS = 360_000;
         const compacting = server.autoCompactInFlight.has(zcodeSid);
-        const busyBudget = notifyActive
-          ? NOTIFY_TURN_BUSY_TIMEOUT_MS
-          : compacting
-            ? COMPACT_BUSY_TIMEOUT_MS
-            : SEND_RETRY_TIMEOUT_MS;
+        const busyBudget = Math.max(
+          notifyActive ? NOTIFY_TURN_BUSY_TIMEOUT_MS : 0,
+          compacting ? COMPACT_BUSY_TIMEOUT_MS : 0,
+          SEND_RETRY_TIMEOUT_MS,
+        );
         const budget = isBusy ? busyBudget : WARMUP_RETRY_TIMEOUT_MS;
         if (isBusy && compacting && !compactWaitNotified) {
           compactWaitNotified = true;
@@ -2103,7 +2111,7 @@ export async function cancel(
       matched = true;
       turn.cancelled = true;
       if (!turn.stopSent) {
-        stopBackendTurn(server, zcodeSid, turn.foregroundExecutionId);
+        stopBackendTurn(server, zcodeSid, turn);
         turn.stopSent = true;
       }
       // Record cancel time so a prompt arriving in the backend's ~20s
@@ -2225,19 +2233,17 @@ export function isBackendLostRequestError(e: unknown): boolean {
  * backend's prompt lock releases when ITS finalisation completes — that,
  * not any bridge-side signal, is what the next prompt's send-retry waits on.
  */
-function stopBackendTurn(
-  server: ZcodeAcpServer,
-  zcodeSid: string,
-  foregroundExecutionId?: string,
-): void {
-  // A turn with NO execution id never started a generation of its own; while
+function stopBackendTurn(server: ZcodeAcpServer, zcodeSid: string, turn: PendingTurn): void {
+  const foregroundExecutionId = turn.foregroundExecutionId;
+  // A turn whose send was NEVER accepted owns no generation of its own; while
   // our detached compaction runs, the only thing foreground on this session
   // is the compaction's internal turn — an unguarded stop here (ESPECIALLY
   // the v4 stop, which "targets whatever is currently foreground") would
   // kill it. ESC on a prompt parked in the compaction wait is exactly how
-  // that happens; skip the whole stop pair for a turn that has nothing to
-  // stop.
-  if (!foregroundExecutionId && server.autoCompactInFlight.has(zcodeSid)) {
+  // that happens. Once the send WAS accepted the turn may own a generation
+  // (turn.started — and with it the execution id — can lag, or never arrive
+  // on a deaf stream), so the stop pair always fires for accepted turns.
+  if (!foregroundExecutionId && !turn.sendAccepted && server.autoCompactInFlight.has(zcodeSid)) {
     log(
       `  [stop] turn never started and a detached compaction is running for ${zcodeSid} — skipping the stop pair`,
     );
@@ -2356,7 +2362,7 @@ export async function drainBackendAfterCancel(
   let escalated = false;
   while (Date.now() - drainT0 < DRAIN_TIMEOUT_MS) {
     if (turn.cancelled) {
-      stopBackendTurn(server, zcodeSid, turn.foregroundExecutionId);
+      stopBackendTurn(server, zcodeSid, turn);
       return "cancelled";
     }
     const proj = await monitor.pollOnce();
@@ -2471,7 +2477,7 @@ export function preemptInFlightTurn(
     if (turn.goalLoop) continue;
     turn.cancelled = true; // signal the old turn to stop its retry loops
     if (!turn.stopSent) {
-      stopBackendTurn(server, zcodeSid, turn.foregroundExecutionId);
+      stopBackendTurn(server, zcodeSid, turn);
       turn.stopSent = true;
     }
     // Record cancel time so the prompt()'s send-retry can use the recovery
@@ -3142,7 +3148,7 @@ export async function runEventTurn(
       } else if (turn.cancelled) {
         // Preserve the pre-existing bounded cancel behaviour. A stuck prompt
         // lock after stop must not keep a user-cancelled turn alive forever.
-        stopBackendTurn(server, turn.zcodeSid, turn.foregroundExecutionId);
+        stopBackendTurn(server, turn.zcodeSid, turn);
         return turnResult(translator, "max_turn_requests");
       } else {
         const frozenMs = Date.now() - lastWatermarkAdvanceAt;
@@ -3191,7 +3197,7 @@ export async function runEventTurn(
           log(
             `  [stall] watermark frozen ${Math.round(frozenMs / 1000)}s with no output; stopping backend turn`,
           );
-          stopBackendTurn(server, turn.zcodeSid, turn.foregroundExecutionId);
+          stopBackendTurn(server, turn.zcodeSid, turn);
           return turnResult(translator, "max_turn_requests");
         }
       }
@@ -3225,7 +3231,7 @@ export async function runEventTurn(
       // to no turn listener, and the next turn's turn-attribution gate
       // discards any residue that slipped into the queue meanwhile.
       if (!turn.stopSent) {
-        stopBackendTurn(server, turn.zcodeSid, turn.foregroundExecutionId);
+        stopBackendTurn(server, turn.zcodeSid, turn);
         turn.stopSent = true;
       }
       return turnResult(translator, "cancelled");
@@ -3304,7 +3310,7 @@ export async function runEventTurn(
                 await sendTextChunk(cx, acpSid, reply.text, chunkMsgId);
               } else if (!emittedOutput) {
                 // No text and no output → suspected failure.
-                stopBackendTurn(server, turn.zcodeSid, turn.foregroundExecutionId);
+                stopBackendTurn(server, turn.zcodeSid, turn);
                 throw new RequestError(-32603, "turn produced no output");
               }
             }
@@ -3510,7 +3516,7 @@ export async function runEventTurn(
       }
       if (translator.turnFailed) {
         // Best-effort stop in case the failed turn left a residual lock.
-        stopBackendTurn(server, turn.zcodeSid, turn.foregroundExecutionId);
+        stopBackendTurn(server, turn.zcodeSid, turn);
         // Throw a TurnFailedError carrying the structured error so the caller
         // (prompt's retry loop) can classify transient vs fatal. The error
         // message is formatted for display when it ultimately reaches the user.
