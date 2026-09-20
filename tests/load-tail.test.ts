@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeMessage } from "../src/backend/types.js";
 import { loadSession } from "../src/handlers/session.js";
-import { loadEarlier } from "../src/handlers/replay.js";
+import { fetchMessages, loadEarlier } from "../src/handlers/replay.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
 vi.mock("../src/tasks-index.js", () => ({
@@ -542,5 +542,51 @@ describe("replayMeta.turnActive", () => {
     expect((result as { replayMeta?: { turnActive?: boolean } }).replayMeta?.turnActive).toBe(
       false,
     );
+  });
+});
+
+describe("fetchMessages (P1: slow reads must not read as empty)", () => {
+  it("retries once on an RPC failure and returns the real history", async () => {
+    const history = hist();
+    let read = 0;
+    const backend = {
+      isDead: false,
+      request: async (_id: number, method: string) => {
+        if (method === "session/messages") {
+          read++;
+          // A transient timeout (big session, cold backend) — the next read
+          // succeeds. Before the retry, this degraded to [] and the caller
+          // replayed an EMPTY conversation.
+          if (read === 1) return { error: { message: "timeout" } };
+          return { result: { messages: history } };
+        }
+        return { result: {} };
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+
+    const out = await fetchMessages(server, "sess_tail");
+    expect(out).toHaveLength(history.length);
+    expect(read).toBe(2);
+  });
+
+  it("degrades to [] only when the retry fails too", async () => {
+    const backend = {
+      isDead: false,
+      request: async (_id: number, method: string) =>
+        method === "session/messages"
+          ? { error: { message: "zcode backend reader exited (backend dead)" } }
+          : { result: {} },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+
+    const out = await fetchMessages(server, "sess_tail");
+    expect(out).toEqual([]);
   });
 });

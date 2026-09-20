@@ -234,25 +234,40 @@ function dedupeMessages(messages: ZcodeMessage[]): ZcodeMessage[] {
     .filter((m): m is ZcodeMessage => m !== null);
 }
 
-/** Fetch session/messages from zcode (the bridge's only history source). */
+/**
+ * Fetch session/messages from zcode (the bridge's only history source).
+ *
+ * The RPC timeout is generous (45s): huge sessions' reads are slow by nature
+ * (observed 2.4–6.3s on a 7413-message session, slower on a cold backend) and
+ * an 8s cap turned them into failures. A failed read is NOT an empty store —
+ * it retries once and only then degrades to `[]` (callers treat empty as
+ * "nothing to replay").
+ */
 export async function fetchMessages(
   server: ZcodeAcpServer,
   zcodeSid: string,
 ): Promise<ZcodeMessage[]> {
   const backend = server.ensureBackend();
-  const resp = await backend.request(
-    server.nextId(),
-    "session/messages",
-    { sessionId: zcodeSid },
-    8000,
-  );
-  if (resp.error) {
-    // Swallowed on purpose (replay must not crash the load) — but loudly: a
-    // silent empty here renders the whole conversation blank for the client.
-    warn(`session/messages failed for ${zcodeSid}: ${resp.error.message ?? ""}`);
-    return [];
+  const read = async (): Promise<ZcodeMessagesResult | null> => {
+    const resp = await backend.request(
+      server.nextId(),
+      "session/messages",
+      { sessionId: zcodeSid },
+      45_000,
+    );
+    if (resp.error) {
+      warn(`session/messages failed for ${zcodeSid}: ${resp.error.message ?? ""}`);
+      return null;
+    }
+    return (resp.result ?? {}) as ZcodeMessagesResult;
+  };
+  let result = await read();
+  if (result === null) {
+    // One retry: transient timeouts on a cold/slow backend are the common
+    // failure, and conflating them with an empty store blanked the replay.
+    result = await read();
   }
-  const result = (resp.result ?? {}) as ZcodeMessagesResult;
+  if (result === null) return [];
   return dedupeMessages(result.messages ?? []);
 }
 

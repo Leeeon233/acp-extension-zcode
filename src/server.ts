@@ -160,6 +160,17 @@ export class ZcodeAcpServer {
    */
   readonly hydrationUnsettled = new Set<string>();
   /**
+   * Largest session/messages snapshot length ever observed by a settle for a
+   * backend session id. A re-settle (marker armed by a capped settle) treats
+   * one non-growing read that reaches this watermark as caught-up: big
+   * sessions' reads take seconds each, and demanding the full two-stable
+   * plateau inside the cap again meant the marker never cleared — every
+   * session/load re-paid a capped settle (observed 2026-09-20 on a 7413-
+   * message session: 22–56s loads). Reset on backend respawn — a rehydrating
+   * session starts growing from zero again.
+   */
+  readonly hydrationWatermark = new Map<string, number>();
+  /**
    * Backend session ids with a DETACHED auto-compact in flight (see
    * runAutoCompactDetached in config/auto-compact.ts). The turn that armed it
    * has already returned — cancel/preempt must not touch the compaction, the
@@ -452,6 +463,10 @@ export class ZcodeAcpServer {
     }
     const backend = new ZcodeBackend(argv, env);
     this.backend = backend;
+    // Fresh backend process: every session rehydrates from scratch, so the
+    // settle bookkeeping from the previous instance is void.
+    this.hydrationUnsettled.clear();
+    this.hydrationWatermark.clear();
     // Answer the provider runtime-headers handshake the moment it ARRIVES:
     // the backend asks before every model request on a zhipu-account provider,
     // and outside a turn loop (compact's internal turn, session/goal set) the

@@ -236,24 +236,26 @@ describe("cap-truncated settle + alreadyLive re-settle (hydration gap)", () => {
 
   it("a capped flight arms the unsettled marker; the next (alreadyLive) load re-settles and replays the FULL history", async () => {
     // Hydration slower than the settle cap, then stable: the ladder grows on
-    // every read past the 10s cap, then flattens at 44 — the shape a long
-    // session shows on the App's cold-incubation first entry.
+    // every read past the 30s cap, then flattens at 122 — the shape a long
+    // session shows on the App's cold-incubation first entry. (Fake-timer
+    // reads are instant; only the 300ms gaps consume the cap, so the ladder
+    // must outgrow ~100 iterations for the cap to fire.)
     const ladder: ZcodeMessage[][] = [];
-    for (let n = 3; n <= 44; n++) ladder.push(hist(n));
-    ladder.push(hist(44), hist(44));
+    for (let n = 3; n <= 122; n++) ladder.push(hist(n));
+    ladder.push(hist(122), hist(122));
     const { backend } = makeBackend({ messagesQueue: ladder });
     const server = new ZcodeAcpServer();
     server.backend = backend;
     const cx1 = collectCx();
 
     const p1 = loadSession(server, loadParams(), cx1.cx);
-    await vi.advanceTimersByTimeAsync(10_600);
+    await vi.advanceTimersByTimeAsync(31_000);
     const r1 = await p1;
 
     // Cap exit: the largest partial snapshot shipped AND the marker armed.
     const total1 = (r1 as { replayMeta?: { totalMessages?: number } }).replayMeta?.totalMessages;
     expect(total1).toBeGreaterThan(0);
-    expect(total1).toBeLessThan(44);
+    expect(total1).toBeLessThan(122);
     expect(server.hydrationUnsettled.has("sess_race")).toBe(true);
 
     // Second client, alreadyLive (no resume flight): the plain read is
@@ -261,13 +263,36 @@ describe("cap-truncated settle + alreadyLive re-settle (hydration gap)", () => {
     // the COMPLETE history instead of another prefix.
     const cx2 = collectCx();
     const p2 = loadSession(server, loadParams(), cx2.cx);
-    await vi.advanceTimersByTimeAsync(4_000);
+    await vi.advanceTimersByTimeAsync(15_000);
     const r2 = await p2;
 
-    expect((r2 as { replayMeta?: { totalMessages?: number } }).replayMeta?.totalMessages).toBe(44);
-    expect(chunks(cx2.updates)).toHaveLength(44);
+    expect((r2 as { replayMeta?: { totalMessages?: number } }).replayMeta?.totalMessages).toBe(122);
+    expect(chunks(cx2.updates)).toHaveLength(122);
     expect(server.hydrationUnsettled.size).toBe(0);
   }, 15_000);
+
+  it("a re-settle with a watermark clears the marker after ONE confirming read (slow-reader catch-up)", async () => {
+    // The 0.44.1 regression: big sessions read in seconds, the two-stable
+    // plateau never fit the cap again, and every load re-paid a capped
+    // settle. With a watermark from the capped exit, one non-growing read
+    // that reaches it is caught-up — two reads total, marker cleared.
+    const { backend, counts } = makeBackend({ messagesQueue: [hist(8)] });
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    server.hydrationUnsettled.add("sess_race");
+    server.hydrationWatermark.set("sess_race", 8);
+    const { cx, updates } = collectCx();
+
+    const p = loadSession(server, loadParams(), cx);
+    await vi.advanceTimersByTimeAsync(1_000);
+    const r = await p;
+
+    expect((r as { replayMeta?: { totalMessages?: number } }).replayMeta?.totalMessages).toBe(8);
+    expect(chunks(updates)).toHaveLength(8);
+    expect(server.hydrationUnsettled.size).toBe(0);
+    // Settle reads: initial + ONE confirming read (+1 buildSnapshot baseline).
+    expect(counts.get("session/messages")).toBe(3);
+  });
 
   it("a stable session never arms the marker — alreadyLive loads do no settle poll", async () => {
     const { backend, counts } = makeBackend({ messagesQueue: [hist(8)] });

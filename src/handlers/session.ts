@@ -2800,8 +2800,13 @@ async function resumePreservingModel(
 
 /** Settle-poll gap after a fresh resume (see fetchMessagesSettled). */
 const RESUME_SETTLE_GAP_MS = 300;
-/** Cap for the settle poll — past this the largest snapshot seen wins. */
-const RESUME_SETTLE_CAP_MS = 10000;
+/**
+ * Cap for the settle poll — past this the largest snapshot seen wins. Large
+ * enough for the full two-stable-read plateau on slow readers (big sessions'
+ * reads take seconds each — 3–5 reads must fit, observed 2.4–6.3s/read on a
+ * 7413-message session), while still bounding a genuinely stuck hydration.
+ */
+const RESUME_SETTLE_CAP_MS = 30_000;
 /** Non-growing reads required to call the store settled (plateau guard). */
 const RESUME_SETTLE_STABLE_READS = 2;
 
@@ -2816,12 +2821,22 @@ const RESUME_SETTLE_STABLE_READS = 2;
  * hydration), capped; on the cap the largest snapshot seen wins. A capped
  * exit records the session in server.hydrationUnsettled so later replay
  * reads re-settle (fetchMessagesForReplay); a stable exit clears it.
+ *
+ * Re-settles (a marker left by a capped settle) fast-path on the WATERMARK:
+ * one non-growing read that reaches the largest length any settle has ever
+ * observed counts as caught-up. Demanding the full two-read plateau again
+ * meant slow-reading sessions NEVER cleared the marker — every load re-paid
+ * a capped settle (observed 2026-09-20: 22–56s loads on a 7413-message
+ * session). Watermarks reset on backend respawn (ensureBackend).
  */
 export async function fetchMessagesSettled(
   server: ZcodeAcpServer,
   zcodeSid: string,
 ): Promise<ZcodeMessage[]> {
   let messages = await fetchMessages(server, zcodeSid);
+  // The catch-up anchor: what a previous settle already saw of this store.
+  const entryWatermark = server.hydrationWatermark.get(zcodeSid) ?? 0;
+  if (messages.length > entryWatermark) server.hydrationWatermark.set(zcodeSid, messages.length);
   let stable = 0;
   const deadline = Date.now() + RESUME_SETTLE_CAP_MS;
   for (;;) {
@@ -2832,13 +2847,20 @@ export async function fetchMessagesSettled(
       // A failed read comes back EMPTY (fetchMessages swallows errors) — never
       // let it vouch for stability while hydration may still be running.
       const errored = next.length === 0 && messages.length > 0;
-      if (!errored && ++stable >= RESUME_SETTLE_STABLE_READS) {
+      // Watermark fast-path: the store reached everything any settle has ever
+      // seen AND this read confirms it is not growing — caught up.
+      const reachedWatermark = entryWatermark > 0 && messages.length >= entryWatermark;
+      if (!errored && (reachedWatermark || ++stable >= RESUME_SETTLE_STABLE_READS)) {
         server.hydrationUnsettled.delete(zcodeSid);
+        server.hydrationWatermark.set(zcodeSid, Math.max(messages.length, entryWatermark));
         return messages;
       }
     } else {
       stable = 0;
       messages = next;
+      if (messages.length > (server.hydrationWatermark.get(zcodeSid) ?? 0)) {
+        server.hydrationWatermark.set(zcodeSid, messages.length);
+      }
     }
     if (Date.now() >= deadline) {
       server.hydrationUnsettled.add(zcodeSid);
