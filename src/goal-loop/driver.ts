@@ -30,6 +30,7 @@ import { sendTextChunk } from "../handlers/io.js";
 import { messages } from "../i18n.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { log, warn } from "../utils.js";
+import { waitForAutoCompactIdle } from "../config/auto-compact.js";
 import { autoCompactThreshold, goalMaxTurns as settingsGoalMaxTurns } from "../config/settings.js";
 import {
   clearGoalState,
@@ -293,33 +294,57 @@ export class GoalLoopDriver {
     const backend = server.ensureBackend();
     const turn: PendingTurn = { zcodeSid: this.zcodeSid, cancelled: false, goalLoop: true };
     const requestId = `goal-${this.zcodeSid}-${this.state.rounds}-${Date.now()}`;
-    await withPreemptLock(server, this.zcodeSid, async () => {
-      server.pendingTurns.set(requestId, turn);
-    });
-    // Mirror runPrompt's round-start indicator: remote clients would flip
-    // idle between rounds (runOneTurn's finally emits running:false per round).
-    for (const sid of server.sessionAliases(this.acpSid)) {
-      void server.clients
-        .broadcast()
-        .notify("$/zcode/turnState", { sessionId: sid, running: true })
-        .catch(() => undefined);
-    }
-    try {
-      return await runOneTurn(server, {
-        backend,
-        cx: server.clients.broadcast(),
-        acpSid: this.acpSid,
-        zcodeSid: this.zcodeSid,
-        requestId,
-        turn,
-        preempted: false,
-        sendText: prompt,
-        autoCompact: false,
+    // Rounds have no user to resend them: a detached compaction (armed by an
+    // earlier editor turn, or a manual /compact) busy-REJECTS the send —
+    // runOneTurn never queues behind a compaction. Wait it out BEFORE
+    // registering/subscribing (a wait before the subscribe is residue-free),
+    // and retry once the same way if a compaction still slipped in between
+    // the wait and the send.
+    for (let attempt = 0; ; attempt++) {
+      await waitForAutoCompactIdle(server, this.zcodeSid);
+      // The turn object is reused across attempts — clear the sticky reject
+      // mark so each attempt is judged by its OWN send result.
+      turn.compactRejected = false;
+      await withPreemptLock(server, this.zcodeSid, async () => {
+        server.pendingTurns.set(requestId, turn);
       });
-    } finally {
-      // flushSandboxGrants marks goalLoop turns it cancels so the round
-      // boundary can tell a backend restart apart from a user ESC.
-      this.lastSandboxRestart = turn.sandboxRestart === true;
+      // Mirror runPrompt's round-start indicator: remote clients would flip
+      // idle between rounds (runOneTurn's finally emits running:false per round).
+      for (const sid of server.sessionAliases(this.acpSid)) {
+        void server.clients
+          .broadcast()
+          .notify("$/zcode/turnState", { sessionId: sid, running: true })
+          .catch(() => undefined);
+      }
+      try {
+        const result = await runOneTurn(server, {
+          backend,
+          cx: server.clients.broadcast(),
+          acpSid: this.acpSid,
+          zcodeSid: this.zcodeSid,
+          requestId,
+          turn,
+          preempted: false,
+          sendText: prompt,
+          autoCompact: false,
+        });
+        if (!turn.compactRejected || turn.cancelled) return result;
+        if (attempt >= 1) {
+          // Both attempts compact-rejected — the round never ran. Returning
+          // the reject response would let runRounds treat it as a COMPLETED
+          // round (budget burn, stale-verdict parse, parked text settled as
+          // end_turn) — the same hazard runOneTurn throws for at its own
+          // retries-exhausted exit. Throw so run()'s crash path pauses the
+          // loop cleanly with the parked text preserved.
+          throw new Error("goal round rejected: auto-compact still running after retry");
+        }
+      } finally {
+        // flushSandboxGrants marks goalLoop turns it cancels so the round
+        // boundary can tell a backend restart apart from a user ESC.
+        this.lastSandboxRestart = turn.sandboxRestart === true;
+      }
+      await this.announce(messages().autoCompactGoalWait);
+      warn("goal-loop: round busy-rejected by a running compaction — retrying after it settles");
     }
   }
 

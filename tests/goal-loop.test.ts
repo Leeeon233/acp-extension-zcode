@@ -238,6 +238,61 @@ describe("goal-loop driver", () => {
     expect(driver["state"].endedReason).toBe("no api access");
   });
 
+  it("waits out a running compaction and retries a compact-rejected round", async () => {
+    vi.stubEnv("ZCODE_ACP_LANG", "en");
+    const server: { autoCompactInFlight: Set<string> } = makeServer(root);
+    // A compaction is in flight at loop start: runGoalTurn's pre-round wait
+    // polls it (500ms ticks) instead of hitting the compaction gate.
+    server.autoCompactInFlight.add("zsid-1");
+    setTimeout(() => server.autoCompactInFlight.delete("zsid-1"), 50);
+    // The decompose round is then busy-rejected by a compaction that armed
+    // in the arm-race window — the retry (flag now clear) succeeds.
+    runOneTurn.mockImplementationOnce(
+      async (_srv: unknown, opts: { turn: { compactRejected?: boolean } }) => {
+        opts.turn.compactRejected = true;
+        return { stopReason: "max_turn_requests" };
+      },
+    );
+    scriptRound("```\n- t | x\n```"); // decompose retry
+    scriptRound("done\nVERDICT: met");
+    scriptRound("PASS");
+
+    const driver = await startLoop(server);
+    await waitSettled(driver);
+
+    expect(driver["state"].status).toBe("complete");
+    // decompose ran twice (rejected once, retried) + dispatch + verify.
+    expect(runOneTurn).toHaveBeenCalledTimes(4);
+    // The rejected round shows the neutral auto-resume note, never the
+    // user-directed resend notice (the driver retries by itself).
+    const notices = sendTextChunk.mock.calls.map((c) => String(c[2] ?? ""));
+    expect(notices.some((t) => t.includes("NOT sent"))).toBe(false);
+    expect(notices.filter((t) => t.includes("continues automatically"))).toHaveLength(1);
+  }, 15_000);
+
+  it("a round rejected twice (compaction never settles) pauses the loop, never counts as completed", async () => {
+    vi.stubEnv("ZCODE_ACP_LANG", "en");
+    const server: { autoCompactInFlight: Set<string> } = makeServer(root);
+    server.autoCompactInFlight.add("zsid-1");
+    setTimeout(() => server.autoCompactInFlight.delete("zsid-1"), 50);
+    const reject = async (_srv: unknown, opts: { turn: { compactRejected?: boolean } }) => {
+      opts.turn.compactRejected = true;
+      return { stopReason: "max_turn_requests" };
+    };
+    runOneTurn.mockImplementationOnce(reject);
+    runOneTurn.mockImplementationOnce(reject);
+
+    const driver = await startLoop(server);
+    await waitSettled(driver);
+
+    // Both decompose attempts rejected → run()'s crash path pauses cleanly;
+    // the round is not budgeted, no stale verdict is parsed, no ticket ran.
+    expect(driver["state"].status).toBe("paused-crash");
+    expect(driver["state"].rounds).toBe(0);
+    expect(driver["state"].tickets).toEqual([]);
+    expect(runOneTurn).toHaveBeenCalledTimes(2);
+  }, 15_000);
+
   it("pauses on a cancelled round (ESC) and preserves parked text", async () => {
     const server = makeServer(root);
     scriptRound("```\n- t | x\n```");

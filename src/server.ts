@@ -73,6 +73,15 @@ export interface PendingTurn {
    * current ticket on the respawned backend" instead of a user ESC pause.
    */
   sandboxRestart?: boolean;
+  /**
+   * Set when the turn was rejected because a detached auto-compact held the
+   * backend prompt lock (busy 1308): the send was never delivered and the
+   * caller told the user to resend. The goal-loop driver keys its
+   * wait-and-retry off this flag — runOneTurn never queues behind a
+   * compaction (the queued listener would inherit the compaction's whole
+   * internal-turn stream as residue).
+   */
+  compactRejected?: boolean;
 }
 
 /**

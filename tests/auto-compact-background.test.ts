@@ -2,9 +2,10 @@
  * Detached auto-compact (the compaction kill-chain fix): the armed turn's
  * response returns and running:false lands BEFORE the compaction finishes;
  * the finished turn is out of pendingTurns (nothing for cancel/preempt to
- * kill); a follow-up prompt during the compaction waits on the busy-retry
- * (one waiting notice, no stop pair, no drain-gate close escalation) and
- * proceeds once the compaction settles.
+ * kill); a follow-up prompt during the compaction is REJECTED outright (one
+ * resend notice, no send attempt, no stop pair, no drain-gate close
+ * escalation) — queueing it would let its subscribed listener dispatch the
+ * compaction's internal-turn stream as its own output.
  *
  * Mock layout mirrors tests/turn-state.test.ts, plus compaction controls:
  * session/read reports a HIGH contextUsed on the first read only (the
@@ -184,7 +185,7 @@ describe("detached auto-compact", () => {
     });
   }, 15_000);
 
-  it("a follow-up prompt during the compaction waits (one notice, no kill) and proceeds after it settles", async () => {
+  it("a follow-up prompt during the compaction is REJECTED at once (one notice, no send, no kill)", async () => {
     const { backend, counts, sentFrames, releaseGoal } = makeBackend();
     const server = setup(backend);
     const { cx, turnStates, texts } = collectCx();
@@ -192,42 +193,42 @@ describe("detached auto-compact", () => {
     await prompt(server, promptParams(), cx, 1); // turn 1 + detached compaction
     await vi.waitFor(() => expect(counts.get("session/compact")).toBe(1));
 
-    const p2 = prompt(server, promptParams(), cx, 2);
-    // The follow-up hits the busy lock and shows the waiting notice.
-    await vi.waitFor(() =>
-      expect(
-        texts.filter((t) => t.includes("auto-compact in progress")).length,
-      ).toBeGreaterThanOrEqual(1),
-    );
-    // No preempt victim, no stop pair, no drain-gate close escalation.
-    expect(killFrames(sentFrames)).toEqual([]);
-
-    releaseGoal();
-    const r2 = await p2;
-    expect(r2).toEqual({ stopReason: "end_turn" });
+    // Rejected outright — the message is NOT queued behind the compaction
+    // (a queued turn's already-subscribed listener would accumulate the
+    // compaction's stream and dispatch it as this prompt's output once the
+    // lock released).
+    const r2 = await prompt(server, promptParams(), cx, 2);
+    expect(r2).toEqual({ stopReason: "max_turn_requests" });
+    // The resend notice fired exactly once; the send was never attempted
+    // (turn 1's send is still the only one).
+    const notices = texts.filter((t) => t.includes("auto-compact in progress"));
+    expect(notices).toHaveLength(1);
+    expect(notices[0]).toContain("NOT sent");
+    expect(counts.get("session/send")).toBe(1);
+    // The rejected prompt never registered: no turnState pair for it, no
+    // preempt victim, no stop pair, no drain-gate close escalation.
     expect(turnStates).toEqual([
       { sessionId: "sess_ac", running: true }, // turn 1 starts
       { sessionId: "sess_ac", running: false }, // turn 1 settles BEFORE the compaction
-      { sessionId: "sess_ac", running: true }, // turn 2 starts (waits in send-retry)
-      { sessionId: "sess_ac", running: false }, // turn 2 completes
     ]);
-    // Compaction settled and the flag cleared; turn 2's own threshold read
-    // (post-compaction usage) did not re-arm a second compaction. The settle
-    // rides a 2s probe gap — same explicit timeout as test 1.
+    expect(killFrames(sentFrames)).toEqual([]);
+
+    // Settle the compaction so no probe loop outlives the test; turn 2's
+    // threshold read never happened (it was rejected), so no re-arm.
+    releaseGoal();
     await vi.waitFor(() => expect(server.autoCompactInFlight.has("zs_ac")).toBe(false), {
       timeout: 10_000,
     });
     expect(counts.get("session/compact")).toBe(1);
-    // The waiting notice fired exactly once across all send retries.
-    expect(texts.filter((t) => t.includes("auto-compact in progress"))).toHaveLength(1);
   }, 20_000);
 
-  it("ESC on a prompt parked in the compaction wait does not fire the stop pair at the compaction", async () => {
+  it("ESC on a turn racing the compaction gate (registered, send never accepted) does not fire the stop pair at the compaction", async () => {
     const { backend, sentFrames } = makeBackend();
     const server = setup(backend);
     server.autoCompactInFlight.add("zs_ac");
-    // A follow-up prompt registered but never started (no turn.started yet —
-    // its send is still waiting out the compaction's lock).
+    // The arm-race shape: a turn registered between the entry gate and its
+    // first busy response — its send was never accepted, so it owns no
+    // generation the compaction guard may stop.
     const turn = { zcodeSid: "zs_ac", cancelled: false };
     server.pendingTurns.set(999, turn as never);
 

@@ -1552,7 +1552,8 @@ export async function runOneTurn(
       // settling before the send — see drainBackendAfterCancel. EXEMPT while a
       // detached auto-compact runs: it legitimately holds the prompt lock, and
       // the gate's close escalation would tear down the resident runtime and
-      // kill the compaction — the busy-retry below waits it out instead.
+      // kill the compaction — the busy-reject below rejects the send outright
+      // instead of waiting it out.
       const cancelledRecently =
         server.lastCancelledAt.get(zcodeSid) !== undefined &&
         Date.now() - server.lastCancelledAt.get(zcodeSid)! < DRAIN_WINDOW_MS &&
@@ -1589,10 +1590,6 @@ export async function runOneTurn(
           : { sessionId: zcodeSid, content: sendText };
       const sendT0 = Date.now();
       let sendAttempt = 0;
-      // One-shot "waiting for compaction" notice — a minutes-long busy window
-      // with no explanation reads as a hang (the very thing that made users
-      // ESC out of the old blocking auto-compact).
-      let compactWaitNotified = false;
       while (true) {
         if (turn.cancelled) {
           stopBackendTurn(server, zcodeSid, turn);
@@ -1653,24 +1650,32 @@ export async function runOneTurn(
         const notifySince = server.notifyTurnActiveSince.get(zcodeSid);
         const notifyActive =
           notifySince !== undefined && Date.now() - notifySince < NOTIFY_TURN_STALE_MS;
-        // A detached auto-compact is the same shape: a real model turn holding
-        // the lock for minutes. Extend the budget past its full worst case
-        // (settle cap 300s + startup + probe gaps) and tell the user once.
-        // Both flags can be true at once (a background notify turn AND a
-        // compaction queued behind it) — take the LARGER budget, never the
-        // smaller: the smaller fails the user's prompt mid-wait.
-        const COMPACT_BUSY_TIMEOUT_MS = 360_000;
-        const compacting = server.autoCompactInFlight.has(zcodeSid);
+        // A detached auto-compact is the opposite case: REJECT instead of
+        // waiting. This turn's listener is already subscribed, so the
+        // compaction's internal AI turn is streaming its residue into our
+        // queue right now; queueing behind the lock until it releases would
+        // dispatch that residue as THIS prompt's output (its turn.completed
+        // ends the turn before the real reply even starts). Reject at once:
+        // the notice asks the user to resend, the queued residue dies with
+        // this turn's listener unregister in the finally, and
+        // turn.compactRejected lets the goal-loop driver (no user to resend)
+        // wait the compaction out and retry the round.
+        if (isBusy && server.autoCompactInFlight.has(zcodeSid)) {
+          // Goal rounds get no user-directed notice: the driver retries them
+          // automatically — a "resend" instruction would point at an internal
+          // dispatch prompt the user never typed (the driver announces its
+          // own wait note instead).
+          if (!turn.goalLoop) {
+            await sendTextChunk(cx, acpSid, messages().autoCompactBusy, randomUUID());
+          }
+          turn.compactRejected = true;
+          return { stopReason: "max_turn_requests" };
+        }
         const busyBudget = Math.max(
           notifyActive ? NOTIFY_TURN_BUSY_TIMEOUT_MS : 0,
-          compacting ? COMPACT_BUSY_TIMEOUT_MS : 0,
           SEND_RETRY_TIMEOUT_MS,
         );
         const budget = isBusy ? busyBudget : WARMUP_RETRY_TIMEOUT_MS;
-        if (isBusy && compacting && !compactWaitNotified) {
-          compactWaitNotified = true;
-          await sendTextChunk(cx, acpSid, messages().autoCompactWaiting, randomUUID());
-        }
         if (Date.now() - sendT0 > budget) {
           throw new Error(
             `zcode send failed: ${isBusy ? "backend still busy" : "send keeps being rejected"} after ${Math.round(budget / 1000)}s (${sendResp.error.message ?? ""})`,
@@ -1837,7 +1842,7 @@ export async function runOneTurn(
     // Start the armed auto-compact ONLY now, after deregistration and the
     // running:false turnState: from here on a cancel or follow-up prompt finds
     // no turn to preempt (the compaction is untouchable housekeeping), and a
-    // prompt racing it waits on the busy-retry instead of killing it.
+    // prompt racing it is rejected outright instead of killing it.
     if (autoCompactDue) {
       try {
         const { runAutoCompactDetached } = await import("../config/auto-compact.js");
@@ -1944,16 +1949,42 @@ async function runPrompt(
   // same lock). Slash commands /auto pause|resume|stop|status were
   // intercepted above, so anything reaching here is conversational input.
   let parked: Promise<acp.PromptResponse> | undefined;
+  // Set when the compaction gate below rejected this prompt.
+  let compactBusy = false;
+  // A sandbox continuation has no user watching to resend it: wait the
+  // compaction out instead of hitting the rejection gate. The wait happens
+  // BEFORE any subscribe, so it is residue-free by construction.
+  if (continuationRound && server.autoCompactInFlight.has(zcodeSid)) {
+    const { waitForAutoCompactIdle } = await import("../config/auto-compact.js");
+    await waitForAutoCompactIdle(server, zcodeSid);
+  }
   await withPreemptLock(server, zcodeSid, async () => {
     const goalLoop = server.goalLoops?.get(zcodeSid);
     if (goalLoop) {
       parked = goalLoop.parkPrompt(sendText);
       return;
     }
+    // Compaction gate: a detached auto-compact holds the backend prompt lock
+    // for minutes. NEVER queue behind it — this prompt's listener subscribes
+    // before the send, so waiting out the compaction would accumulate its
+    // whole internal-turn stream in our queue and dispatch it as THIS
+    // prompt's output once the lock releases (its turn.completed even ends
+    // the turn before the real reply starts). Reject with a resend notice;
+    // runOneTurn's busy-reject fallback covers the arm race between this
+    // check and the send.
+    if (server.autoCompactInFlight.has(zcodeSid)) {
+      compactBusy = true;
+      return;
+    }
     server.pendingTurns.set(requestId, turn);
     preempted = preemptInFlightTurn(server, zcodeSid, requestId);
   });
   if (parked) return parked;
+  if (compactBusy) {
+    await sendTextChunk(cx, params.sessionId, messages().autoCompactBusy, randomUUID());
+    log("session/prompt: rejected — a detached auto-compact is in flight");
+    return { stopReason: "max_turn_requests" };
+  }
   // Discovery: the session is live the moment its turn STARTS — mark it active
   // here instead of only at turn end, so a freshly created conversation shows
   // up in remote lists within one heartbeat even while its first (possibly

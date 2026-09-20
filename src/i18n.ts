@@ -197,8 +197,12 @@ export interface Messages {
   autoCompactTimeout: string;
   autoCompactDone: string;
   autoCompactFailed: (err: string) => string;
-  /** One-shot notice while a prompt waits out a running detached compaction. */
-  autoCompactWaiting: string;
+  /** Prompt rejection notice: a detached auto-compact is running, the message
+   * was NOT sent — resend after the ✓ compressed line. */
+  autoCompactBusy: string;
+  /** Goal-loop wait note: a compaction holds the lock, the round resumes by
+   * itself once it settles (no user action needed). */
+  autoCompactGoalWait: string;
   /** Pre-popup tool_call titles for interactive requests. */
   popupTitleExitPlan: string;
   popupTitleToolPermission: (tool: string) => string;
@@ -329,7 +333,8 @@ const zh: Messages = {
   autoCompactTimeout: "⚠ 自动压缩超时（300s）——后端可能仍在处理",
   autoCompactDone: "✓ 自动压缩: 上下文已压缩",
   autoCompactFailed: (err) => `⚠ 自动压缩失败: ${err}`,
-  autoCompactWaiting: "⏳ 自动压缩进行中，你的消息将在压缩完成后继续发送…",
+  autoCompactBusy: "🔄 自动压缩进行中，这条消息未发送；看到“✓ 自动压缩”提示后请重新发送。",
+  autoCompactGoalWait: "⏳ 自动压缩进行中，auto 任务将在压缩结束后自动继续…",
   popupTitleExitPlan: "可以开始编码了吗？",
   popupTitleToolPermission: (tool) => `工具权限 (${tool})`,
   popupTitleInteraction: "交互",
@@ -465,7 +470,10 @@ const en: Messages = {
   autoCompactTimeout: "⚠ auto-compact timed out (300s) — backend may still be processing",
   autoCompactDone: "✓ auto-compact: context compressed",
   autoCompactFailed: (err) => `⚠ auto-compact failed: ${err}`,
-  autoCompactWaiting: "⏳ auto-compact in progress — your message will be sent once it finishes…",
+  autoCompactBusy:
+    '🔄 auto-compact in progress — this message was NOT sent; resend it after the "✓ auto-compact" notice.',
+  autoCompactGoalWait:
+    "⏳ auto-compact in progress — the auto run continues automatically once it finishes…",
   popupTitleExitPlan: "Ready to code?",
   popupTitleToolPermission: (tool) => `tool permission (${tool})`,
   popupTitleInteraction: "interaction",

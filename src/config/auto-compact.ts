@@ -119,3 +119,27 @@ export function runAutoCompactDetached(
     })
     .finally(() => server.autoCompactInFlight.delete(zcodeSid));
 }
+
+/** Worst-case compaction wall time: settle cap 300s + startup + probe gaps. */
+export const AUTO_COMPACT_SETTLE_MS = 330_000;
+
+/**
+ * Bounded wait until no detached auto-compact is in flight for the session.
+ * For flows with no user to resend (goal-loop rounds, sandbox continuations):
+ * prompts are REJECTED during a compaction — their subscribed listener would
+ * accumulate the compaction's internal-turn stream as residue — whereas a
+ * caller that waits BEFORE subscribing is residue-free by construction.
+ * Resolves false on timeout (the compaction may legitimately still run).
+ */
+export async function waitForAutoCompactIdle(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+  timeoutMs = AUTO_COMPACT_SETTLE_MS,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (server.autoCompactInFlight.has(zcodeSid)) {
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return true;
+}

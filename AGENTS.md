@@ -234,9 +234,20 @@ ZCode protocol types into ACP notifications directly — always translate.
   — 3.12+ `session/compact` submits `/compact` as a background prompt and
   swallows its failure into an event the bridge never saw; both layers are
   now fixed. Invariants that must stay: single-flight per sid
-  (`server.autoCompactInFlight`), drain gate exempt while it runs, and the
-  follow-up prompt's send-retry extends its busy budget to 330s with a
-  one-shot waiting notice (compact's own settle caps at 300s).
+  (`server.autoCompactInFlight`), drain gate exempt while it runs, and a
+  prompt landing in the compaction window is REJECTED outright — entry gate
+  in runPrompt plus the busy-reject fallback in runOneTurn (notice asks the
+  user to resend after the ✓ line) — NEVER queued behind the lock: the
+  queued turn's listener is already subscribed and would dispatch the
+  compaction's whole internal-turn stream as its own output once the lock
+  releases (its turn.completed ends the turn before the real reply starts;
+  observed as corrupted follow-up turns). Flows with no user to resend wait
+  the compaction out BEFORE subscribing instead
+  (`waitForAutoCompactIdle`: goal-loop rounds retry via
+  `turn.compactRejected` — the neutral `autoCompactGoalWait` note, never the
+  resend notice; a round rejected TWICE throws → `paused-crash`, never
+  counted as a completed round — and sandbox continuations wait at prompt
+  entry).
 - **Preempt lock**: concurrent prompts for the same session are serialized via
   `withPreemptLock`. Don't bypass it — two simultaneous turns corrupt the listener.
 - **The lazy-alias store (`~/.zcode/v2/acp-lazy-sessions.json`) is shared by
