@@ -358,8 +358,8 @@ export class GoalLoopDriver {
 
   /** Text of the last assistant reply at or after `since` (verdict parsing input). */
   private async lastAssistantText(since = 0): Promise<string> {
-    const { fetchMessages } = await import("../handlers/replay.js");
-    const msgs = await fetchMessages(this.server, this.zcodeSid);
+    const { fetchMessages, TURN_READ } = await import("../handlers/replay.js");
+    const msgs = await fetchMessages(this.server, this.zcodeSid, TURN_READ);
     for (let i = msgs.length - 1; i >= Math.min(since, msgs.length); i--) {
       const m = msgs[i]!;
       if (m.info.role !== "assistant") continue;
@@ -374,8 +374,8 @@ export class GoalLoopDriver {
 
   /** Tool-part count in the messages appended since `before` (stall signal). */
   private async toolActivitySince(before: number): Promise<number> {
-    const { fetchMessages } = await import("../handlers/replay.js");
-    const msgs = await fetchMessages(this.server, this.zcodeSid);
+    const { fetchMessages, TURN_READ } = await import("../handlers/replay.js");
+    const msgs = await fetchMessages(this.server, this.zcodeSid, TURN_READ);
     let tools = 0;
     for (let i = Math.min(before, msgs.length); i < msgs.length; i++) {
       if (msgs[i]!.parts.some((p) => p.type === "tool")) tools++;
@@ -384,8 +384,8 @@ export class GoalLoopDriver {
   }
 
   private async messageCount(): Promise<number> {
-    const { fetchMessages } = await import("../handlers/replay.js");
-    return (await fetchMessages(this.server, this.zcodeSid)).length;
+    const { fetchMessages, TURN_READ } = await import("../handlers/replay.js");
+    return (await fetchMessages(this.server, this.zcodeSid, TURN_READ)).length;
   }
 
   private async contextUsed(): Promise<number> {

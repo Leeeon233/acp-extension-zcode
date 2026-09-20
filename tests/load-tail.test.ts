@@ -15,7 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeMessage } from "../src/backend/types.js";
 import { loadSession } from "../src/handlers/session.js";
-import { fetchMessages, loadEarlier } from "../src/handlers/replay.js";
+import { fetchMessages, loadEarlier, TURN_READ } from "../src/handlers/replay.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
 vi.mock("../src/tasks-index.js", () => ({
@@ -588,5 +588,70 @@ describe("fetchMessages (P1: slow reads must not read as empty)", () => {
 
     const out = await fetchMessages(server, "sess_tail");
     expect(out).toEqual([]);
+  });
+
+  it("defaults to the generous 45s hydration timeout", async () => {
+    const timeouts: number[] = [];
+    const backend = {
+      isDead: false,
+      request: async (_id: number, method: string, _params: unknown, timeout?: number) => {
+        if (method === "session/messages") {
+          timeouts.push(timeout ?? -1);
+          return { result: { messages: hist() } };
+        }
+        return { result: {} };
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+
+    await fetchMessages(server, "sess_tail");
+    expect(timeouts).toEqual([45_000]);
+  });
+
+  it("passes opts through: custom timeout honored, retry:false fails in ONE read", async () => {
+    const timeouts: number[] = [];
+    const backend = {
+      isDead: false,
+      request: async (_id: number, method: string, _params: unknown, timeout?: number) => {
+        if (method === "session/messages") {
+          timeouts.push(timeout ?? -1);
+          return { error: { message: "timeout" } };
+        }
+        return { result: {} };
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+
+    const out = await fetchMessages(server, "sess_tail", TURN_READ);
+    // One bounded read, no retry, no 45s hang — the turn-internal contract.
+    expect(timeouts).toEqual([8000]);
+    expect(out).toEqual([]);
+  });
+
+  it("passes a custom timeoutMs through even with retry on", async () => {
+    const timeouts: number[] = [];
+    const backend = {
+      isDead: false,
+      request: async (_id: number, method: string, _params: unknown, timeout?: number) => {
+        if (method === "session/messages") {
+          timeouts.push(timeout ?? -1);
+          return { result: { messages: hist() } };
+        }
+        return { result: {} };
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+
+    await fetchMessages(server, "sess_tail", { timeoutMs: 12_345 });
+    expect(timeouts).toEqual([12_345]);
   });
 });

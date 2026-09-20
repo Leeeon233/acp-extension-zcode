@@ -69,8 +69,15 @@ import { clientConnectionRoot, log, warn } from "../utils.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { dispatchEvent } from "./dispatch.js";
 import { sendSessionUpdate, sendTextChunk, withReplayBatch } from "./io.js";
-import type { ReplaySlice } from "./replay.js";
-import { fetchMessages, fullSlice, readTailLimit, replayMessages, sliceTail } from "./replay.js";
+import type { FetchMessagesOptions, ReplaySlice } from "./replay.js";
+import {
+  fetchMessages,
+  fullSlice,
+  readTailLimit,
+  replayMessages,
+  sliceTail,
+  TURN_READ,
+} from "./replay.js";
 import {
   extractPermDeniedPath,
   extractSandboxDenial,
@@ -1022,7 +1029,7 @@ export async function resumeIntoSession(
     if (current) {
       let existing: Awaited<ReturnType<typeof fetchMessages>>;
       try {
-        existing = await fetchMessages(server, current);
+        existing = await fetchMessages(server, current, TURN_READ);
       } catch {
         // Cannot prove the thread empty — refuse rather than orphan history.
         return { ok: false, error: messages().slashResumeNotEmpty };
@@ -2823,11 +2830,17 @@ const RESUME_SETTLE_STABLE_READS = 2;
  * reads re-settle (fetchMessagesForReplay); a stable exit clears it.
  *
  * Re-settles (a marker left by a capped settle) fast-path on the WATERMARK:
- * one non-growing read that reaches the largest length any settle has ever
- * observed counts as caught-up. Demanding the full two-read plateau again
+ * one non-growing read that itself reaches the largest length any settle has
+ * ever observed counts as caught-up. Demanding the full two-read plateau again
  * meant slow-reading sessions NEVER cleared the marker — every load re-paid
  * a capped settle (observed 2026-09-20: 22–56s loads on a 7413-message
- * session). Watermarks reset on backend respawn (ensureBackend).
+ * session). The confirming READ (not this flight's running max) must reach
+ * the live watermark, so a read that dips below what any settle has seen
+ * falls back to the plateau rule; watermark writes are monotonic, so a
+ * concurrent settle's higher observation is never traded down. Residual,
+ * accepted: a hydration stalling at/above the watermark across one read+gap
+ * still exits early with a prefix — bounded, and the next plain read
+ * self-heals. Watermarks reset on backend respawn (ensureBackend).
  */
 export async function fetchMessagesSettled(
   server: ZcodeAcpServer,
@@ -2836,7 +2849,7 @@ export async function fetchMessagesSettled(
   let messages = await fetchMessages(server, zcodeSid);
   // The catch-up anchor: what a previous settle already saw of this store.
   const entryWatermark = server.hydrationWatermark.get(zcodeSid) ?? 0;
-  if (messages.length > entryWatermark) server.hydrationWatermark.set(zcodeSid, messages.length);
+  raiseWatermark(server, zcodeSid, messages.length);
   let stable = 0;
   const deadline = Date.now() + RESUME_SETTLE_CAP_MS;
   for (;;) {
@@ -2847,20 +2860,20 @@ export async function fetchMessagesSettled(
       // A failed read comes back EMPTY (fetchMessages swallows errors) — never
       // let it vouch for stability while hydration may still be running.
       const errored = next.length === 0 && messages.length > 0;
-      // Watermark fast-path: the store reached everything any settle has ever
-      // seen AND this read confirms it is not growing — caught up.
-      const reachedWatermark = entryWatermark > 0 && messages.length >= entryWatermark;
+      // Watermark fast-path: the confirming read itself reached everything
+      // any settle has ever seen (live value — a concurrent settle may have
+      // raised it past our entry snapshot) AND the store is not growing.
+      const liveWatermark = server.hydrationWatermark.get(zcodeSid) ?? 0;
+      const reachedWatermark = entryWatermark > 0 && next.length >= liveWatermark;
       if (!errored && (reachedWatermark || ++stable >= RESUME_SETTLE_STABLE_READS)) {
         server.hydrationUnsettled.delete(zcodeSid);
-        server.hydrationWatermark.set(zcodeSid, Math.max(messages.length, entryWatermark));
+        raiseWatermark(server, zcodeSid, Math.max(messages.length, entryWatermark));
         return messages;
       }
     } else {
       stable = 0;
       messages = next;
-      if (messages.length > (server.hydrationWatermark.get(zcodeSid) ?? 0)) {
-        server.hydrationWatermark.set(zcodeSid, messages.length);
-      }
+      raiseWatermark(server, zcodeSid, messages.length);
     }
     if (Date.now() >= deadline) {
       server.hydrationUnsettled.add(zcodeSid);
@@ -2871,6 +2884,13 @@ export async function fetchMessagesSettled(
       );
       return messages;
     }
+  }
+}
+
+/** Monotonic watermark write — a concurrent settle's higher observation wins. */
+function raiseWatermark(server: ZcodeAcpServer, zcodeSid: string, length: number): void {
+  if (length > (server.hydrationWatermark.get(zcodeSid) ?? 0)) {
+    server.hydrationWatermark.set(zcodeSid, length);
   }
 }
 
@@ -3569,7 +3589,7 @@ export async function runEventTurn(
       // compaction, before the user's next send) would leave its entire output
       // invisible in the UI. `fetchLastReply` above only covers the last
       // assistant message, not the whole missing span.
-      const snapshot = await buildSnapshot(server, turn.zcodeSid);
+      const snapshot = await buildSnapshot(server, turn.zcodeSid, TURN_READ);
       const completionEvents = differ.diff(snapshot);
       for (const iev of completionEvents) {
         // Per-kind dedup (see deliveredReasoningMessageIds): text and reasoning
@@ -3644,7 +3664,7 @@ async function fetchLastReply(
   differ: ProjectionDiffer,
 ): Promise<{ text: string; messageId: string | null } | null> {
   for (let attempt = 0; attempt < 4; attempt++) {
-    const messages = await fetchMessages(server, zcodeSid);
+    const messages = await fetchMessages(server, zcodeSid, TURN_READ);
     for (let i = messages.length - 1; i >= 0; i--) {
       const m = messages[i];
       if (!m) continue;
@@ -3685,10 +3705,14 @@ export function flattenTodos(
 }
 
 /** Build a {projection, messages, todos} snapshot from session/messages + session/read. */
-async function buildSnapshot(server: ZcodeAcpServer, zcodeSid: string): Promise<ZcodeSnapshot> {
+async function buildSnapshot(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+  opts: FetchMessagesOptions = {},
+): Promise<ZcodeSnapshot> {
   const backend = server.ensureBackend();
   const [msgs, readResp] = await Promise.all([
-    fetchMessages(server, zcodeSid),
+    fetchMessages(server, zcodeSid, opts),
     backend.request(server.nextId(), "session/read", { sessionId: zcodeSid }, 8000),
   ]);
   const read = (readResp.result ?? {}) as {
@@ -3749,7 +3773,7 @@ async function dispatchEditDiff(
   differ: ProjectionDiffer,
   chunkMsgId: string,
 ): Promise<void> {
-  const messages = await fetchMessages(server, zcodeSid);
+  const messages = await fetchMessages(server, zcodeSid, TURN_READ);
   for (const m of messages) {
     for (const p of m.parts ?? []) {
       if (!p || typeof p !== "object") continue;

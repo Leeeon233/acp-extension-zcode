@@ -21,7 +21,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeMessage } from "../src/backend/types.js";
-import { loadSession } from "../src/handlers/session.js";
+import { fetchMessagesSettled, loadSession } from "../src/handlers/session.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
 vi.mock("../src/tasks-index.js", () => ({
@@ -315,5 +315,51 @@ describe("cap-truncated settle + alreadyLive re-settle (hydration gap)", () => {
     await vi.advanceTimersByTimeAsync(0);
     await p2;
     expect(counts.get("session/messages") ?? 0).toBe(readsAfterFirst + 2);
+  });
+
+  it("fast-path needs the CONFIRMING read to reach the watermark — a dipping read falls back to the plateau rule", async () => {
+    // Marker armed by a capped settle that saw 3 of a still-growing store.
+    // The re-settle's entry read jumps to 5 (raising the live watermark), the
+    // next read DIPS to 3: the running max (5) reaches the watermark but the
+    // confirming read (3) does not — no fast exit. The pre-hardening code
+    // exited here on the running max alone, shipping whatever prefix the
+    // max-read caught if hydration was merely stalled.
+    const { backend, counts } = makeBackend({
+      messagesQueue: [hist(3), hist(5), hist(3), hist(3), hist(3)],
+    });
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    server.hydrationUnsettled.add("sess_race");
+    server.hydrationWatermark.set("sess_race", 3);
+
+    const p = fetchMessagesSettled(server, "sess_race");
+    await vi.advanceTimersByTimeAsync(2_000);
+    const out = await p;
+
+    // Entry + growth read + TWO plateau reads (no fast exit): 4 total.
+    expect(counts.get("session/messages")).toBe(4);
+    expect(out).toHaveLength(5); // largest snapshot wins
+    expect(server.hydrationUnsettled.size).toBe(0); // plateau cleared the marker
+    expect(server.hydrationWatermark.get("sess_race")).toBe(5); // monotonic
+  });
+
+  it("watermark writes are monotonic — a settle on a smaller store never trades it down", async () => {
+    // A capped settle once saw 8; compaction then shrank the store to 4. The
+    // re-settle can never reach 8, exits via the plateau rule, and must leave
+    // the watermark at 8 — trading down would break a future re-hydration's
+    // catch-up anchor.
+    const { backend } = makeBackend({ messagesQueue: [hist(4), hist(4), hist(4)] });
+    const server = new ZcodeAcpServer();
+    server.backend = backend;
+    server.hydrationUnsettled.add("sess_race");
+    server.hydrationWatermark.set("sess_race", 8);
+
+    const p = fetchMessagesSettled(server, "sess_race");
+    await vi.advanceTimersByTimeAsync(2_000);
+    const out = await p;
+
+    expect(out).toHaveLength(4);
+    expect(server.hydrationUnsettled.size).toBe(0);
+    expect(server.hydrationWatermark.get("sess_race")).toBe(8);
   });
 });

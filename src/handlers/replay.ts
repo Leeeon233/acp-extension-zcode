@@ -234,26 +234,47 @@ function dedupeMessages(messages: ZcodeMessage[]): ZcodeMessage[] {
     .filter((m): m is ZcodeMessage => m !== null);
 }
 
+/** Tuning knobs for fetchMessages; unset means the hydration defaults. */
+export interface FetchMessagesOptions {
+  /** Per-read RPC timeout. */
+  timeoutMs?: number;
+  /** Retry one failed read before degrading to `[]`. */
+  retry?: boolean;
+}
+
+/**
+ * Turn-internal reads: short timeout, no retry. fetchMessages' generous
+ * default exists for slow hydration reads on huge sessions; a turn-loop
+ * caller (per-tool-result diff fetch, reply fallback) inheriting it would
+ * stall the live stream for up to ~90s on a hung read. These callers
+ * degrade gracefully instead — a missed diff is reconciled at turn
+ * completion, a missed reply falls through to other recovery paths.
+ */
+export const TURN_READ: FetchMessagesOptions = { timeoutMs: 8000, retry: false };
+
 /**
  * Fetch session/messages from zcode (the bridge's only history source).
  *
- * The RPC timeout is generous (45s): huge sessions' reads are slow by nature
- * (observed 2.4–6.3s on a 7413-message session, slower on a cold backend) and
- * an 8s cap turned them into failures. A failed read is NOT an empty store —
- * it retries once and only then degrades to `[]` (callers treat empty as
- * "nothing to replay").
+ * The default RPC timeout is generous (45s): huge sessions' reads are slow by
+ * nature (observed 2.4–6.3s on a 7413-message session, slower on a cold
+ * backend) and an 8s cap turned them into failures. A failed read is NOT an
+ * empty store — it retries once and only then degrades to `[]` (callers treat
+ * empty as "nothing to replay"). Turn-internal callers pass TURN_READ to keep
+ * the pre-0.44.2 bounded behavior.
  */
 export async function fetchMessages(
   server: ZcodeAcpServer,
   zcodeSid: string,
+  opts: FetchMessagesOptions = {},
 ): Promise<ZcodeMessage[]> {
   const backend = server.ensureBackend();
+  const timeoutMs = opts.timeoutMs ?? 45_000;
   const read = async (): Promise<ZcodeMessagesResult | null> => {
     const resp = await backend.request(
       server.nextId(),
       "session/messages",
       { sessionId: zcodeSid },
-      45_000,
+      timeoutMs,
     );
     if (resp.error) {
       warn(`session/messages failed for ${zcodeSid}: ${resp.error.message ?? ""}`);
@@ -262,7 +283,7 @@ export async function fetchMessages(
     return (resp.result ?? {}) as ZcodeMessagesResult;
   };
   let result = await read();
-  if (result === null) {
+  if (result === null && (opts.retry ?? true)) {
     // One retry: transient timeouts on a cold/slow backend are the common
     // failure, and conflating them with an empty store blanked the replay.
     result = await read();
