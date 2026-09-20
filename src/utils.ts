@@ -56,6 +56,16 @@ export function zcodeHomeDir(): string {
 export const ZCODE_CREDS_PATH = path.join(zcodeHomeDir(), "v2", "config.json");
 
 /**
+ * Path to the desktop's personal provider config (3.12+): the desktop writes
+ * user-added providers and models HERE, and the backend registry reads it
+ * directly — legacy config.json's provider map stopped syncing. Per call, so
+ * discovery follows a `ZCODE_HOME` change made after import (tests).
+ */
+export function zcodePersonalProviderPath(): string {
+  return path.join(zcodeHomeDir(), "v2", "provider_config.json");
+}
+
+/**
  * Path to the ZCode CLI config (skills/plugins/MCP enablement). Per call, so
  * discovery follows a `ZCODE_HOME` change made after import (tests).
  */

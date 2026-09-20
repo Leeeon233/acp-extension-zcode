@@ -192,6 +192,25 @@ ZCode protocol types into ACP notifications directly — always translate.
   (`account-provider:…:account:<uid>:api-key` exists but the `…:identity`
   half was never written on the observed machine), so the bridge cannot rely
   on it.
+- **Desktop 3.12+ writes user-added models to `provider_config.json` and legacy
+  config.json has STOPPED syncing — the dropdown must union both** (observed
+  2026-09-20: a model added in the app landed only in
+  `~/.zcode/v2/provider_config.json` `modelConfigRules.providerModelRules`,
+  config.json's mtime stayed days stale, and the dropdown built from
+  `loadAllModels()` never showed it while the backend registry accepted the
+  model fine). `loadAllModels` (src/config/options.ts) merges: config.json
+  stays authoritative for enablement/credentials; the personal config
+  contributes model ids per provider plus WHOLE providers config.json lacks
+  (same `providerSelectable` rule applied to the rule's own
+  `config.access.apiKey` / `config.api.baseUrl`). Shapes that bite: personal
+  rule ids use the REGISTRY spelling (`account:…` — normalize through
+  `configProviderIdFor` before matching config.json's `builtin:*` keys), the
+  enabled flag nests under `config.enabled` (not top-level), and models carry
+  `config.properties.contextWindow` + `optionSpecs.reasoningLevel.values`.
+  `modelContextWindow` and `resolveDefaultReasoningLevel` fall back to the
+  personal rule too — a model added after session/create is absent from BOTH
+  the captured availability snapshot and config.json, and omitting `options`
+  hard-fails a level-bearing `session/setModel`.
 - **The backend ignores `session/stop`** (verified against app-server 0.16.5 —
   the model stream runs to its natural end no matter what). Cancel is therefore
   bridge-side only: the turn loop returns `cancelled` at once, and the next

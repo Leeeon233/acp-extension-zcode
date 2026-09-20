@@ -34,6 +34,7 @@ import {
   isBuiltinProvider,
   loadAllModels,
   parseModelValue,
+  personalModelSpec,
 } from "./options.js";
 import type { ModelRef } from "./options.js";
 import { log, warn } from "../utils.js";
@@ -226,7 +227,19 @@ function resolveDefaultReasoningLevel(
       if (reasoning.variants?.length) return reasoning.variants[0]!;
     }
   } catch {
-    // unreadable config — omit options
+    // unreadable config — try the personal config below
+  }
+  // In config.json neither — a model the desktop added to its personal
+  // provider config after this session was created. The rule carries the
+  // level vocabulary (`optionSpecs.reasoningLevel`); its declared default or
+  // first value is the best-effort level (omitting `options` would hard-fail
+  // a level-bearing switch).
+  try {
+    const spec = personalModelSpec(providerId, modelId);
+    const values = spec?.reasoningValues;
+    if (values?.length) return values[0]!;
+  } catch {
+    // unreadable personal config — omit options
   }
   return null;
 }

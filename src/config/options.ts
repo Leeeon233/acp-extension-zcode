@@ -21,6 +21,7 @@ import {
   log,
   warn,
   ZCODE_CREDS_PATH,
+  zcodePersonalProviderPath,
 } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { configProviderIdFor } from "./account-provider.js";
@@ -46,6 +47,124 @@ interface ProviderEntry {
 
 interface ConfigShape {
   provider?: Record<string, ProviderEntry>;
+}
+
+// ---------- personal provider config (3.12+) ----------
+
+/**
+ * The desktop's `provider_config.json` — where user-added providers and models
+ * land since 3.12. config.json's provider map is legacy and has stopped
+ * syncing (observed 2026-09: a model added in the desktop app was written ONLY
+ * here, so a dropdown built from config.json alone never showed it; the
+ * backend registry reads this file directly and accepts the model fine).
+ *
+ * Spelling notes: provider rule ids use the REGISTRY spelling
+ * (`account:bigmodel-individual-coding-plan`), so they normalize through
+ * `configProviderIdFor` before matching config.json's `builtin:*` keys. Model
+ * rules nest their flag under `config.enabled` (NOT top-level), and carry
+ * `config.properties.contextWindow` + `config.optionSpecs.reasoningLevel.values`.
+ */
+interface PersonalModelRule {
+  providerId?: string;
+  modelId?: string;
+  config?: {
+    enabled?: boolean;
+    properties?: { contextWindow?: number };
+    optionSpecs?: { reasoningLevel?: { values?: string[] } };
+  };
+}
+
+interface PersonalProviderRule {
+  providerId?: string;
+  providerName?: string;
+  enabled?: boolean;
+  config?: {
+    access?: { type?: string; apiKey?: string };
+    api?: { type?: string; baseUrl?: string };
+  };
+}
+
+interface PersonalProviderConfig {
+  config?: {
+    providerConfigRules?: { providerRules?: PersonalProviderRule[] };
+    modelConfigRules?: {
+      providerModelRules?: PersonalModelRule[];
+      manualProviderModelRules?: PersonalModelRule[];
+    };
+  };
+}
+
+/** provider_config.json content projected onto config.json spellings. */
+interface PersonalModels {
+  /** enabled model ids per NORMALIZED provider id, file order. */
+  modelsByProvider: Map<string, string[]>;
+  /** context window per `providerId\modelId` (formatModelValue separator). */
+  contextByModel: Map<string, number>;
+  /** reasoning level values per `providerId\modelId`, file order. */
+  reasoningByModel: Map<string, string[]>;
+  /** every provider rule, normalized id attached, file order. */
+  providers: Array<{ pid: string; rule: PersonalProviderRule }>;
+}
+
+function readPersonalProviderConfig(): PersonalProviderConfig | null {
+  try {
+    return JSON.parse(readFileSync(zcodePersonalProviderPath(), "utf8")) as PersonalProviderConfig;
+  } catch {
+    return null; // absent/unreadable (or pre-3.12 desktop) — config.json alone decides
+  }
+}
+
+function loadPersonalModels(): PersonalModels | null {
+  const pc = readPersonalProviderConfig();
+  const providerRules = pc?.config?.providerConfigRules?.providerRules ?? [];
+  const modelRules = [
+    ...(pc?.config?.modelConfigRules?.providerModelRules ?? []),
+    ...(pc?.config?.modelConfigRules?.manualProviderModelRules ?? []),
+  ];
+  if (providerRules.length === 0 && modelRules.length === 0) return null;
+  const out: PersonalModels = {
+    modelsByProvider: new Map(),
+    contextByModel: new Map(),
+    reasoningByModel: new Map(),
+    providers: [],
+  };
+  for (const rule of modelRules) {
+    if (!rule.providerId || !rule.modelId) continue;
+    if (rule.config?.enabled === false) continue;
+    const pid = configProviderIdFor(rule.providerId);
+    const ids = out.modelsByProvider.get(pid) ?? [];
+    if (!ids.includes(rule.modelId)) ids.push(rule.modelId);
+    out.modelsByProvider.set(pid, ids);
+    const key = `${pid}\\${rule.modelId}`;
+    const ctx = rule.config?.properties?.contextWindow;
+    if (ctx && ctx > 0) out.contextByModel.set(key, ctx);
+    const values = rule.config?.optionSpecs?.reasoningLevel?.values;
+    if (values?.length) out.reasoningByModel.set(key, values);
+  }
+  for (const rule of providerRules) {
+    if (!rule.providerId) continue;
+    out.providers.push({ pid: configProviderIdFor(rule.providerId), rule });
+  }
+  return out;
+}
+
+/**
+ * A model's declaration from provider_config.json only — the lookup for
+ * models that exist in the desktop's personal config but not (yet) in legacy
+ * config.json. Null when the personal config is absent or lacks the model.
+ */
+export function personalModelSpec(
+  providerId: string,
+  modelId: string,
+): { contextWindow?: number; reasoningValues?: string[] } | null {
+  const personal = loadPersonalModels();
+  if (!personal) return null;
+  const pid = configProviderIdFor(providerId);
+  const key = `${pid}\\${modelId}`;
+  const contextWindow = personal.contextByModel.get(key);
+  const reasoningValues = personal.reasoningByModel.get(key);
+  if (contextWindow === undefined && !reasoningValues) return null;
+  return { contextWindow, reasoningValues };
 }
 
 /**
@@ -97,9 +216,46 @@ function isLocalBaseURL(url: string | undefined): boolean {
 }
 
 /**
- * Collect models from config.json for the dropdown.
+ * Append providers that exist ONLY in provider_config.json — added in the
+ * desktop app after config.json stopped syncing. Credentials come from the
+ * rule itself (`config.access.apiKey` / `config.api.baseUrl`), selectability
+ * follows the same rule as config.json entries (#156).
+ */
+function appendPersonalOnlyProviders(
+  out: ModelRef[],
+  personal: PersonalModels,
+  pinned: string | undefined,
+): void {
+  const known = new Set(out.map((m) => m.providerId));
+  for (const { pid, rule } of personal.providers) {
+    if (known.has(pid)) continue;
+    if (pinned && pid !== pinned) continue;
+    const synthesized: ProviderEntry = {
+      name: rule.providerName,
+      enabled: rule.enabled,
+      options: {
+        apiKey: rule.config?.access?.apiKey,
+        baseURL: rule.config?.api?.baseUrl,
+      },
+    };
+    if (!providerSelectable(pid, synthesized)) continue;
+    const providerName = rule.providerName ?? pid;
+    for (const modelId of personal.modelsByProvider.get(pid) ?? []) {
+      out.push({ providerId: pid, providerName, modelId });
+    }
+  }
+}
+
+/**
+ * Collect models from config.json for the dropdown, UNIONED with the desktop's
+ * provider_config.json (3.12+): models the user added in the desktop app land
+ * there and never reach legacy config.json, so without the merge the dropdown
+ * silently misses them (observed 2026-09). config.json stays authoritative for
+ * provider enablement/credentials; the personal config contributes model ids
+ * per provider, plus whole providers it describes and config.json does not.
  */
 export function loadAllModels(): ModelRef[] {
+  const personal = loadPersonalModels();
   try {
     const cfg = readConfig() as ConfigShape;
     const out: ModelRef[] = [];
@@ -109,10 +265,13 @@ export function loadAllModels(): ModelRef[] {
       if (pinned && pid !== pinned) continue;
       if (!providerSelectable(pid, p)) continue;
       const providerName = p.name ?? pid;
-      for (const modelId of Object.keys(p.models ?? {})) {
+      const ids = new Set(Object.keys(p.models ?? {}));
+      for (const modelId of personal?.modelsByProvider.get(pid) ?? []) ids.add(modelId);
+      for (const modelId of ids) {
         out.push({ providerId: pid, providerName, modelId });
       }
     }
+    if (personal) appendPersonalOnlyProviders(out, personal, pinned);
     // The default-provider fallback applies only to a MISSING/empty provider
     // map (fresh install). When providers ARE configured but none is usable
     // (all keyless/未启用, #156), returning [] is correct: the fallback would
@@ -129,6 +288,11 @@ export function loadAllModels(): ModelRef[] {
     }
     return out;
   } catch {
+    // config.json unreadable — a personal-config-only setup still advertises
+    // its providers before the fresh-install default kicks in.
+    const out: ModelRef[] = [];
+    if (personal) appendPersonalOnlyProviders(out, personal, process.env.ZCODE_PROVIDER);
+    if (out.length > 0) return out;
     return [
       {
         providerId: DEFAULT_PROVIDER_ID,
@@ -153,16 +317,20 @@ export function findProviderConfig(providerId: string): ProviderEntry | null {
   }
 }
 
-/** Read the context-window size for a provider+model from config.json. */
+/** Read the context-window size for a provider+model: config.json first, then
+ *  the desktop's provider_config.json (models added there carry
+ *  `config.properties.contextWindow` and never reach config.json). */
 export function modelContextWindow(providerId: string, modelId: string): number {
+  const pid = configProviderIdFor(providerId);
   try {
     const cfg = readConfig() as ConfigShape;
-    const entry = cfg.provider?.[configProviderIdFor(providerId)];
-    const models = entry?.models ?? {};
-    return models[modelId]?.limit?.context ?? 0;
+    const models = cfg.provider?.[pid]?.models ?? {};
+    const hit = models[modelId]?.limit?.context;
+    if (hit && hit > 0) return hit;
   } catch {
-    return 0;
+    // fall through to the personal config
   }
+  return personalModelSpec(pid, modelId)?.contextWindow ?? 0;
 }
 
 /** Builtin providerIds are prefixed with `builtin:` (e.g. `builtin:bigmodel`). */

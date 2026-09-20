@@ -13,7 +13,7 @@ import path from "node:path";
 import process from "node:process";
 import { execFileSync } from "node:child_process";
 
-import { log } from "../utils.js";
+import { log, zcodePersonalProviderPath } from "../utils.js";
 
 /** `which bin` — resolve a binary on PATH without external deps. */
 function whichSync(bin: string): string | null {
@@ -177,7 +177,7 @@ export function builtinProviderEnv(entryArg?: string): NodeJS.ProcessEnv {
   ];
   const found = candidates.find((c) => existsSync(c));
   if (!found) return {};
-  const personal = path.join(os.homedir(), ".zcode", "v2", "provider_config.json");
+  const personal = zcodePersonalProviderPath();
   return existsSync(personal)
     ? { [BUILTIN_PROVIDER_ENV]: found, [PERSONAL_PROVIDER_ENV]: personal }
     : { [BUILTIN_PROVIDER_ENV]: found };
