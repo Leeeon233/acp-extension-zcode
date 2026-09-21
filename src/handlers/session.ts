@@ -1558,7 +1558,16 @@ export async function runOneTurn(
         server.lastCancelledAt.get(zcodeSid) !== undefined &&
         Date.now() - server.lastCancelledAt.get(zcodeSid)! < DRAIN_WINDOW_MS &&
         !server.autoCompactInFlight.has(zcodeSid);
-      if (cancelledRecently) {
+      // Drain gate, behavior-adaptive: on a backend that has REJECTED a send
+      // with the whole-turn busy error (0.16.9 — sendPrompt's
+      // activeAbortController guard spans the entire turn), a mid-turn send
+      // is never accepted as steer, so the send loop's busy-retry below is
+      // the authoritative readiness probe and the pre-send poll (with its
+      // close-escalation) is skipped. Backends that never showed the
+      // rejection (0.16.5: a mid-generation send is accepted as steer and
+      // silently dropped) keep the full gate.
+      const drainRan = cancelledRecently && !server.observedSendBusyReject;
+      if (drainRan) {
         const drained = await drainBackendAfterCancel(server, {
           acpSid,
           zcodeSid,
@@ -1573,12 +1582,14 @@ export async function runOneTurn(
 
       // Send the prompt, retrying while the backend reports it's still busy.
       // The backend's prompt lock is the single authoritative readiness signal:
-      // a rejected send (code 1308 "prompt is running") means a previous turn
-      // (cancelled, preempted, or still finalising) hasn't released the lock
-      // yet. Rather than guessing when the backend is ready — or blocking on a
-      // local shadow flag — we retry with a fixed delay until the backend
-      // accepts. This covers the preempt path (new prompt interrupting an
-      // in-flight one) and the stop-recovery window after a manual cancel.
+      // a rejected send (1308 "prompt is running" on 0.16.5; -32010 "A prompt
+      // is already running for this session" spanning the WHOLE turn on
+      // 0.16.9) means a previous turn (cancelled, preempted, or still
+      // finalising) hasn't released the lock yet. Rather than guessing when
+      // the backend is ready — or blocking on a local shadow flag — we retry
+      // with a fixed delay until the backend accepts. This covers the preempt
+      // path (new prompt interrupting an in-flight one) and the
+      // stop-recovery window after a manual cancel.
       const SEND_RETRY_INTERVAL_MS = 500;
       const SEND_RETRY_TIMEOUT_MS = 30_000;
       // Cold-start rejections recover in seconds (observed); a longer budget
@@ -1590,6 +1601,7 @@ export async function runOneTurn(
           : { sessionId: zcodeSid, content: sendText };
       const sendT0 = Date.now();
       let sendAttempt = 0;
+      let queuedNoticeSent = false;
       while (true) {
         if (turn.cancelled) {
           stopBackendTurn(server, zcodeSid, turn);
@@ -1601,9 +1613,13 @@ export async function runOneTurn(
         // will reject an immediate send. On the first attempt with no recent
         // cancel, send immediately so normal prompts aren't delayed.
         const recentCancel = server.lastCancelledAt.get(zcodeSid);
+        // With whole-turn busy semantics a rejection is cheap and retried —
+        // no need to pre-sleep after a cancel on such backends.
         const expectBusy =
           sendAttempt > 1 ||
-          (recentCancel !== undefined && Date.now() - recentCancel < SEND_RETRY_TIMEOUT_MS);
+          (!server.observedSendBusyReject &&
+            recentCancel !== undefined &&
+            Date.now() - recentCancel < SEND_RETRY_TIMEOUT_MS);
         if (expectBusy) {
           await sleep(SEND_RETRY_INTERVAL_MS);
           if (turn.cancelled) {
@@ -1615,6 +1631,15 @@ export async function runOneTurn(
         if (!sendResp.error) {
           const accepted = (sendResp.result ?? {}) as { accepted?: boolean };
           if (accepted.accepted) {
+            // A retried send means another turn (typically the cancelled
+            // one) was still unwinding during our attempts and commits its
+            // residue AFTER this turn's pre-send baseline. The drain gate
+            // re-baselines after its wait; the fast path has no wait, so
+            // re-baseline here or the completion diff replays that residue
+            // as this turn's output.
+            if (sendAttempt > 1) {
+              differ.markSeen(await fetchMessages(server, zcodeSid));
+            }
             // From this moment the turn may own a running generation —
             // stopBackendTurn's compaction guard no longer spares it.
             turn.sendAccepted = true;
@@ -1628,6 +1653,19 @@ export async function runOneTurn(
           sendErrCode === 1308 ||
           sendErrMsg.includes("prompt is running") ||
           sendErrMsg.includes("already running");
+        // Whole-turn busy rejection observed (code AND message: -32010 is
+        // shared by unrelated errors, e.g. "Subagent sessions are read-only")
+        // — this backend never accepts a mid-turn send as steer. Disarm the
+        // drain gate's pre-send poll for the rest of this backend process.
+        if (
+          isBusy &&
+          sendErrCode === -32010 &&
+          sendErrMsg.includes("already running") &&
+          !server.observedSendBusyReject
+        ) {
+          server.observedSendBusyReject = true;
+          log("  [send] whole-turn busy rejection observed — drain gate disarmed for this backend");
+        }
         const isWarming = isTransientSendError(sendResp.error.message ?? "");
         if (!isBusy && !isWarming) {
           // Permanent error (auth, malformed, a truly removed model, …) —
@@ -1681,6 +1719,14 @@ export async function runOneTurn(
             `zcode send failed: ${isBusy ? "backend still busy" : "send keeps being rejected"} after ${Math.round(budget / 1000)}s (${sendResp.error.message ?? ""})`,
           );
         }
+        // Fast-path parity with the drain gate's wait note: the pre-send
+        // poll was skipped (whole-turn busy semantics), so this busy wait is
+        // the first thing telling the user their prompt queues behind a
+        // turn. Legacy backends got the note from the drain itself.
+        if (isBusy && !drainRan && !queuedNoticeSent && !turn.goalLoop) {
+          queuedNoticeSent = true;
+          await sendTextChunk(cx, acpSid, messages().promptQueuedBehindTurn, randomUUID());
+        }
         log(
           `  [send] backend ${isBusy ? "busy" : "cold-start reject"} (${sendResp.error.message ?? ""}), retrying in ${SEND_RETRY_INTERVAL_MS}ms`,
         );
@@ -1698,9 +1744,10 @@ export async function runOneTurn(
       try {
         // Event-driven turn loop: translate events via EventTranslator + dispatch.
         // Arm the attribution gate also on a recent cancel: the abandoned turn
-        // is still finalising in the backend (session/stop is not honored —
-        // verified 0.16.5), and its leftover deltas stream past the subscribe
-        // of this new prompt (see the gate comment in runEventTurn).
+        // is still finalising in the backend (stops are honored on 0.16.9 but
+        // finalisation still trails the stop), and its leftover deltas stream
+        // past the subscribe of this new prompt (see the gate comment in
+        // runEventTurn).
         const gateArmed =
           preempted ||
           Date.now() - (server.lastCancelledAt.get(zcodeSid) ?? 0) < CANCEL_RESIDUE_WINDOW_MS;
@@ -3166,6 +3213,74 @@ export async function runEventTurn(
   let thinkingHintSent = false;
   const THINKING_HINT_DELAY_MS = 1200;
 
+  // Sub-agent visibility (session/subagents RPC, 0.16.9): the model can run
+  // sub-agents for minutes behind a silent stream — the watermark keeps
+  // moving but the editor shows nothing. Piggyback on the stall-reconcile
+  // cadence (it fires exactly in those quiet phases) to poll the backend's
+  // sub-agent roster and surface CHANGES as one-line text updates, plus a
+  // one-shot terminal summary when the roster drains. Best-effort: probe
+  // failures (old backends answer -32601) are silent and never affect the
+  // turn.
+  let lastSubagentLine = "";
+  let subagentEndedBaseline: number | null = null;
+  let subagentEndedLineSent = false;
+  const turnEpoch = Date.now();
+  const pollSubagentsOnce = async (): Promise<void> => {
+    if (turn.cancelled) return;
+    let result: unknown;
+    try {
+      const resp = await backend.request(
+        server.nextId(),
+        "session/subagents",
+        { sessionId: turn.zcodeSid },
+        8000,
+      );
+      if (resp.error || resp.result === undefined) return;
+      result = resp.result;
+    } catch {
+      return;
+    }
+    const roster = result as {
+      running?: Array<{ status?: string }>;
+      ended?: { total?: number; items?: Array<{ status?: string; endedAt?: number }> };
+    };
+    const running = Array.isArray(roster.running) ? roster.running : [];
+    const endedTotal = typeof roster.ended?.total === "number" ? roster.ended.total : 0;
+    if (subagentEndedBaseline === null) subagentEndedBaseline = endedTotal;
+    if (running.length > 0) {
+      const count = (status: string) => running.filter((a) => a.status === status).length;
+      const line = messages().subagentStatusLine(
+        count("running"),
+        count("waiting"),
+        count("blocked"),
+      );
+      if (line !== lastSubagentLine) {
+        lastSubagentLine = line;
+        await sendTextChunk(cx, acpSid, line, randomUUID());
+      }
+    } else if (lastSubagentLine !== "") {
+      lastSubagentLine = "";
+      const endedDuringTurn = (roster.ended?.items ?? []).filter(
+        (item) => typeof item.endedAt === "number" && item.endedAt >= turnEpoch - 5_000,
+      );
+      if (
+        !subagentEndedLineSent &&
+        subagentEndedBaseline !== null &&
+        endedTotal > subagentEndedBaseline
+      ) {
+        subagentEndedLineSent = true;
+        const failed = endedDuringTurn.filter((item) => item.status === "failed").length;
+        const cancelled = endedDuringTurn.filter((item) => item.status === "cancelled").length;
+        await sendTextChunk(
+          cx,
+          acpSid,
+          messages().subagentEndedLine(endedTotal - subagentEndedBaseline, failed, cancelled),
+          randomUUID(),
+        );
+      }
+    }
+  };
+
   const recordProtocolProgress = (): void => {
     lastProtocolProgressAt = Date.now();
     nextNoProgressDecisionAt = lastProtocolProgressAt + NO_PROGRESS_MS;
@@ -3360,6 +3475,7 @@ export async function runEventTurn(
         const proj = await monitor.pollOnce();
         noteWatermark(proj);
         await forwardAuthoritativeProgress();
+        await pollSubagentsOnce();
         if (proj?.status === "idle") {
           // A single idle probe can also fire mid-work: the backend is silent
           // during the model's thinking/connection phase and may report idle
