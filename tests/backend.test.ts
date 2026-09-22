@@ -11,7 +11,9 @@
  * against the real zcode binary in CI.
  */
 
-import { describe, expect, it } from "vitest";
+import { once } from "node:events";
+
+import { describe, expect, it, vi } from "vitest";
 
 import { ZcodeBackend, type EventListener } from "../src/backend/client.js";
 import type { ZcodeEvent, ZcodeInbound } from "../src/backend/types.js";
@@ -227,5 +229,41 @@ describe("ZcodeBackend spawn failure (ENOENT)", () => {
     const resp = await b.request(1, "ping", {}, 500);
     expect(resp.error).toBeDefined();
     await b.close();
+  });
+});
+
+describe("backend exit diagnostics", () => {
+  it("retains bounded stderr and exit status without consuming protocol stdout", async () => {
+    let diagnostic = "";
+    const stderr = vi.spyOn(process.stderr, "write").mockImplementation((chunk) => {
+      diagnostic += String(chunk);
+      return true;
+    });
+    const b = new ZcodeBackend(
+      [
+        process.execPath,
+        "-e",
+        `
+      process.stdin.once('data', data => {
+        const { id } = JSON.parse(data.toString());
+        process.stdout.write(JSON.stringify({ id, result: { ok: true } }) + '\\n');
+        process.stderr.write('x'.repeat(8000) + 'missing provider config', () => process.exit(1));
+      });
+    `,
+      ],
+      process.env,
+    );
+    const closed = once(b.proc, "close");
+    try {
+      expect((await b.request(1, "probe")).result).toEqual({ ok: true });
+      await closed;
+      expect(diagnostic).toContain("code=1 signal=null");
+      expect(diagnostic).toContain("missing provider config");
+      expect(diagnostic.length).toBeLessThan(4600);
+      expect((await b.request(2, "probe")).error).toBeDefined();
+    } finally {
+      stderr.mockRestore();
+      await b.close();
+    }
   });
 });

@@ -101,6 +101,11 @@ Note: the `zcode` backend subprocess always needs real Node (it uses
 `node:sea`, which Bun does not implement) — installing Bun changes the
 runtime of the bridge/hub only, and Node >= 22 remains a requirement.
 
+Desktop provider tables are discovered next to the resolved CLI installation.
+For custom layouts, supply `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` and
+`ZCODE_PERSONAL_PROVIDER_CONFIG_FILE`; explicit paths take precedence.
+See [backend startup troubleshooting](docs/TROUBLESHOOTING.md#desktop-cli-exits-with-无法定位-cli-zcode-built-in-provider-config).
+
 ### `ZCODE_BIN` per platform
 
 The CLI is resolved in this order: `ZCODE_BIN` → a `zcode` found on `PATH` →

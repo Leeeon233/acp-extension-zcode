@@ -7,7 +7,7 @@
  * "app-server", "--stdio"]` with an explicit, sqlite-capable Node binary.
  */
 
-import { existsSync, readdirSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -182,4 +182,48 @@ export function resolveZcodeCommand(): string[] {
       "(may fail under GUI launch)",
   );
   return [zcodeBin, ...backendArgs()];
+}
+
+/**
+ * Desktop bundles keep the provider table outside glm/, unlike npm installs.
+ * Resolve against the actual launched entry (including symlinks), before any
+ * sandbox wrapping. Explicit host paths stay authoritative. Pair the builtin
+ * path with an existing personal config to prevent CLI revision remapping.
+ */
+export function builtinProviderEnv(
+  argv: readonly string[],
+  env: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  const builtinKey = "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE";
+  const personalKey = "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE";
+  let builtin = env[builtinKey]?.trim();
+  if (!builtin) {
+    const entry = argv[argv.indexOf("app-server") - 1];
+    if (!entry) return {};
+    let realEntry: string;
+    try {
+      realEntry = realpathSync(entry);
+    } catch {
+      return {}; // Missing binaries retain the normal spawn error path.
+    }
+    if (!/\.(cjs|mjs|js)$/.test(realEntry)) return {};
+    const dir = path.dirname(realEntry);
+    builtin = [
+      path.join(dir, "provider", "zcode-builtin.json"),
+      path.join(dir, "..", "config", "provider", "zcode-builtin.json"),
+    ].find((candidate) => existsSync(candidate));
+  }
+  if (!builtin) return {};
+  const result: NodeJS.ProcessEnv = { [builtinKey]: builtin };
+  const personal =
+    env[personalKey]?.trim() ||
+    path.join(
+      env.ZCODE_DATA_BASE_DIR?.trim() || os.homedir(),
+      ".zcode",
+      "v2",
+      "provider_config.json",
+    );
+  // Do not invent a personal config on a fresh install; let the CLI bootstrap it.
+  if (env[personalKey]?.trim() || existsSync(personal)) result[personalKey] = personal;
+  return result;
 }

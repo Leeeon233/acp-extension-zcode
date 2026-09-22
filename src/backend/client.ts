@@ -56,6 +56,8 @@ export class ZcodeBackend {
   // is delivered to every registered listener for the session.
   private readonly listeners = new Map<string, Set<EventListener>>();
   private readerDead = false;
+  private closing = false;
+  private stderrTail = "";
   /** Monotonic id for fire-and-forget sends (send()). Uses a high range to
    *  avoid collisions with the server's request ids (low range). */
   private sendIdCounter = 1_000_000_000;
@@ -64,7 +66,7 @@ export class ZcodeBackend {
 
   constructor(argv: string[], env: NodeJS.ProcessEnv) {
     this.proc = spawn(argv[0]!, argv.slice(1), {
-      stdio: ["pipe", "pipe", "ignore"],
+      stdio: ["pipe", "pipe", "pipe"],
       env,
       detached: true, // own process group → kill(-pid) reaps the whole tree
     });
@@ -86,6 +88,18 @@ export class ZcodeBackend {
     this.proc.stdin?.on("error", (err) => {
       this.readerDead = true;
       warn(`backend: stdin error: ${err.message}`);
+    });
+    // Keep a bounded diagnostic tail, never forward backend output to ACP stdout.
+    this.proc.stderr?.setEncoding("utf8");
+    this.proc.stderr?.on("data", (chunk: string) => {
+      this.stderrTail = (this.stderrTail + chunk).slice(-4096);
+    });
+    this.proc.on("close", (code, signal) => {
+      if (!this.closing) {
+        warn(`backend: process closed (code=${code} signal=${signal})`);
+        if (this.stderrTail.trim()) warn(`backend: stderr tail: ${this.stderrTail.trim()}`);
+      }
+      this.stderrTail = "";
     });
     this.startReader();
     this.startWatchdog();
@@ -397,6 +411,7 @@ export class ZcodeBackend {
    * leaving orphans).
    */
   async close(): Promise<void> {
+    this.closing = true;
     const proc = this.proc;
     if (!proc.pid) return;
     try {

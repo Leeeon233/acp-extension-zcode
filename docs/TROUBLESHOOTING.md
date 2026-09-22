@@ -34,6 +34,32 @@
    - Confirm a `provider` is enabled
    - Confirm `models` are defined
 
+### Desktop CLI exits with “无法定位 CLI ZCode Built-in Provider Config”
+
+Desktop bundles place `zcode-builtin.json` under `Resources/config/provider/`,
+while their CLI entry is under `Resources/glm/`. The CLI's standalone lookup
+can miss this layout. The bridge now resolves the real entry path (including
+symlinks) and injects `ZCODE_BUILTIN_PROVIDER_CONFIG_FILE` from either
+`<entry-dir>/provider/` or `<entry-dir>/../config/provider/` before spawning.
+
+An explicit non-empty provider path supplied by the host takes precedence.
+When available, `ZCODE_PERSONAL_PROVIDER_CONFIG_FILE` is passed alongside it,
+using the existing `<data-base>/.zcode/v2/provider_config.json`; `data-base`
+follows `ZCODE_DATA_BASE_DIR`, then the user's home. Passing both paths keeps
+the CLI from remapping the builtin config revision. No personal file is created
+by the bridge on a fresh install.
+
+For custom layouts or cache-only CLI copies without adjacent provider tables,
+set those two variables to the actual files belonging to the installation.
+The bridge now logs the backend exit code/signal and the final 4096 characters
+of stderr on unexpected process closure, even without `ZCODE_ACP_DEBUG=1`.
+Check that diagnostic instead of repeatedly retrying `backend dead`.
+
+This fixes provider discovery at startup, not newer backend protocol changes.
+A subsequent `Method not found: workspace/updateProviderRegistry` requires a
+separate provider-registry compatibility update. Background:
+[upstream issue #202](https://github.com/william0wang/zcode-acp/issues/202).
+
 ### Authentication / credential errors (401, provider auth failed)
 
 **Symptom:** turns fail with authentication errors (e.g. `401`, `provider auth failed`, `invalid api key`), or `~/.zcode/v2/config.json` is missing.

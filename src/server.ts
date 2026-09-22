@@ -10,6 +10,7 @@
 import type * as acp from "@agentclientprotocol/sdk";
 
 import {
+  builtinProviderEnv,
   loadZcodeCredentials,
   mergeEnvWithCreds,
   resolveZcodeCommand,
@@ -384,6 +385,7 @@ export class ZcodeAcpServer {
     if (this.backend && !this.backend.isDead) return this.backend;
     const env = mergeEnvWithCreds(loadZcodeCredentials());
     let argv = resolveZcodeCommand();
+    Object.assign(env, builtinProviderEnv(argv, env));
     this.backendSandboxed = sandboxActive(this.sandboxRoots());
     if (this.backendSandboxed) {
       const { workspaces, extraAllow } = collectSandboxWorkspaces(this.sandboxRoots());
