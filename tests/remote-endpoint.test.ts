@@ -496,6 +496,12 @@ describe("hub cross-instance session dedupe", () => {
   }
 
   it("keeps one copy of a session: freshest updatedAt, then newest instance", async () => {
+    // The hub timestamps first registration itself; client startedAt is ignored.
+    // Advance only Date.now so real HTTP/timers keep working without same-ms races.
+    const now = vi.spyOn(Date, "now").mockReturnValue(1000);
+    trackStop(() => {
+      now.mockRestore();
+    });
     const hub = await startHub({ port: 0, host: "127.0.0.1", token: TOKEN });
     trackStop(() => hub.close());
 
@@ -503,34 +509,38 @@ describe("hub cross-instance session dedupe", () => {
       id: "old",
       port: 18001,
       pid: 1,
-      startedAt: 1000,
       workspace: "/proj",
       sessions: [
         { sessionId: "sess_x", updatedAt: 500 }, // stale copy of x
         { sessionId: "sess_only_old", updatedAt: 900 },
       ],
     });
+    now.mockReturnValue(2000);
     await register(hub.port, {
       id: "new",
       port: 18002,
       pid: 2,
-      startedAt: 2000,
       workspace: "/proj",
       sessions: [
         { sessionId: "sess_x", updatedAt: 800 }, // driving x → wins by updatedAt
         { sessionId: "sess_tie", updatedAt: 700 },
       ],
     });
+    now.mockReturnValue(3000);
     await register(hub.port, {
       id: "newest",
       port: 18003,
       pid: 3,
-      startedAt: 3000,
       workspace: "/proj",
       sessions: [{ sessionId: "sess_tie", updatedAt: 700 }], // tie → newest startedAt wins
     });
 
     const list = await instances(hub.port);
+    expect(list.map((i) => [i.id, i.startedAt])).toEqual([
+      ["old", 1000],
+      ["new", 2000],
+      ["newest", 3000],
+    ]);
     const byId = new Map(list.map((i) => [i.id, i.sessions.map((s) => s.sessionId)]));
     expect(byId.get("old")).toEqual(["sess_only_old"]); // lost sess_x
     expect(byId.get("new")).toEqual(["sess_x"]); // won sess_x, lost sess_tie
