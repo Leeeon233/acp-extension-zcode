@@ -2,15 +2,24 @@
  * ZCode-specific session method handlers (non-standard ACP extensions).
  *
  * Thin passthroughs for the extended session/* methods (0.14.8+):
- * fork/goal/compact/cancelBackgroundTask +
- * 0.15.0+: setThoughtLevel/updateRuntimeModelConfig/setModel/setMode.
- * (rewind/rewindCascade/steer existed up to 0.15.x; app-server 0.16+ removed
- * them in favor of the v4 conversation API, so the bridge dropped them.)
+ * fork/goal/compact/cancelBackgroundTask + 0.15.0+: setThoughtLevel/setModel/
+ * setMode. (rewind/rewindCascade/steer existed up to 0.15.x; app-server 0.16+
+ * removed them in favor of the v4 conversation API, so the bridge dropped
+ * them. The bridge's own `session/updateRuntimeModelConfig` passthrough was
+ * removed 2026-09: the method is absent from the 0.16.9 enum — every call
+ * answered -32601 — and `applyModelSwitch` already speaks the modern
+ * `session/setModel` shape with a legacy fallback.)
  *
  * These share a near-identical shape (resolve sid → build params → forward →
  * check error). Only the genuine per-method differences are spelled out:
  * fork's new sid mapping, compact/goal(set)'s internal-turn lock wait, and
- * setModel rerouting through updateRuntimeModelConfig.
+ * setModel routing through applyModelSwitch.
+ *
+ * The settings methods (setModel/setThoughtLevel/setMode) emit the
+ * config_option_update broadcast afterwards: session settings are
+ * per-SESSION, so a switch from any attached client must refresh the
+ * others (phone ↔ CLI window). They receive the broadcast-proxy cx, whose
+ * notify already fans out to every connection.
  */
 
 import { randomUUID } from "node:crypto";
@@ -20,11 +29,11 @@ import { emitInitialUsage } from "../config/model-cache.js";
 import { applyModelSwitch } from "../config/runtime-model.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
 import { withLodyActivity } from "../lody.js";
+import { emitConfigOptionUpdate, rememberModelChoice } from "../config/options.js";
 import { ProjectionDiffer } from "../translators/projection-differ.js";
 import { clientConnectionRoot, log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
-import { sendSessionUpdate } from "./io.js";
-import { ensureRealSession } from "./session.js";
+import { cacheModelAvailability, ensureRealSession } from "./session.js";
 
 /** Build the zcode `target` object from ACP params (checkpoint or latest). */
 function buildCheckpointTarget(params: ExtensionParams): unknown {
@@ -104,7 +113,10 @@ export async function fork(
 
   // The fork is a real backend session; use its id as the ACP session id (the
   // same convention the ZCode extension and session/list already use).
+  cacheModelAvailability(server, forkedSessionId, result);
   server.registerSession(forkedSessionId, forkedSessionId);
+  const srcMcp = server.sessionMcpServers.get(acpSid);
+  if (srcMcp) server.sessionMcpServers.set(forkedSessionId, srcMcp);
   server.ensureBackgroundListener(forkedSessionId);
   server.markBackendLoaded(forkedSessionId);
   const sourceCwd = server.sessionCwds.get(acpSid);
@@ -178,22 +190,51 @@ export async function compact(
     _meta: withLodyActivity({}, { version: 1, kind: "context_compaction" }),
   });
   try {
+    // `/compact <focus>` (or a direct ACP call) forwards the focus text as
+    // compact instructions (0.16.9 params: {sessionId, inputId?, instructions?,
+    // expectedRevision?}).
+    const zcParams: Record<string, unknown> = { sessionId: zcodeSid };
+    const instructions = typeof params.instructions === "string" ? params.instructions.trim() : "";
+    if (instructions) zcParams.instructions = instructions;
+    const startedAt = Date.now();
     const resp = await server
       .ensureBackend()
-      .request(server.nextId(), "session/compact", { sessionId: zcodeSid }, 30000);
+      .request(server.nextId(), "session/compact", zcParams, 30000);
     if (resp.error) throw new Error(`compact failed: ${resp.error.message}`);
+    const ack = ((resp.result ?? {}) as { compact?: { state?: string } }).compact?.state;
+    const alreadyRunning = ack === "already_running";
+    if (alreadyRunning) {
+      // Another compaction (e.g. started from the desktop app) is mid-flight;
+      // the same lock wait below settles when THAT run ends.
+      log("session/compact → already_running (another compaction is mid-flight)");
+    }
     // compact's internal AI turn (read history → LLM compress → write back) can
     // take minutes; expectLock=true avoids the startup-delay false-success window.
     // timeout is in MILLISECONDS (Date.now()-based), not seconds — Python's
     // timeout=300 becomes 300000. A bare 300 expires on the first probe sleep,
     // making compact return "✓" while the internal turn lock is still held.
     const released = await waitForTurnIdle(server, zcodeSid, 300_000, "session/goal", true);
-    if (released) {
+    // The RPC ack is "accepted", never whether the background turn SUCCEEDED —
+    // failures are swallowed into a state.updated notification (source:
+    // runCompactTurnInBackground → afterStateMutation). Read the recorded
+    // outcome; the lock wait can return a tick before the broadcast lands, so
+    // accept outcomes from shortly before our own RPC onward. Optional chaining:
+    // test harnesses build partial servers without this map.
+    const outcome = server.compactOutcomes?.get(zcodeSid);
+    const failed =
+      released === true &&
+      outcome !== undefined &&
+      outcome.at >= startedAt - 1500 &&
+      (outcome.reason === "session_compact_failed" ||
+        outcome.reason === "session_compact_cancelled");
+    if (failed) {
+      warn(`session/compact → backend reported ${outcome!.reason} (context NOT compressed)`);
+    } else if (released) {
       log("session/compact → ok (lock released)");
     } else {
       warn("session/compact → ⚠ lock wait timeout (backend may still be compacting)");
     }
-    if (released) {
+    if (released && !failed) {
       // Refresh usage so the UI reflects the reduced contextUsed post-compact.
       // Ensure a differ exists (compact may be the first action on a fresh session)
       // and sync its usage baseline so the next turn won't re-emit the same value.
@@ -203,12 +244,17 @@ export async function compact(
         server.differs.set(zcodeSid, differ);
       }
       await emitInitialUsage(server, cx, acpSid, zcodeSid, differ);
-      activityStatus = "completed";
     }
-    // Surface the lock-timeout to the slash-command path so it can warn the user
-    // (the ACP method path ignores this non-standard flag). Mirrors Python's
+    // Surface the outcomes to the slash-command path so it can tell the user
+    // (the ACP method path ignores these non-standard flags). Mirrors Python's
     // "⚠ 压缩超时" branch in _handle_slash_command.
-    return { ...((resp.result ?? {}) as Result), __lockTimeout: !released };
+    if (released && !failed) activityStatus = "completed";
+    return {
+      ...((resp.result ?? {}) as Result),
+      __lockTimeout: !released,
+      __compactFailed: failed,
+      __alreadyRunning: alreadyRunning,
+    };
   } finally {
     await server.notifyByZcodeSid(zcodeSid, {
       sessionUpdate: "tool_call_update",
@@ -257,6 +303,7 @@ export async function cancelBackgroundTask(
 export async function setThoughtLevel(
   server: ZcodeAcpServer,
   params: ExtensionParams,
+  cx: acp.AgentContext,
 ): Promise<Result> {
   const zcodeSid = await resolveSidOrThrow(server, params);
   // 3.3.0 marks thoughtLevel optional (omitting it resets to the model's
@@ -268,36 +315,38 @@ export async function setThoughtLevel(
     .request(server.nextId(), "session/setThoughtLevel", zcParams, 15000);
   if (resp.error) throw new Error(`setThoughtLevel failed: ${resp.error.message}`);
   log("session/setThoughtLevel → ok");
+  // Remember for the post-resume re-assert (the backend's own selection
+  // persistence can be lost — see reassertModelChoice in session.ts). A
+  // RESET (absent/null level) must be remembered as an EMPTY level: skipping
+  // the record would leave the stale level in memory and the re-assert
+  // would resurrect it (turn thinking back on) after every resume.
+  const level = typeof params.thoughtLevel === "string" ? params.thoughtLevel : undefined;
+  rememberModelChoice(server, params.sessionId, zcodeSid, { thought: level ?? "" });
+  // Session settings are per-session, not per-connection: a switch from the
+  // phone must refresh the CLI window's dropdown (and vice versa) — emit the
+  // config_option_update to every attached client, not just the switcher.
+  await emitConfigOptionUpdate(server, cx, params.sessionId, zcodeSid, "thought");
   return (resp.result ?? {}) as Result;
 }
 
-/** session/updateRuntimeModelConfig → same: runtime overlay of session model config. */
-export async function updateRuntimeModelConfig(
+/** session/setModel → applyModelSwitch (modern session/setModel shape first,
+ * legacy overlay fallback for pre-3.12 builds). */
+export async function setModel(
   server: ZcodeAcpServer,
   params: ExtensionParams,
+  cx: acp.AgentContext,
 ): Promise<Result> {
-  const zcodeSid = await resolveSidOrThrow(server, params);
-  const runtimeModel = params.runtimeModel;
-  if (!runtimeModel) throw new Error("updateRuntimeModelConfig requires runtimeModel");
-  const zcParams: Record<string, unknown> = { sessionId: zcodeSid, runtimeModel };
-  if (params.applyModelSelection !== undefined)
-    zcParams.applyModelSelection = params.applyModelSelection;
-  const resp = await server
-    .ensureBackend()
-    .request(server.nextId(), "session/updateRuntimeModelConfig", zcParams, 15000);
-  if (resp.error) throw new Error(`updateRuntimeModelConfig failed: ${resp.error.message}`);
-  log("session/updateRuntimeModelConfig → ok");
-  return (resp.result ?? {}) as Result;
-}
-
-/** session/setModel → applyModelSwitch (runtime overlay, not persistence). */
-export async function setModel(server: ZcodeAcpServer, params: ExtensionParams): Promise<Result> {
   const zcodeSid = await resolveSidOrThrow(server, params);
   const modelId = params.modelId as string;
   if (!modelId) throw new Error("setModel requires modelId");
   const ok = await applyModelSwitch(server, zcodeSid, modelId);
   if (!ok) throw new Error("setModel failed (model switch rejected)");
-  log(`session/setModel → ${modelId} (updateRuntimeModelConfig)`);
+  log(`session/setModel → ${modelId} (applyModelSwitch)`);
+  // Remember for the post-resume re-assert (see reassertModelChoice in
+  // session.ts — the backend's own selection persistence can be lost).
+  rememberModelChoice(server, params.sessionId, zcodeSid, { model: modelId });
+  // Broadcast so the other attached clients' dropdowns follow the switch.
+  await emitConfigOptionUpdate(server, cx, params.sessionId, zcodeSid, "model");
   return {};
 }
 
@@ -321,20 +370,12 @@ export async function setMode(
   if (resp.error) throw new Error(`setMode failed: ${resp.error.message}`);
   log(`session/setMode → ${mode}`);
   // Re-build configOptions (settings.mode.current is now updated) and emit
-  // config_option_update + current_mode_update so the editor UI reflects it.
-  const options = await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx));
-  await sendSessionUpdate(cx, acpSid, {
-    sessionUpdate: "config_option_update",
-    configOptions: options,
-  });
-  const modes = await buildModes(server, zcodeSid);
-  await sendSessionUpdate(cx, acpSid, {
-    sessionUpdate: "current_mode_update",
-    currentModeId: modes.currentModeId,
-  });
+  // config_option_update + current_mode_update to EVERY attached client, so
+  // the editor UI reflects it no matter which connection switched.
+  const { currentModeId } = await emitConfigOptionUpdate(server, cx, acpSid, zcodeSid, "mode");
   // Record the advertised mode so the turn-completion reconciliation knows the
   // client has already been told about this value.
-  server.lastMode.set(acpSid, modes.currentModeId);
+  if (currentModeId !== undefined) server.lastMode.set(acpSid, currentModeId);
   return (resp.result ?? {}) as Result;
 }
 
@@ -383,7 +424,10 @@ export async function waitForTurnIdle(
       10000,
     );
     const errMsg = resp.error?.message ?? "";
-    if (errMsg.includes("prompt is running")) {
+    // 0.16.5 spelled the busy lock "…prompt is running…"; 0.16.9 says
+    // "A prompt is already running for this session" — match both (source:
+    // server-operations.ts sendPrompt's -32010).
+    if (errMsg.includes("prompt is running") || errMsg.includes("already running")) {
       log(
         `  [probe] #${probeCount} @${elapsed}s: LOCK HELD ("${errMsg.slice(0, 60)}") → lockSeen=true`,
       );
@@ -397,6 +441,14 @@ export async function waitForTurnIdle(
       continue;
     }
     if (resp.error) {
+      // A dead reader is NOT a release — the internal turn died with the
+      // backend, and reading it as "released" reported a false "✓ compressed"
+      // on backend loss (sandbox allow-restart, crash). Fail honestly; the
+      // next end_turn re-arms the compaction on the respawned backend.
+      if (errMsg.includes("backend reader exited")) {
+        log(`  [probe] #${probeCount} @${elapsed}s: backend reader DEAD → not released`);
+        return false;
+      }
       if (lockSeen) {
         log(
           `  [probe] #${probeCount} @${elapsed}s: NON-LOCK error after lock → released (err="${errMsg.slice(0, 50)}")`,

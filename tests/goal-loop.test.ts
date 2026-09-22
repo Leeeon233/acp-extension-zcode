@@ -41,9 +41,12 @@ vi.mock("../src/handlers/io.js", async (importOriginal) => {
 /**
  * Scripted history: each scriptRound() queues the assistant reply that lands
  * when runOneTurn is invoked for it (a reply exists only after its turn).
- * Every fetchMessages call then sees the full history delivered so far —
- * matching the real backend, and the driver's three per-round reads
- * (count / tool activity / verdict text) all observe the same world.
+ * The fetchMessages mock mirrors the backend's session/messages handler:
+ * afterMessageId is an EXCLUSIVE forward cursor (an unknown id answers with
+ * the whole store) and limit caps the tail (server-operations.ts:1865-1876).
+ * The driver's per-round reads therefore observe the same world the real
+ * backend would show them: lastMessageId's limit:1 tail, the round's
+ * post-anchor window, and the verify turn's post-vBefore window.
  */
 const fetchMessagesState: Array<{ role: "assistant" | "user"; text: string; tools?: boolean }> = [];
 const pendingReplies: Array<{ role: "assistant" | "user"; text: string; tools?: boolean }> = [];
@@ -52,14 +55,23 @@ vi.mock("../src/handlers/replay.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/handlers/replay.js")>();
   return {
     ...actual,
-    fetchMessages: async () =>
-      fetchMessagesState.map((m) => ({
-        info: { role: m.role },
+    fetchMessages: async (
+      _server: unknown,
+      _sid: string,
+      opts?: { afterMessageId?: string | null; limit?: number },
+    ) => {
+      const all = fetchMessagesState.map((m, i) => ({
+        info: { id: `m${i}`, role: m.role },
         parts: [
           ...(m.tools ? [{ type: "tool", callId: "c" }] : []),
           ...(m.text ? [{ type: "text", text: m.text }] : []),
         ],
-      })),
+      }));
+      const after = opts?.afterMessageId;
+      const afterIndex = after ? all.findIndex((m) => m.info.id === after) : -1;
+      const scoped = afterIndex >= 0 ? all.slice(afterIndex + 1) : all;
+      return opts?.limit ? scoped.slice(-opts.limit) : scoped;
+    },
   };
 });
 
@@ -79,6 +91,8 @@ function makeServer(root: string): never {
     goalLoops: new Map(),
     modelCache: new Map(),
     lastCancelledAt: new Map(),
+    // stopBackendTurn consults this (compaction kill guard) — mirror the shape.
+    autoCompactInFlight: new Set<string>(),
     sessionAliases: (sid: string) => [sid],
     clients: { broadcast: () => ({ notify: async () => undefined }) },
     ensureBackend: () => ({ request }),
@@ -235,6 +249,61 @@ describe("goal-loop driver", () => {
     expect(driver["state"].status).toBe("impossible");
     expect(driver["state"].endedReason).toBe("no api access");
   });
+
+  it("waits out a running compaction and retries a compact-rejected round", async () => {
+    vi.stubEnv("ZCODE_ACP_LANG", "en");
+    const server: { autoCompactInFlight: Set<string> } = makeServer(root);
+    // A compaction is in flight at loop start: runGoalTurn's pre-round wait
+    // polls it (500ms ticks) instead of hitting the compaction gate.
+    server.autoCompactInFlight.add("zsid-1");
+    setTimeout(() => server.autoCompactInFlight.delete("zsid-1"), 50);
+    // The decompose round is then busy-rejected by a compaction that armed
+    // in the arm-race window — the retry (flag now clear) succeeds.
+    runOneTurn.mockImplementationOnce(
+      async (_srv: unknown, opts: { turn: { compactRejected?: boolean } }) => {
+        opts.turn.compactRejected = true;
+        return { stopReason: "max_turn_requests" };
+      },
+    );
+    scriptRound("```\n- t | x\n```"); // decompose retry
+    scriptRound("done\nVERDICT: met");
+    scriptRound("PASS");
+
+    const driver = await startLoop(server);
+    await waitSettled(driver);
+
+    expect(driver["state"].status).toBe("complete");
+    // decompose ran twice (rejected once, retried) + dispatch + verify.
+    expect(runOneTurn).toHaveBeenCalledTimes(4);
+    // The rejected round shows the neutral auto-resume note, never the
+    // user-directed resend notice (the driver retries by itself).
+    const notices = sendTextChunk.mock.calls.map((c) => String(c[2] ?? ""));
+    expect(notices.some((t) => t.includes("NOT sent"))).toBe(false);
+    expect(notices.filter((t) => t.includes("continues automatically"))).toHaveLength(1);
+  }, 15_000);
+
+  it("a round rejected twice (compaction never settles) pauses the loop, never counts as completed", async () => {
+    vi.stubEnv("ZCODE_ACP_LANG", "en");
+    const server: { autoCompactInFlight: Set<string> } = makeServer(root);
+    server.autoCompactInFlight.add("zsid-1");
+    setTimeout(() => server.autoCompactInFlight.delete("zsid-1"), 50);
+    const reject = async (_srv: unknown, opts: { turn: { compactRejected?: boolean } }) => {
+      opts.turn.compactRejected = true;
+      return { stopReason: "max_turn_requests" };
+    };
+    runOneTurn.mockImplementationOnce(reject);
+    runOneTurn.mockImplementationOnce(reject);
+
+    const driver = await startLoop(server);
+    await waitSettled(driver);
+
+    // Both decompose attempts rejected → run()'s crash path pauses cleanly;
+    // the round is not budgeted, no stale verdict is parsed, no ticket ran.
+    expect(driver["state"].status).toBe("paused-crash");
+    expect(driver["state"].rounds).toBe(0);
+    expect(driver["state"].tickets).toEqual([]);
+    expect(runOneTurn).toHaveBeenCalledTimes(2);
+  }, 15_000);
 
   it("pauses on a cancelled round (ESC) and preserves parked text", async () => {
     const server = makeServer(root);

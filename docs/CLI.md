@@ -24,20 +24,22 @@ no longer spawns a terminal UI.
 ## Quota cards
 
 Check plan usage from the terminal — no editor or running server needed. By
-default it shows both **GLM Coding Plan** and **Opencode Go** in one card;
-pass a provider to focus on one.
+default it shows **GLM Coding Plan**, **Opencode Go**, and **Ollama Cloud**
+(when configured) in one card; pass a provider to focus on one.
 
 GLM credentials are read from `~/.zcode/v2/config.json`. Opencode Go
 credentials come from environment variables (the dashboard needs a browser
-cookie — see [Opencode Go setup](#opencode-go-setup) below).
+cookie — see [Opencode Go setup](#opencode-go-setup) below). Ollama Cloud
+needs an API key — see [Ollama Cloud setup](#ollama-cloud-setup) below.
 
 ```bash
-# Both providers (default): GLM + Opencode Go in one card
+# All configured providers (default): GLM + Opencode Go + Ollama Cloud
 zcode-acp quota
 
 # Focus on one provider
 zcode-acp quota glm        # GLM Coding Plan only
 zcode-acp quota go         # Opencode Go only (rolling + weekly + monthly)
+zcode-acp quota oc         # Ollama Cloud only (5h + weekly)
 
 # Live monitor: clear the screen and refresh every 30s (default)
 zcode-acp quota -w
@@ -71,20 +73,27 @@ node dist/cli.js quota -w
 
 Opencode Go has no JSON API for subscription usage — the CLI scrapes the
 authenticated dashboard at `opencode.ai/workspace/<id>/go`, so it needs your
-browser `auth` cookie. Credentials are read from two sources, **merged
-field-by-field with environment variables taking precedence** over the config
-file:
+browser `auth` cookie. Credentials are read from three sources, **merged
+field-by-field, highest precedence first**:
 
-- **Config file**: `~/.pi/agent/opencode-go.json` — same convention as the
-  `@beyona/pi-zai-usage` Pi extension, so if you already configured it there
-  you're done.
+- **Our config file** (`~/.config/zcode-acp/config.json`, `quota` section —
+  the preferred home):
   ```json
-  { "workspaceId": "wrk_your_workspace_id", "authCookie": "Fe26.2**your_cookie_value" }
+  { "quota": {
+      "opencodeGoWorkspaceId": "wrk_your_workspace_id",
+      "opencodeGoAuthCookie": "Fe26.2**your_cookie_value"
+  } }
   ```
-- **Environment variables** (override the matching file field):
+- **Environment variables** (override the legacy file below):
   ```bash
   export OPENCODE_GO_WORKSPACE_ID="wrk_your_workspace_id"
   export OPENCODE_GO_AUTH_COOKIE="Fe26.2**your_cookie_value"
+  ```
+- **Legacy config file**: `~/.pi/agent/opencode-go.json` — same convention as
+  the `@beyona/pi-zai-usage` Pi extension, kept so existing setups keep
+  working unchanged.
+  ```json
+  { "workspaceId": "wrk_your_workspace_id", "authCookie": "Fe26.2**your_cookie_value" }
   ```
 
 How to get the values:
@@ -96,8 +105,34 @@ How to get the values:
    `opencode.ai` → copy the value of the cookie named `auth` (it starts with
    `Fe26.2**`).
 
-Without credentials, the default dual-provider mode silently shows GLM only
+Without credentials, the default multi-provider mode silently shows GLM only
 (no error). Running `zcode-acp quota go` without credentials prints a setup hint.
+
+## Ollama Cloud setup
+
+Ollama Cloud exposes an (undocumented) usage endpoint at
+`ollama.com/api/usage` that the CLI queries with your API key. Create a key
+at [cloud.ollama.ai](https://cloud.ollama.ai) → API keys. The key comes from
+two sources, with the **config file taking precedence** over the environment
+variable:
+
+- **Config file** (`~/.config/zcode-acp/config.json`, `quota` section):
+  ```json
+  { "quota": { "ollamaApiKey": "your_ollama_api_key" } }
+  ```
+- **Environment variable** (fallback / one-off override):
+  ```bash
+  export OLLAMA_API_KEY="your_ollama_api_key"
+  ```
+
+The card shows whatever usage windows the account's plan exposes — legacy
+plans get `5h` + `Week` bars, current credit plans get a `Month` bar. The
+server returns fractions only, so reset moments are derived client-side
+(epoch-aligned 5h buckets, Monday 00:00 UTC weeks, and for monthly the
+`/api/me` billing period end or — on new credit plans, which return only a
+`CreatedAt` — the next subscription-day anniversary). Without a key, the
+default mode silently skips the Ollama section; `zcode-acp quota oc` without
+a key prints a setup hint.
 
 ## Hub and server subcommands
 

@@ -377,6 +377,17 @@ the ACP `session/prompt` result's `usage` field (UNSTABLE in
 agent-client-protocol), with `source`/`modelRequestCount`/web request counts
 riding in the result's `_meta.zcode.usage`.
 
+One field is normalized: the backend's `inputTokens` is cache-INCLUSIVE
+(OpenAI-style; verified `totalTokens == inputTokens + outputTokens` on live
+frames), while ACP's de-facto convention (claude-agent-acp, DeepSeek's
+dsh-token-meter four-bucket model) reports `inputTokens` EXCLUDING cache —
+clients compute hit rate as `cachedRead / (input + cachedRead + cachedWrite)`.
+The bridge therefore reports `inputTokens = backend inputTokens − cacheRead −
+cacheWrite` (clamped at 0) and keeps `totalTokens` verbatim (the backend's
+input+output sum equals the convention's four-bucket total). The untouched
+backend value rides in `_meta.zcode.usage.rawInputTokens` — present only when
+normalization actually changed the number.
+
 ```json
 {
   "method": "session/event",
@@ -944,6 +955,58 @@ The mechanism:
 `session/cancelBackgroundTask` for a background Bash task additionally emits
 `terminal_exit` with `_meta.backgroundTask.cancelled = true` so the terminal
 UI closes on cancellation.
+
+### Notification-turn busy window
+
+When a background task finishes, the backend's notification turn (the model
+summarising the result) holds the session's prompt lock for its whole
+duration — a fresh `session/send` during that window answers busy:
+
+```json
+{ "code": -32010, "message": "A prompt is already running for this session" }
+```
+
+(observed live against desktop 3.12.3 / app-server 0.16.5, 2026-09-18). The
+prompt path's busy-retry normally gives up after 30s, but a notification turn
+is a real model turn and easily outlives that budget. While the session's
+`BackgroundTaskListener` has a notification turn active
+(`server.notifyTurnActiveSince`), the bridge extends the busy budget to 180s
+instead of failing the user's prompt — the send is guaranteed accepted once
+the notification turn drains.
+
+### `session.titleUpdated`
+
+New in app-server 0.16.5 (verified live + schema-checked against the desktop
+3.12.3 bundle): the backend pushes authoritative conversation-title changes.
+
+```json
+{
+  "type": "session.titleUpdated",
+  "payload": {
+    "previousTitle": "",
+    "source": "generated",
+    "title": "Fix the login bug",
+    "messageID": "msg_…"
+  }
+}
+```
+
+`source` is one of `default` (nothing meaningful), `first_input` (the literal
+first prompt), `generated` (the backend's LLM-generated title, landing after
+the first turn), or `custom` (a user rename from another surface, e.g. the
+desktop app over the same session store).
+
+The bridge's session-scoped `SessionTitleListener` (registered alongside the
+background-task listener) adopts `generated` and `custom` pushes — updating
+`sessionTitles` for every ACP alias of the conversation, the session summary,
+the tasks-index, the martty terminal tab title, and broadcasting an ACP
+`session_info_update` to attached clients per alias. A manual rename wins:
+sessions renamed through the bridge's remote rename endpoint (or adopted via
+a `custom` push) are pinned in `server.titleUserSetBy`, and the durable
+`title_overridden` flag in `tasks-index.sqlite` is consulted for renames that
+predate the bridge process — later `generated` pushes never override them.
+`default`/`first_input` pushes are ignored — the bridge already seeds the
+first-prompt form itself (see "one-shot session title" in the handlers).
 
 ### `session/cancelBackgroundTask`
 

@@ -35,7 +35,7 @@ import {
 import path from "node:path";
 import process from "node:process";
 
-import { warn } from "./utils.js";
+import { warn, zcodeHomeDir } from "./utils.js";
 
 /** Placeholder alias record persisted in the store. */
 export interface LazySessionRecord {
@@ -43,6 +43,18 @@ export interface LazySessionRecord {
   /** Backend session id once the placeholder materialized (absent = never used). */
   zcodeSid?: string;
   createdAt: number;
+  /**
+   * Last model/thought choice the user set through this bridge (config
+   * spelling, e.g. "providerId\modelId"). The backend's own per-session
+   * selection entry can be LOST (session_entry has a session FK; setModel
+   * before the first prompt hits FOREIGN KEY — source: the row is only
+   * created at first input), and a resumed session then silently reverts to
+   * the workspace default. Re-applied after every resume (see
+   * reassertModelChoice in handlers/session.ts). `at` arbitrates recovery:
+   * several aliases can record choices for the SAME backend session
+   * (editor + TUI attach), so ensureRealSession re-seeds newer-wins.
+   */
+  modelChoice?: { model?: string; thought?: string; at?: number };
 }
 
 /** Store file lives next to config.json / tasks-index.sqlite under ~/.zcode/v2/. */
@@ -51,10 +63,9 @@ const STORE_FILENAME = "acp-lazy-sessions.json";
 /** NEVER-USED placeholders expire after 30 days; materialized records never do. */
 const TTL_MS = 30 * 24 * 60 * 60 * 1000;
 
-/** Resolved at call time so tests can stub HOME without re-importing. */
+/** Resolved at call time so tests can stub HOME/ZCODE_HOME without re-importing. */
 function storePath(): string {
-  const home = process.env.HOME || process.env.USERPROFILE || "~";
-  return path.join(home, ".zcode", "v2", STORE_FILENAME);
+  return path.join(zcodeHomeDir(), "v2", STORE_FILENAME);
 }
 
 /** Parse and validate the table. No side effects — never rewrites the file. */
@@ -166,8 +177,46 @@ export function recordMaterializedSession(acpSid: string, zcodeSid: string, cwd:
       cwd: existing?.cwd ?? cwd,
       zcodeSid,
       createdAt: existing?.createdAt ?? Date.now(),
+      ...(existing?.modelChoice ? { modelChoice: existing.modelChoice } : {}),
     },
   });
+}
+
+/** Merge a model/thought choice patch into an existing record (merge-write). */
+export function recordModelChoice(
+  acpSid: string,
+  patch: { model?: string; thought?: string; at?: number },
+): void {
+  const { kept } = readTable();
+  const existing = kept[acpSid];
+  // Unknown alias (foreign session / never a placeholder) — in-memory only.
+  if (!existing) return;
+  const merged = { ...(existing.modelChoice ?? {}), ...patch };
+  // Dedupe on the meaningful fields only — `at` always moves, it must not
+  // defeat the skip. An explicit EMPTY value (thought reset) still counts
+  // as a change: "" overwrites the stale level here AND in the re-assert.
+  const prev = existing.modelChoice;
+  if (prev && prev.model === merged.model && prev.thought === merged.thought) return;
+  persist({
+    ...kept,
+    [acpSid]: { ...existing, modelChoice: { ...merged, at: patch.at ?? Date.now() } },
+  });
+}
+
+/**
+ * Freshest model/thought choice recorded for a BACKEND session across every
+ * alias. One backend session can hold several acpSids (an editor tab plus a
+ * TUI/phone attachment, or an adopted conversation), each recording its own
+ * switches — recovering through a STALE alias must not resurrect a choice a
+ * fresher alias already replaced. Max-`at` wins; ties keep the first seen.
+ */
+export function lookupModelChoiceByZcodeSid(zcodeSid: string): LazySessionRecord["modelChoice"] {
+  let best: LazySessionRecord["modelChoice"];
+  for (const rec of Object.values(loadRecords())) {
+    if (rec.zcodeSid !== zcodeSid || !rec.modelChoice) continue;
+    if (!best || (rec.modelChoice.at ?? 0) > (best.at ?? 0)) best = rec.modelChoice;
+  }
+  return best;
 }
 
 /** Look up a placeholder alias (undefined = unknown to this bridge and store). */

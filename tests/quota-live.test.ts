@@ -7,13 +7,15 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { queryQuotaMock, buildOptionsMock, remoteConfigMock } = vi.hoisted(() => ({
+const { queryQuotaMock, buildOptionsMock, remoteConfigMock, queryOcUsageMock } = vi.hoisted(() => ({
   queryQuotaMock: vi.fn(),
   buildOptionsMock: vi.fn(),
   remoteConfigMock: vi.fn(),
+  queryOcUsageMock: vi.fn(),
 }));
 
 vi.mock("../src/quota/index.js", () => ({ queryQuota: queryQuotaMock }));
+vi.mock("../src/quota/ollama-cloud/index.js", () => ({ queryOcUsage: queryOcUsageMock }));
 vi.mock("../src/config/options.js", () => ({ buildConfigOptions: buildOptionsMock }));
 vi.mock("../src/remote/config.js", () => ({ parseRemoteConfig: remoteConfigMock }));
 
@@ -81,6 +83,8 @@ beforeEach(() => {
   queryQuotaMock.mockReset();
   buildOptionsMock.mockReset();
   remoteConfigMock.mockReset();
+  queryOcUsageMock.mockReset();
+  queryOcUsageMock.mockResolvedValue({ kind: "not_configured" });
   remoteConfigMock.mockReturnValue(null);
   buildOptionsMock.mockResolvedValue([{ id: "model" }]);
 });

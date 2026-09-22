@@ -8,6 +8,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import { debugEnabled } from "./config/settings.js";
+
 /** ACP protocol version this server speaks. */
 export const PROTOCOL_VERSION = 1;
 
@@ -35,13 +37,72 @@ export const AGENT_INFO = {
   version: PACKAGE_VERSION,
 } as const;
 
-/** Path to the ZCode v2 config (credentials + provider/model metadata). */
-export const ZCODE_CREDS_PATH = path.join(
-  process.env.HOME || process.env.USERPROFILE || "~",
-  ".zcode",
-  "v2",
-  "config.json",
-);
+/**
+ * Root of the ZCode data directory. `ZCODE_HOME` replaces `~/.zcode` outright,
+ * so a bridge can run against an isolated ZCode install (a second account, a
+ * container mount, a test fixture) without touching the user's real one.
+ * Resolved at call time so a caller can change the env before reading.
+ */
+export function zcodeHomeDir(): string {
+  const explicit = process.env.ZCODE_HOME;
+  if (explicit) return explicit;
+  return path.join(process.env.HOME || process.env.USERPROFILE || "~", ".zcode");
+}
+
+/**
+ * Path to the ZCode v2 config (credentials + provider/model metadata).
+ * Module-level snapshot: `ZCODE_HOME` must be set before the process starts.
+ */
+export const ZCODE_CREDS_PATH = path.join(zcodeHomeDir(), "v2", "config.json");
+
+/**
+ * Path to the desktop's personal provider config (3.12+): the desktop writes
+ * user-added providers and models HERE, and the backend registry reads it
+ * directly — legacy config.json's provider map stopped syncing. Per call, so
+ * discovery follows a `ZCODE_HOME` change made after import (tests).
+ */
+export function zcodePersonalProviderPath(): string {
+  return path.join(zcodeHomeDir(), "v2", "provider_config.json");
+}
+
+/**
+ * Path to the ZCode CLI config (skills/plugins/MCP enablement). Per call, so
+ * discovery follows a `ZCODE_HOME` change made after import (tests).
+ */
+export function zcodeCliConfigPath(): string {
+  return path.join(zcodeHomeDir(), "cli", "config.json");
+}
+
+/** Root of the ZCode plugin cache directory (per call — see above). */
+export function zcodePluginCacheDir(): string {
+  return path.join(zcodeHomeDir(), "cli", "plugins", "cache");
+}
+
+/**
+ * Root of the ZCode user-scope agent definitions (`~/.zcode/agents/*.md`).
+ * Per call, so discovery follows a `ZCODE_HOME` change made after import.
+ */
+export function zcodeAgentsDir(): string {
+  return path.join(zcodeHomeDir(), "agents");
+}
+
+/**
+ * Path of the agent state file (`~/.zcode/v2/agents-state.json`): per-agent
+ * enablement plus the built-in agents' model overrides. Per call — see above.
+ */
+export function zcodeAgentsStatePath(): string {
+  return path.join(zcodeHomeDir(), "v2", "agents-state.json");
+}
+
+/** Path of the CLI agent database (`~/.zcode/cli/db/db.sqlite`) — usage stats. */
+export function zcodeUsageDbPath(): string {
+  return path.join(zcodeHomeDir(), "cli", "db", "db.sqlite");
+}
+
+/** Path of the encrypted credential store (`~/.zcode/v2/credentials.json`). */
+export function zcodeCredentialsPath(): string {
+  return path.join(zcodeHomeDir(), "v2", "credentials.json");
+}
 
 /**
  * Slash commands surfaced to the editor. Each maps to a ZCode session method
@@ -141,10 +202,11 @@ export const CONFIG_DISPATCH: Record<string, { method: string; paramKey: string 
  * Never use `console.log` — it would corrupt the stdout protocol stream.
  */
 
-/** True when the user opted into verbose diagnostics.
- *  Read at call time so tests can flip it without re-importing the module. */
+/** True when the user opted into verbose diagnostics (config file `debug` or
+ *  `ZCODE_ACP_DEBUG=1`). Read at call time so tests can flip it without
+ *  re-importing the module. */
 function isDebug(): boolean {
-  return process.env.ZCODE_ACP_DEBUG === "1";
+  return debugEnabled();
 }
 
 /** Verbose diagnostic log. Only emitted when `ZCODE_ACP_DEBUG=1`. */

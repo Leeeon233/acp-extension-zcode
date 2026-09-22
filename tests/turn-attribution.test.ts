@@ -132,7 +132,11 @@ describe("turn-completion replay: re-emit text never streamed live, dedup by mes
     const t = new EventTranslator();
     t.translate({
       type: "model.streaming",
-      payload: { kind: "reasoning_delta", delta: "live reasoning", assistantMessageId: "msg_live_1" },
+      payload: {
+        kind: "reasoning_delta",
+        delta: "live reasoning",
+        assistantMessageId: "msg_live_1",
+      },
     });
     expect(t.deliveredReasoningMessageIds.has("msg_live_1")).toBe(true);
     expect(t.deliveredMessageIds.has("msg_live_1")).toBe(false);
@@ -158,7 +162,9 @@ describe("turn-completion replay: re-emit text never streamed live, dedup by mes
     const replayed = events.filter((e) => {
       if (e.kind !== "TextDelta" && e.kind !== "ReasoningDelta") return true;
       const delivered =
-        e.kind === "TextDelta" ? translator.deliveredMessageIds : translator.deliveredReasoningMessageIds;
+        e.kind === "TextDelta"
+          ? translator.deliveredMessageIds
+          : translator.deliveredReasoningMessageIds;
       return !(e.messageId && delivered.has(e.messageId));
     });
     const texts = replayed.filter((e) => e.kind === "TextDelta");
@@ -186,12 +192,18 @@ describe("turn-completion replay: re-emit text never streamed live, dedup by mes
     const replayed = events.filter((e) => {
       if (e.kind !== "TextDelta" && e.kind !== "ReasoningDelta") return true;
       const delivered =
-        e.kind === "TextDelta" ? translator.deliveredMessageIds : translator.deliveredReasoningMessageIds;
+        e.kind === "TextDelta"
+          ? translator.deliveredMessageIds
+          : translator.deliveredReasoningMessageIds;
       return !(e.messageId && delivered.has(e.messageId));
     });
 
     const reasoning = replayed.find((e) => e.kind === "ReasoningDelta");
-    expect(reasoning).toMatchObject({ kind: "ReasoningDelta", text: "the chain of thought", messageId: "msg_x" });
+    expect(reasoning).toMatchObject({
+      kind: "ReasoningDelta",
+      text: "the chain of thought",
+      messageId: "msg_x",
+    });
     // And the already-streamed text must still be deduped.
     expect(replayed.find((e) => e.kind === "TextDelta")).toBeUndefined();
   });
@@ -251,6 +263,8 @@ describe("preemptInFlightTurn cancels ALL matching turns", () => {
     const server = {
       pendingTurns,
       lastCancelledAt: new Map<string, number>(),
+      // stopBackendTurn consults this (compaction kill guard) — mirror the shape.
+      autoCompactInFlight: new Set<string>(),
       ensureBackend: () => ({
         send: (method: string, params: { sessionId: string }) =>
           sends.push({ method, sid: params.sessionId }),
@@ -275,6 +289,7 @@ describe("preemptInFlightTurn cancels ALL matching turns", () => {
     const server = {
       pendingTurns,
       lastCancelledAt: new Map<string, number>(),
+      autoCompactInFlight: new Set<string>(),
       ensureBackend: () => ({ send: () => {} }),
     };
     expect(preemptInFlightTurn(server as never, "zs_1", 202)).toBe(false);

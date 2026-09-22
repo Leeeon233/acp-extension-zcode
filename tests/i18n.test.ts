@@ -1,17 +1,36 @@
 /**
  * i18n resolution tests: ZCODE_ACP_LANG override → ZCode app settings
- * (~/.zcode/v2/setting.json, mocked fs) → POSIX locale sniff → English
- * default, plus table completeness (no empty entry in either language).
+ * (<zcode-home>/v2/setting.json, mocked fs — `~/.zcode` or `$ZCODE_HOME`) →
+ * POSIX locale sniff → English default, plus table completeness (no empty
+ * entry in either language).
  */
+
+import os from "node:os";
+import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Fake settings-file content; null = file absent (ENOENT).
 let settingJson: string | null = null;
+// Fake user-config content (~/.config/zcode-acp/config.json), served only at
+// the fixed /fake-xdg XDG root the lang tests pass; null = absent.
+let userConfigJson: string | null = null;
+const FAKE_USER_CONFIG = path.join("/fake-xdg", "zcode-acp", "config.json");
+
+/** The settings path the bridge should consult for the CURRENT env — exact
+ *  match, so a ZCODE_HOME test can serve content only at the overridden root
+ *  (a suffix match would also serve the real `~/.zcode` spelling). */
+function expectedSettingsPath(): string {
+  const root = process.env.ZCODE_HOME ?? path.join(os.homedir(), ".zcode");
+  return path.join(root, "v2", "setting.json");
+}
 
 vi.mock("node:fs", () => ({
   readFileSync: (p: unknown) => {
-    if (settingJson !== null && String(p).endsWith(".zcode/v2/setting.json")) {
+    if (userConfigJson !== null && String(p) === FAKE_USER_CONFIG) {
+      return userConfigJson;
+    }
+    if (settingJson !== null && String(p) === expectedSettingsPath()) {
       return settingJson;
     }
     throw new Error("ENOENT (fake)");
@@ -25,6 +44,7 @@ async function freshModule() {
 
 beforeEach(() => {
   settingJson = null;
+  userConfigJson = null;
 });
 
 afterEach(() => {
@@ -42,6 +62,15 @@ describe("resolveLanguage", () => {
     settingJson = JSON.stringify({ locale: "zh-CN" });
     expect(resolveLanguage({ ZCODE_ACP_LANG: "en" })).toBe("en");
     expect(resolveLanguage({ ZCODE_ACP_LANG: "ZH_CN.UTF-8", LANG: "en_US" })).toBe("zh");
+  });
+
+  it("config-file lang wins over env, app locale, and POSIX", async () => {
+    const { resolveLanguage } = await freshModule();
+    userConfigJson = JSON.stringify({ lang: "zh" });
+    settingJson = JSON.stringify({ localePreference: "en-US" });
+    expect(
+      resolveLanguage({ XDG_CONFIG_HOME: "/fake-xdg", ZCODE_ACP_LANG: "en", LANG: "en_US" }),
+    ).toBe("zh");
   });
 
   it("inherits the app's localePreference, then locale", async () => {
@@ -83,6 +112,15 @@ describe("resolveLanguage", () => {
     expect(resolveLanguage({})).toBe("zh"); // cached, not re-read
     settingJson = JSON.stringify({ locale: null });
     expect(resolveLanguage({})).toBe("zh"); // null value must not bust the cache
+  });
+
+  it("reads the app settings file from ZCODE_HOME when set", async () => {
+    vi.stubEnv("ZCODE_HOME", "/alt-zcode-home");
+    const { resolveLanguage } = await freshModule();
+    settingJson = JSON.stringify({ localePreference: "zh-CN" });
+    // The mock serves content ONLY at /alt-zcode-home/v2/setting.json — the
+    // real ~/.zcode spelling stays absent, so "zh" proves the override.
+    expect(resolveLanguage({ LANG: "en_US" })).toBe("zh");
   });
 
   it("falls through a missing or malformed app settings file", async () => {

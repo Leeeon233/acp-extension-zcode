@@ -234,26 +234,110 @@ function dedupeMessages(messages: ZcodeMessage[]): ZcodeMessage[] {
     .filter((m): m is ZcodeMessage => m !== null);
 }
 
-/** Fetch session/messages from zcode (the bridge's only history source). */
+/** Tuning knobs for fetchMessages; unset means the hydration defaults. */
+export interface FetchMessagesOptions {
+  /** Per-read RPC timeout. */
+  timeoutMs?: number;
+  /** Retry one failed read before degrading to `[]`. */
+  retry?: boolean;
+  /**
+   * Native forward cursor (session/messages `afterMessageId`): the backend
+   * returns only the messages AFTER this id. When the id is no longer in the
+   * store (a rewind discarded its branch) the backend answers with the FULL
+   * list — callers that cannot tolerate that must also pass `limit`.
+   */
+  afterMessageId?: string | null;
+  /**
+   * Native tail cap (session/messages `limit`): only the last N of the
+   * (post-cursor) messages. Also bounds the not-found-cursor fallback above.
+   */
+  limit?: number;
+}
+
+/**
+ * Turn-internal reads: short timeout, no retry. fetchMessages' generous
+ * default exists for slow hydration reads on huge sessions; a turn-loop
+ * caller (per-tool-result diff fetch, reply fallback) inheriting it would
+ * stall the live stream for up to ~90s on a hung read. These callers
+ * degrade gracefully instead — a missed diff is reconciled at turn
+ * completion, a missed reply falls through to other recovery paths.
+ */
+export const TURN_READ: FetchMessagesOptions = { timeoutMs: 8000, retry: false };
+
+/**
+ * Peek-read caps for turn-internal lookups whose target is always the
+ * NEWEST message (the just-completed edit's tool part, the just-finished
+ * reply). The anchor scopes the read; the cap only bounds the
+ * cursor-not-found fallback, which answers with the whole store.
+ */
+export const EDIT_DIFF_READ_LIMIT = 60;
+export const REPLY_READ_LIMIT = 60;
+/**
+ * Tail window for the goal loop's cursor-less reads (verdict / ticket
+ * parsing). A turn's reply is its newest message, so the scan that walks
+ * backward from the end finds it inside this window; the cap only keeps a
+ * long session's per-round reads from transferring the whole history.
+ */
+export const GOAL_TAIL_READ_LIMIT = 200;
+
+/**
+ * Fetch session/messages from zcode (the bridge's only history source).
+ *
+ * The default RPC timeout is generous (45s): huge sessions' reads are slow by
+ * nature (observed 2.4–6.3s on a 7413-message session, slower on a cold
+ * backend) and an 8s cap turned them into failures. A failed read is NOT an
+ * empty store — it retries once and only then degrades to `[]` (callers treat
+ * empty as "nothing to replay"). Turn-internal callers pass TURN_READ to keep
+ * the pre-0.44.2 bounded behavior.
+ *
+ * `afterMessageId`/`limit` map to the backend's native pagination (schema:
+ * zcode-protocol index.ts:1658-1665; the handler slices after-id then
+ * tail-limits in memory, server-operations.ts:1865-1876). The backend still
+ * reads the whole store — these options shrink the bridge-side payload and
+ * per-message work, not the backend's sqlite scan.
+ */
 export async function fetchMessages(
   server: ZcodeAcpServer,
   zcodeSid: string,
+  opts: FetchMessagesOptions = {},
 ): Promise<ZcodeMessage[]> {
   const backend = server.ensureBackend();
-  const resp = await backend.request(
-    server.nextId(),
-    "session/messages",
-    { sessionId: zcodeSid },
-    8000,
-  );
-  if (resp.error) {
-    // Swallowed on purpose (replay must not crash the load) — but loudly: a
-    // silent empty here renders the whole conversation blank for the client.
-    warn(`session/messages failed for ${zcodeSid}: ${resp.error.message ?? ""}`);
-    return [];
+  const timeoutMs = opts.timeoutMs ?? 45_000;
+  const params: { sessionId: string; afterMessageId?: string; limit?: number } = {
+    sessionId: zcodeSid,
+  };
+  if (opts.afterMessageId) params.afterMessageId = opts.afterMessageId;
+  if (opts.limit !== undefined) params.limit = opts.limit;
+  const read = async (): Promise<ZcodeMessagesResult | null> => {
+    const resp = await backend.request(server.nextId(), "session/messages", params, timeoutMs);
+    if (resp.error) {
+      warn(`session/messages failed for ${zcodeSid}: ${resp.error.message ?? ""}`);
+      return null;
+    }
+    return (resp.result ?? {}) as ZcodeMessagesResult;
+  };
+  let result = await read();
+  if (result === null && (opts.retry ?? true)) {
+    // One retry: transient timeouts on a cold/slow backend are the common
+    // failure, and conflating them with an empty store blanked the replay.
+    result = await read();
   }
-  const result = (resp.result ?? {}) as ZcodeMessagesResult;
+  if (result === null) return [];
   return dedupeMessages(result.messages ?? []);
+}
+
+/**
+ * Fetch only what arrived after the differ's history anchor — the residue of
+ * an abandoned turn, or the messages a retry must re-baseline. A null anchor
+ * (fresh differ) degrades to a full read, which is the pre-pagination shape.
+ */
+export async function fetchMessagesSinceAnchor(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+  anchor: string | null,
+  opts: FetchMessagesOptions = {},
+): Promise<ZcodeMessage[]> {
+  return fetchMessages(server, zcodeSid, { ...opts, afterMessageId: anchor });
 }
 
 /**
@@ -388,6 +472,14 @@ function collapseUserText(
  */
 export interface ReplayOptions {
   toolTurnWindow?: number;
+  /**
+   * Mark every update in this batch `_meta.zcode.earlierPage: true`. Set ONLY
+   * by load_earlier: a remote client collecting in-flight session/updates
+   * into an "older page" buffer cannot tell page replays from live-turn
+   * updates client-side, so the page rides a protocol-level marker (merged
+   * shallowly over any existing `_meta`); tail replays stay unmarked.
+   */
+  earlierPage?: boolean;
 }
 
 /**
@@ -417,6 +509,16 @@ export async function replayMessages(
   const lastTurn = starts.length - 1;
   const toolsKept = (i: number): boolean =>
     opts.toolTurnWindow === undefined || lastTurn - turnOf(i) < opts.toolTurnWindow;
+  // load_earlier pages are marked so clients can route them apart from
+  // live-turn updates (see ReplayOptions.earlierPage).
+  const markEarlierPage = (update: acp.SessionUpdate): acp.SessionUpdate => {
+    if (opts.earlierPage !== true) return update;
+    const meta = (update._meta ?? {}) as { zcode?: Record<string, unknown> };
+    return {
+      ...update,
+      _meta: { ...meta, zcode: { ...(meta.zcode ?? {}), earlierPage: true } },
+    };
+  };
   let replayed = 0;
   for (const [mi, m] of messages.entries()) {
     const info = m.info ?? {};
@@ -438,7 +540,7 @@ export async function replayMessages(
           if (collapse.kind === "tool-transcript" && !toolsKept(mi)) continue;
           await cx.notify("session/update", {
             sessionId: acpSid,
-            update: {
+            update: markEarlierPage({
               sessionUpdate: "tool_call",
               toolCallId: `histfold_${mid}`,
               title: collapse.title,
@@ -446,7 +548,7 @@ export async function replayMessages(
               status: "completed",
               content: [{ type: "content", content: { type: "text", text } }],
               _meta: collapsedMeta(collapse.kind),
-            },
+            }),
           });
         } else if (role === "user" && info.semantics?.transcriptVisibility === "hidden") {
           // Hidden harness plumbing that fits no collapse shape (plan-file
@@ -457,11 +559,11 @@ export async function replayMessages(
         } else {
           await cx.notify("session/update", {
             sessionId: acpSid,
-            update: {
+            update: markEarlierPage({
               sessionUpdate: role === "user" ? "user_message_chunk" : "agent_message_chunk",
               content: { type: "text", text },
               messageId: mid,
-            },
+            }),
           });
         }
       } else if (ptype === "reasoning") {
@@ -470,11 +572,11 @@ export async function replayMessages(
         if (text) {
           await cx.notify("session/update", {
             sessionId: acpSid,
-            update: {
+            update: markEarlierPage({
               sessionUpdate: "agent_thought_chunk",
               content: { type: "text", text },
               messageId: `thought_${mid}`,
-            },
+            }),
           });
         }
       } else if (ptype === "tool") {
@@ -508,7 +610,7 @@ export async function replayMessages(
         }
         await cx.notify("session/update", {
           sessionId: acpSid,
-          update: {
+          update: markEarlierPage({
             sessionUpdate: "tool_call",
             toolCallId: tp.id ?? `histtool_${randomUUID().slice(0, 8)}`,
             title: st.title ?? histToolName ?? i18nMessages().replayToolCallFallback,
@@ -516,7 +618,7 @@ export async function replayMessages(
             status: (st.status as acp.ToolCallStatus) ?? "completed",
             ...(content.length > 0 ? { content } : {}),
             ...(histToolName ? { _meta: { claudeCode: { toolName: histToolName } } } : {}),
-          },
+          }),
         });
       }
       // patch / step-start / other: skipped (history replay focuses on text + tool summary)
@@ -546,7 +648,9 @@ export async function loadEarlier(
 
   const messages = await fetchMessages(server, zcodeSid);
   const slice = sliceBefore(messages, params.before, params.limit ?? DEFAULT_EARLIER_LIMIT);
-  await withReplayBatch(acpSid, () => replayMessages(cx, acpSid, slice.batch));
+  await withReplayBatch(acpSid, () =>
+    replayMessages(cx, acpSid, slice.batch, { earlierPage: true }),
+  );
   log(`session/load_earlier: ${slice.meta.replayedMessages} messages before cursor`);
   return { replayMeta: slice.meta };
 }

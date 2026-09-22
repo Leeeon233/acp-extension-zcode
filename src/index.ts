@@ -36,7 +36,6 @@ import {
   setMode,
   setModel,
   setThoughtLevel,
-  updateRuntimeModelConfig,
 } from "./handlers/extensions.js";
 import { echoUserPromptToOthers, sendAvailableCommandsDeferred } from "./handlers/io.js";
 import { loadEarlier } from "./handlers/replay.js";
@@ -111,7 +110,11 @@ export async function main(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     log(`shutting down (${reason})`);
-    // Stop the remote endpoint first (bounded by its 1.5s unregister timeout);
+    // Terminal records for in-flight background tasks BEFORE the remote
+    // endpoint closes — afterwards the WS/stdio clients are gone and the
+    // records could not be delivered (#194).
+    await server.emitBackgroundTaskShutdownRecords();
+    // Stop the remote endpoint (bounded by its 1.5s unregister timeout);
     // the hub's heartbeat TTL also prunes us if this doesn't complete.
     if (remoteHandle) await remoteHandle.stop();
     if (server.backend) await server.backend.close();
@@ -178,7 +181,13 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       })
       .onRequest("session/list", (ctx) => listSessions(server, ctx.params))
       .onRequest("session/resume", async (ctx) => {
-        const result = await resumeSession(server, ctx.params, server.clients.broadcast());
+        // Replays target the REQUESTING connection only (ctx.client, not the
+        // broadcast proxy): a replay is per-client rendering state, and
+        // fanning it out appends the whole history to every OTHER attached
+        // client's transcript at the bottom — the "replay disorder" report
+        // (editor + TUI + app sharing one bridge through the hub). Live turn
+        // updates keep fanning out via prompt()'s broadcast cx.
+        const result = await resumeSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(ctx.params.sessionId)) {
           sendAvailableCommandsDeferred(server.clients, sid, allCommands);
         }
@@ -189,7 +198,8 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
         return result;
       })
       .onRequest("session/load", async (ctx) => {
-        const result = await loadSession(server, ctx.params, server.clients.broadcast());
+        // Targeted replay — see the session/resume comment above.
+        const result = await loadSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(ctx.params.sessionId)) {
           sendAvailableCommandsDeferred(server.clients, sid, allCommands);
         }
@@ -199,12 +209,13 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       // Tail-replay pagination (non-standard; Proposal 0001) — params stay
       // top-level because the parser below is ours, unlike spec methods where
       // bridge extensions must ride in `_meta.zcode`.
+      // Targeted replay — see the session/resume comment above.
       .onRequest(
         "session/load_earlier",
         z
           .object({ sessionId: z.string(), before: z.string(), limit: z.number().optional() })
           .passthrough(),
-        (ctx) => loadEarlier(server, ctx.params, server.clients.broadcast()),
+        (ctx) => loadEarlier(server, ctx.params, ctx.client),
       )
       // Account-level plan quota for remote clients (non-standard; Proposal
       // 0002). Pull-only, no session required; errors carry the failure kind in
@@ -241,11 +252,15 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .onRequest("session/cancelBackgroundTask", extParams, (ctx) =>
         cancelBackgroundTask(server, ctx.params),
       )
-      .onRequest("session/setThoughtLevel", extParams, (ctx) => setThoughtLevel(server, ctx.params))
-      .onRequest("session/updateRuntimeModelConfig", extParams, (ctx) =>
-        updateRuntimeModelConfig(server, ctx.params),
+      .onRequest("session/setThoughtLevel", extParams, (ctx) =>
+        setThoughtLevel(server, ctx.params, server.clients.broadcast()),
       )
-      .onRequest("session/setModel", extParams, (ctx) => setModel(server, ctx.params))
+      // session/updateRuntimeModelConfig was removed 2026-09: the method is
+      // absent from the app-server 0.16.9 enum (every call answered -32601);
+      // setModel + applyModelSwitch cover the switch path on all builds.
+      .onRequest("session/setModel", extParams, (ctx) =>
+        setModel(server, ctx.params, server.clients.broadcast()),
+      )
       .onRequest("session/setMode", extParams, (ctx) =>
         setMode(server, ctx.params, server.clients.broadcast()),
       )
@@ -314,6 +329,9 @@ export async function runHeadless(): Promise<void> {
     if (shuttingDown) return;
     shuttingDown = true;
     log(`serve: shutting down (${reason})`);
+    // Records first, endpoint second — remote-only clients ride the WS link
+    // that remoteHandle.stop() tears down (#194).
+    await server.emitBackgroundTaskShutdownRecords();
     if (remoteHandle) await remoteHandle.stop();
     if (server.backend) await server.backend.close();
     process.exit(0);

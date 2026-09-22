@@ -2,11 +2,13 @@
  * Bridge-emitted user-facing strings (editor popups, status/hint lines).
  *
  * Language selection, first match wins:
- *   1. ZCODE_ACP_LANG  — explicit override ("zh", "en"; prefixes like "zh_CN"
- *      accepted, case-insensitive)
+ *   1. Explicit override — `lang` in ~/.config/zcode-acp/config.json, else
+ *      ZCODE_ACP_LANG ("zh", "en"; prefixes like "zh_CN" accepted,
+ *      case-insensitive)
  *   2. The ZCode desktop app's language choice — `localePreference` (explicit
  *      user pick), falling back to `locale` (effective), in
- *      ~/.zcode/v2/setting.json; absent when the app was never installed
+ *      <zcode-home>/v2/setting.json (the ZCode data root — `~/.zcode`, or
+ *      `$ZCODE_HOME` when set); absent when the app was never installed
  *   3. LC_ALL / LC_MESSAGES / LANG — POSIX locale sniff ("zh*" → zh)
  *   4. English (the project ships bilingual READMEs; international default)
  *
@@ -17,8 +19,10 @@
  */
 
 import { readFileSync } from "node:fs";
-import os from "node:os";
 import path from "node:path";
+
+import { languageOverride } from "./config/settings.js";
+import { zcodeHomeDir } from "./utils.js";
 
 export type Lang = "en" | "zh";
 
@@ -34,7 +38,7 @@ export function resolveLanguage(env: NodeJS.ProcessEnv = process.env): Lang {
     return undefined;
   };
   return (
-    pick(env.ZCODE_ACP_LANG) ??
+    languageOverride(env) ??
     pick(appLocale()) ??
     pick(env.LC_ALL) ??
     pick(env.LC_MESSAGES) ??
@@ -54,7 +58,7 @@ function appLocale(): string | undefined {
     appLocaleRead = true;
     let locale: string | undefined;
     try {
-      const raw = readFileSync(path.join(os.homedir(), ".zcode", "v2", "setting.json"), "utf8");
+      const raw = readFileSync(path.join(zcodeHomeDir(), "v2", "setting.json"), "utf8");
       // Editors saving UTF-8 with a BOM leave \uFEFF in the string; JSON.parse
       // rejects it, which would silently fall the bridge back to English.
       const bomless = raw.charCodeAt(0) === 0xfeff ? raw.slice(1) : raw;
@@ -108,6 +112,10 @@ export interface Messages {
   goalBackendRecovered: string;
   /** Prompt queued behind a still-generating turn (drain gate). */
   promptQueuedBehindTurn: string;
+  /** Live sub-agent roster line during silent phases (session/subagents). */
+  subagentStatusLine: (running: number, waiting: number, blocked: number) => string;
+  /** One-shot terminal summary for sub-agents that ended during the turn. */
+  subagentEndedLine: (ended: number, failed: number, cancelled: number) => string;
   thinkingPlaceholder: string;
   /** Steered prompt silently swallowed by the still-running turn. */
   messageSwallowedByTurn: string;
@@ -130,6 +138,8 @@ export interface Messages {
   /** Ack for the boot-resume banner handshake (auto-submitted trigger). */
   bootResumeAck: string;
   slashCompactTimeout: string;
+  slashCompactFailed: string;
+  slashCompactAlreadyRunning: string;
   slashGoalSet: (value: string) => string;
   slashAutoSet: (value: string) => string;
   slashErrAutoArg: string;
@@ -185,6 +195,13 @@ export interface Messages {
   mcpFromConfig: string;
   mcpFromPlugins: string;
   mcpFooter: string;
+  /** `/mcp` live health panel (backend mcp/list mode:"status"). */
+  mcpHealthHeader: (count: number) => string;
+  mcpHealthTools: (count: number) => string;
+  /** Turn-end status line (`turn.completed` resultType + cacheStats). */
+  turnCompleted: string;
+  turnCompletedCache: (cached: number, total: number, cacheRead?: string) => string;
+  turnStoppedEarly: (resultType: string) => string;
   /** Editor slash-command menu: localized descriptions for the static
    *  commands (names and argument hints stay as-is — they are tokens). */
   slashCommandDescriptions: Record<string, string>;
@@ -193,6 +210,15 @@ export interface Messages {
   autoCompactTimeout: string;
   autoCompactDone: string;
   autoCompactFailed: (err: string) => string;
+  /** Fixed reason text for a backend-reported compaction failure (state.updated
+   *  session_compact_failed/cancelled) — fed into autoCompactFailed. */
+  autoCompactBackendFailed: string;
+  /** Prompt rejection notice: a detached auto-compact is running, the message
+   * was NOT sent — resend after the ✓ compressed line. */
+  autoCompactBusy: string;
+  /** Goal-loop wait note: a compaction holds the lock, the round resumes by
+   * itself once it settles (no user action needed). */
+  autoCompactGoalWait: string;
   /** Pre-popup tool_call titles for interactive requests. */
   popupTitleExitPlan: string;
   popupTitleToolPermission: (tool: string) => string;
@@ -246,6 +272,10 @@ const zh: Messages = {
     `[后端进程异常中断，已重启并恢复会话，自动继续刚才的任务 (${attempt}/${total})…]`,
   goalBackendRecovered: "[后端进程异常中断，auto 任务已自动恢复并继续…]",
   promptQueuedBehindTurn: "[上一个回复仍在生成，等待结束后发送…]",
+  subagentStatusLine: (running, waiting, blocked) =>
+    `[子代理] ${running} 运行中${waiting ? ` · ${waiting} 等待` : ""}${blocked ? ` · ${blocked} 阻塞` : ""}`,
+  subagentEndedLine: (ended, failed, cancelled) =>
+    `[子代理完成] ${ended} 个结束${failed ? ` · ${failed} 失败` : ""}${cancelled ? ` · ${cancelled} 取消` : ""}`,
   thinkingPlaceholder: "正在思考…",
   messageSwallowedByTurn: "[消息被并入仍在生成的回合，将被丢弃，请重新发送]",
   interactionInterrupted: "交互中断：连接关闭或超时，请重新发起对话。",
@@ -261,6 +291,8 @@ const zh: Messages = {
   slashCompacted: "✓ 已压缩对话上下文",
   bootResumeAck: "⟲ 已恢复会话 · 历史已回放",
   slashCompactTimeout: "⚠ 压缩超时（300s），后端可能仍在处理——稍等片刻再发送",
+  slashCompactFailed: "⚠ 压缩失败：后端未完成上下文压缩（详见日志）",
+  slashCompactAlreadyRunning: "⏳ 已有压缩正在进行——已等待其完成",
   slashGoalSet: (v) => `✓ 目标已设置：${v}`,
   slashAutoSet: (v) => `✓ auto loop：${v}`,
   slashErrAutoArg: "/auto 需要目标描述（或 status | pause | resume | stop）",
@@ -305,6 +337,12 @@ const zh: Messages = {
   mcpFromConfig: "来自 config.json:",
   mcpFromPlugins: "来自插件:",
   mcpFooter: "MCP 工具会在需要时由模型自动调用。",
+  mcpHealthHeader: (n) => `📡 MCP 服务器 (${n}) · 后端状态`,
+  mcpHealthTools: (n) => `${n} 个工具`,
+  turnCompleted: "✓ 已完成",
+  turnCompletedCache: (c, t, r) =>
+    `✓ 已完成 · 缓存 ${c}/${t} 条消息${r ? ` · ${r} 缓存读取 token` : ""}`,
+  turnStoppedEarly: (rt) => `⚠ 提前结束：${rt}`,
   slashCommandDescriptions: {
     auto: "自治目标循环：开始、查看、暂停、恢复、停止",
     compact: "压缩对话上下文（释放 token）",
@@ -323,6 +361,9 @@ const zh: Messages = {
   autoCompactTimeout: "⚠ 自动压缩超时（300s）——后端可能仍在处理",
   autoCompactDone: "✓ 自动压缩: 上下文已压缩",
   autoCompactFailed: (err) => `⚠ 自动压缩失败: ${err}`,
+  autoCompactBackendFailed: "后端报告压缩失败（session_compact_failed）",
+  autoCompactBusy: "🔄 自动压缩进行中，这条消息未发送；看到“✓ 自动压缩”提示后请重新发送。",
+  autoCompactGoalWait: "⏳ 自动压缩进行中，auto 任务将在压缩结束后自动继续…",
   popupTitleExitPlan: "可以开始编码了吗？",
   popupTitleToolPermission: (tool) => `工具权限 (${tool})`,
   popupTitleInteraction: "交互",
@@ -374,6 +415,10 @@ const en: Messages = {
   goalBackendRecovered:
     "[Backend process was interrupted; the auto task recovered automatically and is continuing…]",
   promptQueuedBehindTurn: "[The previous reply is still generating; sending once it finishes…]",
+  subagentStatusLine: (running, waiting, blocked) =>
+    `[subagents] ${running} running${waiting ? ` · ${waiting} waiting` : ""}${blocked ? ` · ${blocked} blocked` : ""}`,
+  subagentEndedLine: (ended, failed, cancelled) =>
+    `[subagents finished] ${ended} ended${failed ? ` · ${failed} failed` : ""}${cancelled ? ` · ${cancelled} cancelled` : ""}`,
   thinkingPlaceholder: "Thinking…",
   messageSwallowedByTurn:
     "[The message was merged into a still-generating turn and will be dropped; please resend it.]",
@@ -392,6 +437,8 @@ const en: Messages = {
   bootResumeAck: "⟲ session resumed — history replayed",
   slashCompactTimeout:
     "⚠ compact timed out (300s), backend may still be processing — wait a bit before sending",
+  slashCompactFailed: "⚠ compaction failed: the backend did not compress the context (see logs)",
+  slashCompactAlreadyRunning: "⏳ a compaction was already running — waited for it to finish",
   slashGoalSet: (v) => `✓ goal set: ${v}`,
   slashAutoSet: (v) => `✓ auto loop: ${v}`,
   slashErrAutoArg: "/auto requires an objective (or status | pause | resume | stop)",
@@ -440,6 +487,12 @@ const en: Messages = {
   mcpFromConfig: "From config.json:",
   mcpFromPlugins: "From plugins:",
   mcpFooter: "MCP tools are auto-invoked by the model when needed.",
+  mcpHealthHeader: (n) => `📡 MCP Servers (${n}) · backend status`,
+  mcpHealthTools: (n) => `${n} tools`,
+  turnCompleted: "✓ completed",
+  turnCompletedCache: (c, t, r) =>
+    `✓ completed · cache ${c}/${t} messages${r ? ` · ${r} cache-read tokens` : ""}`,
+  turnStoppedEarly: (rt) => `⚠ stopped early: ${rt}`,
   slashCommandDescriptions: {
     auto: "Autonomous goal loop: start, status, pause, resume, stop",
     compact: "Compress conversation context (free up tokens)",
@@ -458,6 +511,11 @@ const en: Messages = {
   autoCompactTimeout: "⚠ auto-compact timed out (300s) — backend may still be processing",
   autoCompactDone: "✓ auto-compact: context compressed",
   autoCompactFailed: (err) => `⚠ auto-compact failed: ${err}`,
+  autoCompactBackendFailed: "backend reported compaction failed (session_compact_failed)",
+  autoCompactBusy:
+    '🔄 auto-compact in progress — this message was NOT sent; resend it after the "✓ auto-compact" notice.',
+  autoCompactGoalWait:
+    "⏳ auto-compact in progress — the auto run continues automatically once it finishes…",
   popupTitleExitPlan: "Ready to code?",
   popupTitleToolPermission: (tool) => `tool permission (${tool})`,
   popupTitleInteraction: "interaction",
