@@ -28,7 +28,7 @@ import { buildLodyTaskMeta, toLodyTaskStatus, withLodyMeta, withLodyToolName } f
 import type { InternalEvent } from "../translators/types.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { clientConnectionRoot, warn } from "../utils.js";
-import { sendSessionUpdate, sendSessionUpdateToOthers } from "./io.js";
+import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "./io.js";
 
 /** True once the EPERM hint fired for this process — throttled to one shot. */
 let sandboxEpermHinted = false;
@@ -94,6 +94,9 @@ export async function dispatchEvent(
         break;
       case "UsageDelta":
         await dispatchUsageDelta(server, cx, sid, ev);
+        break;
+      case "TurnInfo":
+        await dispatchTurnInfo(cx, sid, ev, chunkMsgId);
         break;
       case "TextDelta":
         await sendSessionUpdate(cx, sid, {
@@ -167,8 +170,10 @@ async function dispatchConfigChanged(
     };
     await sendSessionUpdate(cx, acpSid, configUpdate);
     // Settings are per-session: the CLI's /model or the phone's dropdown must
-    // reach every OTHER attached client too.
-    sendSessionUpdateToOthers(server, cx, acpSid, configUpdate);
+    // reach every OTHER attached client too. The broadcast proxy already
+    // reached everyone with the send above — an "others" leg on it would
+    // double-deliver (it has no connectionContext to exclude anyone by).
+    if (!isBroadcastSource(cx)) sendSessionUpdateToOthers(server, cx, acpSid, configUpdate);
     if (ev.mode !== undefined) {
       // Mirror the advertised mode so turn-completion reconciliation
       // (emitModeIfChanged) doesn't re-emit the same value.
@@ -178,7 +183,7 @@ async function dispatchConfigChanged(
         currentModeId: ev.mode,
       };
       await sendSessionUpdate(cx, acpSid, modeUpdate);
-      sendSessionUpdateToOthers(server, cx, acpSid, modeUpdate);
+      if (!isBroadcastSource(cx)) sendSessionUpdateToOthers(server, cx, acpSid, modeUpdate);
     }
   } catch (e) {
     warn(`dispatch: ConfigChanged failed (${e instanceof Error ? e.message : String(e)})`);
@@ -406,23 +411,66 @@ async function dispatchTerminalUpdate(
   }
 }
 
+/**
+ * Turn-end status line from `turn.completed` (resultType + cacheStats):
+ * success renders the prompt-cache stats (or a bare "completed" when the
+ * backend sent no cacheStats); any non-success resultType is surfaced
+ * verbatim as a warning-flavored line. Distinct messageId (chunkMsgId
+ * prefix) so editors keep it a separate message from the reply text.
+ */
+async function dispatchTurnInfo(
+  cx: acp.AgentContext,
+  acpSid: string,
+  ev: Extract<InternalEvent, { kind: "TurnInfo" }>,
+  chunkMsgId: string,
+): Promise<void> {
+  const m = messages();
+  let line: string;
+  if (ev.resultType === "success") {
+    line = ev.cacheStats
+      ? m.turnCompletedCache(
+          ev.cacheStats.cachedMessages,
+          ev.cacheStats.totalMessages,
+          ev.cacheStats.cacheReadTokens !== undefined
+            ? formatTokenCount(ev.cacheStats.cacheReadTokens)
+            : undefined,
+        )
+      : m.turnCompleted;
+  } else {
+    line = m.turnStoppedEarly(ev.resultType);
+  }
+  await sendSessionUpdate(cx, acpSid, {
+    sessionUpdate: "agent_message_chunk",
+    content: { type: "text", text: line },
+    messageId: `turninfo_${chunkMsgId}`,
+  });
+}
+
+/** Compact token-count rendering for status lines: 12300 → "12.3k", 999 → "999". */
+function formatTokenCount(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : `${n}`;
+}
+
 async function dispatchUsageDelta(
   server: ZcodeAcpServer,
   cx: acp.AgentContext,
   acpSid: string,
   ev: Extract<InternalEvent, { kind: "UsageDelta" }>,
 ): Promise<void> {
-  // The backend often returns contextWindow=0; fill from the model's
-  // config.json limit.context so the editor can render the context bar.
-  let size = ev.size;
-  if (!size) {
-    // Resolve to the real backend session id — `acpSid` may be a lazy
-    // session/new placeholder that the backend rejects with "Session is not
-    // active", wasting a 5s request timeout on every usage_update.
-    const zcodeSid = server.resolveSid(acpSid) ?? acpSid;
-    const { providerId, modelId } = parseModelValue(await currentModelCached(server, zcodeSid));
-    size = modelContextWindow(providerId, modelId);
-  }
+  // `size` precedence: the user's explicit config.json `limit.context` for the
+  // session's model FIRST, the backend event's contextWindow as fallback. The
+  // CLI's projection seeds contextWindow with a hardcoded 200K default and
+  // account-provider models carry no registry metadata (our account snapshot
+  // pushes model ids only), so the event value can be a placeholder — while
+  // config.json is the explicit per-model truth, and it is already what the
+  // boot/switch-time emissions use. Config-first keeps the gauge from
+  // flip-flopping between the two values across a session.
+  // Resolve to the real backend session id — `acpSid` may be a lazy
+  // session/new placeholder that the backend rejects with "Session is not
+  // active", wasting a 5s request timeout on every usage_update.
+  const zcodeSid = server.resolveSid(acpSid) ?? acpSid;
+  const { providerId, modelId } = parseModelValue(await currentModelCached(server, zcodeSid));
+  const size = modelContextWindow(providerId, modelId) || ev.size;
   await sendSessionUpdate(cx, acpSid, {
     sessionUpdate: "usage_update",
     used: ev.used,

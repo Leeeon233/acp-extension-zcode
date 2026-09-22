@@ -78,6 +78,59 @@ describe("session close endpoint", () => {
     expect((await collectSessions(server)).map((s) => s.sessionId)).not.toContain(acpSid);
   });
 
+  it("notifies attached clients ($/zcode/session_closed) per alias on a serve-origin close", async () => {
+    // The martty-quit channel: an incubated window showing the closed session
+    // exits cleanly on this notification instead of waiting for terminate
+    // signals. Serve-origin only — and one copy per session alias, because a
+    // client may hold the conversation under a different acpSid.
+    process.env.ZCODE_ACP_REMOTE_ORIGIN = "serve";
+    try {
+      const server = new ZcodeAcpServer();
+      const { acpSid, zcodeSid } = seedSession(server, { title: "remote" });
+      const altSid = randomUUID();
+      server.registerSession(altSid, zcodeSid);
+      const received: Array<{ method: string; params: Record<string, unknown> }> = [];
+      server.clients.add({
+        notify: async (method: string, params: unknown) => {
+          received.push({ method, params: params as Record<string, unknown> });
+        },
+        request: async () => {
+          throw new Error("no server→client requests expected");
+        },
+      });
+      const base = await bootClose(server);
+
+      const res = await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" });
+      expect(res.status).toBe(200);
+      expect(received).toEqual([
+        { method: "$/zcode/session_closed", params: { sessionId: acpSid } },
+        { method: "$/zcode/session_closed", params: { sessionId: altSid } },
+      ]);
+    } finally {
+      delete process.env.ZCODE_ACP_REMOTE_ORIGIN;
+    }
+  });
+
+  it("stays silent on close for an editor-origin bridge (no window teardown hint)", async () => {
+    // A remote retire must never hint a user-launched CLI window into
+    // closing itself — ADR-0006's self-heal owns that case.
+    const server = new ZcodeAcpServer();
+    const { acpSid } = seedSession(server, { title: "editor" });
+    const received: Array<{ method: string }> = [];
+    server.clients.add({
+      notify: async (method: string) => {
+        received.push({ method });
+      },
+      request: async () => {
+        throw new Error("no server→client requests expected");
+      },
+    });
+    const base = await bootClose(server);
+
+    expect((await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" })).status).toBe(200);
+    expect(received).toEqual([]);
+  });
+
   it("rejects closing a session with a running turn", async () => {
     const server = new ZcodeAcpServer();
     const { acpSid, zcodeSid } = seedSession(server);

@@ -103,6 +103,36 @@ describe("loadMcpServers", () => {
     expect(servers[0]!.source).toBe("config");
   });
 
+  it("reads the CLI config from ZCODE_HOME when set (real home ignored)", () => {
+    resetMocks();
+    mockFiles.set(
+      `${HOME}/.zcode/cli/config.json`,
+      JSON.stringify({
+        mcp: {
+          servers: {
+            realHomeServer: { type: "stdio", command: "real" },
+          },
+        },
+      }),
+    );
+    const altRoot = `${HOME}/zcode-alt-home`;
+    mockFiles.set(
+      `${altRoot}/cli/config.json`,
+      JSON.stringify({
+        mcp: {
+          servers: {
+            altHomeServer: { type: "http", url: "https://example.com/mcp" },
+          },
+        },
+      }),
+    );
+    vi.stubEnv("ZCODE_HOME", altRoot);
+    const servers = loadMcpServers();
+    expect(servers).toHaveLength(1);
+    expect(servers[0]!.name).toBe("altHomeServer");
+    expect(servers[0]!.url).toBe("https://example.com/mcp");
+  });
+
   it("discovers http servers from config.json", () => {
     resetMocks();
     mockFiles.set(

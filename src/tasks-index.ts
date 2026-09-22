@@ -17,11 +17,11 @@
  */
 
 import { existsSync, readFileSync, statSync } from "node:fs";
-import { homedir, tmpdir } from "node:os";
+import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { DEFAULT_MODEL_ID } from "./config/options.js";
-import { warn, ZCODE_CREDS_PATH } from "./utils.js";
+import { warn, zcodeHomeDir, ZCODE_CREDS_PATH } from "./utils.js";
 
 // Precise DatabaseSync constructor type from @types/node, captured without a
 // runtime import (type position only). node:sqlite's API is prepared-statement
@@ -331,6 +331,27 @@ export async function updateSessionTitle(
 
 // ---------- known workspaces (remote session-create, ADR-0014) ----------
 
+/**
+ * Whether the tasks-index row marks this conversation's title as manually
+ * renamed (`title_overridden=1`, set by renameSessionTask). Read-only consult
+ * for the title listener: the bridge's in-memory rename pin is lost on
+ * restart, but the durable flag keeps a later backend `generated` title push
+ * from overriding the user's rename. False when the index or row is absent.
+ */
+export async function isTitleOverridden(taskId: string): Promise<boolean> {
+  if (!existsSync(TASKS_INDEX_PATH)) return false;
+  try {
+    const row = await withSqliteRetry(
+      (con) =>
+        con.prepare("SELECT title_overridden FROM tasks WHERE task_id=?").get(taskId) as
+          { title_overridden: number } | undefined,
+    );
+    return row?.title_overridden === 1;
+  } catch {
+    return false;
+  }
+}
+
 /** One known project workspace, as recorded by the App's tasks index. */
 export interface KnownWorkspace {
   workspacePath: string;
@@ -342,18 +363,13 @@ export interface KnownWorkspace {
  * Whether a recorded workspace path may be offered for remote session
  * creation. Excludes: degenerate roots, system temp trees (macOS /tmp is a
  * symlink to /private/tmp — both spellings; $TMPDIR lives under /var/folders),
- * and ~/.zcode itself (the config home, not a project). The directory must
- * still exist — a moved/deleted project disappears from the list.
+ * and the ZCode data root itself (the config home, not a project). The
+ * directory must still exist — a moved/deleted project disappears from the
+ * list.
  */
 export function isSelectableWorkspace(p: string): boolean {
   if (!p || p === "/") return false;
-  const excluded = [
-    "/tmp",
-    "/private/tmp",
-    "/var/folders",
-    tmpdir(),
-    path.join(homedir(), ".zcode"),
-  ];
+  const excluded = ["/tmp", "/private/tmp", "/var/folders", tmpdir(), zcodeHomeDir()];
   for (const ex of excluded) {
     if (p === ex || p.startsWith(ex + path.sep)) return false;
   }

@@ -37,6 +37,8 @@ function makeServer(turns: FakeTurn[], resolve: (sid: string) => string | undefi
     resolveSid: resolve,
     pendingTurns: new Map(turns.map((t, i) => [`req${i}`, t])),
     lastCancelledAt: new Map<string, number>(),
+    // stopBackendTurn consults this (compaction kill guard) — mirror the shape.
+    autoCompactInFlight: new Set<string>(),
     ensureBackend: () => ({
       send: (method: string, params: unknown) => {
         sent.push({ method, params });
@@ -87,6 +89,7 @@ describe("session/cancel handler", () => {
       resolveSid: () => undefined,
       pendingTurns: new Map(),
       lastCancelledAt: new Map<string, number>(),
+      autoCompactInFlight: new Set<string>(),
       ensureBackend: () => ({ send }),
     } as unknown as ZcodeAcpServer;
 
@@ -107,6 +110,8 @@ function makeTurnFixtures() {
       pollServerRequests: () => [],
     }),
     sessionAliases: (sid: string) => [sid],
+    // stopBackendTurn consults this (compaction kill guard) — mirror the shape.
+    autoCompactInFlight: new Set<string>(),
   } as unknown as ZcodeAcpServer;
   const pollEvent = vi.fn();
   const listener = {

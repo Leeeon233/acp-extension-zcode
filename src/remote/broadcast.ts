@@ -9,9 +9,10 @@
  * - `notify` fans out to every client; a single dead/slow client is warned
  *   about and never fails the others.
  * - `request` (permission / elicitation) is sent to every client and the FIRST
- *   response wins. Losers are aborted via `cancellationSignal`, which makes
- *   the SDK emit `$/cancel_request` so the losing editor dismisses its dialog
- *   (verified against Zed's ACP client).
+ *   response wins. Losing attempts are aborted locally (the SDK ignores the
+ *   signal — nothing reaches the wire); the visible dismissal of the losers'
+ *   stale dialogs is the bridge's `$/zcode/ask_settled` notification (see
+ *   handlers/server-requests.ts emitAskSettled).
  *
  * Loser promises settle late (the peer answers the cancellation eventually) —
  * every raced promise carries a no-op catch so late settlements can't surface

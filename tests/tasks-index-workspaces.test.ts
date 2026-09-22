@@ -10,7 +10,7 @@
  * so directory-existence checks need no filesystem.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // Row shape the SELECT aggregates over (only the columns the query reads).
 interface FakeRow {
@@ -30,10 +30,7 @@ let realDirs: Set<string>;
 
 vi.mock("node:sqlite", () => {
   class DatabaseSync {
-    constructor(
-      path: string,
-      _options?: { timeout?: number },
-    ) {
+    constructor(path: string, _options?: { timeout?: number }) {
       openedPaths.push(path);
     }
     prepare(sql: string) {
@@ -89,6 +86,16 @@ vi.mock("node:fs", async () => {
 
 import { isSelectableWorkspace, listKnownWorkspaces } from "../src/tasks-index.js";
 
+// The workspace exclusion uses zcodeHomeDir(), which reads HOME from the env
+// (not node:os) — pin it to the same fake home the node:os mock reports.
+beforeEach(() => {
+  vi.stubEnv("HOME", "/fake/home");
+});
+
+afterEach(() => {
+  vi.unstubAllEnvs();
+});
+
 describe("isSelectableWorkspace", () => {
   beforeEach(() => {
     realDirs = new Set(["/Users/dev/Develop/proj-a"]);
@@ -120,6 +127,16 @@ describe("isSelectableWorkspace", () => {
     expect(isSelectableWorkspace("/Users/dev/work/.zcode")).toBe(true);
   });
 
+  it("rejects the ZCODE_HOME override root instead of ~/.zcode when set", () => {
+    vi.stubEnv("ZCODE_HOME", "/alt/data-root");
+    realDirs.add("/alt/data-root");
+    realDirs.add("/fake/home/.zcode");
+    expect(isSelectableWorkspace("/alt/data-root")).toBe(false);
+    expect(isSelectableWorkspace("/alt/data-root/skills")).toBe(false);
+    // With the override active, the real home's .zcode is an ordinary path.
+    expect(isSelectableWorkspace("/fake/home/.zcode")).toBe(true);
+  });
+
   it("rejects missing paths and non-directories", () => {
     expect(isSelectableWorkspace("/Users/dev/Develop/gone")).toBe(false);
     realDirs.add("/Users/dev/Develop/a-file");
@@ -139,9 +156,24 @@ describe("listKnownWorkspaces", () => {
 
   it("aggregates sessions per workspace, newest activity first", async () => {
     rows = [
-      { workspace_key: "/Users/dev/Develop/proj-a", workspace_path: "/Users/dev/Develop/proj-a", deleted: 0, updated_at: 100 },
-      { workspace_key: "/Users/dev/Develop/proj-a", workspace_path: "/Users/dev/Develop/proj-a", deleted: 0, updated_at: 300 },
-      { workspace_key: "/Users/dev/Develop/proj-b", workspace_path: "/Users/dev/Develop/proj-b", deleted: 0, updated_at: 200 },
+      {
+        workspace_key: "/Users/dev/Develop/proj-a",
+        workspace_path: "/Users/dev/Develop/proj-a",
+        deleted: 0,
+        updated_at: 100,
+      },
+      {
+        workspace_key: "/Users/dev/Develop/proj-a",
+        workspace_path: "/Users/dev/Develop/proj-a",
+        deleted: 0,
+        updated_at: 300,
+      },
+      {
+        workspace_key: "/Users/dev/Develop/proj-b",
+        workspace_path: "/Users/dev/Develop/proj-b",
+        deleted: 0,
+        updated_at: 200,
+      },
     ];
     const list = await listKnownWorkspaces("/fake/db.sqlite");
     expect(list).toEqual([
@@ -152,11 +184,36 @@ describe("listKnownWorkspaces", () => {
 
   it("drops deleted rows, temp dirs, the config home, and vanished directories", async () => {
     rows = [
-      { workspace_key: "/Users/dev/Develop/gone", workspace_path: "/Users/dev/Develop/gone", deleted: 0, updated_at: 900 },
-      { workspace_key: "/tmp/scratch", workspace_path: "/tmp/scratch", deleted: 0, updated_at: 800 },
-      { workspace_key: "/fake/home/.zcode", workspace_path: "/fake/home/.zcode", deleted: 0, updated_at: 700 },
-      { workspace_key: "/Users/dev/Develop/proj-a", workspace_path: "/Users/dev/Develop/proj-a", deleted: 1, updated_at: 600 },
-      { workspace_key: "/Users/dev/Develop/proj-b", workspace_path: "/Users/dev/Develop/proj-b", deleted: 0, updated_at: 500 },
+      {
+        workspace_key: "/Users/dev/Develop/gone",
+        workspace_path: "/Users/dev/Develop/gone",
+        deleted: 0,
+        updated_at: 900,
+      },
+      {
+        workspace_key: "/tmp/scratch",
+        workspace_path: "/tmp/scratch",
+        deleted: 0,
+        updated_at: 800,
+      },
+      {
+        workspace_key: "/fake/home/.zcode",
+        workspace_path: "/fake/home/.zcode",
+        deleted: 0,
+        updated_at: 700,
+      },
+      {
+        workspace_key: "/Users/dev/Develop/proj-a",
+        workspace_path: "/Users/dev/Develop/proj-a",
+        deleted: 1,
+        updated_at: 600,
+      },
+      {
+        workspace_key: "/Users/dev/Develop/proj-b",
+        workspace_path: "/Users/dev/Develop/proj-b",
+        deleted: 0,
+        updated_at: 500,
+      },
     ];
     const list = await listKnownWorkspaces("/fake/db.sqlite");
     // gone: not in realDirs → excluded. scratch: temp. .zcode: config home.
@@ -168,7 +225,9 @@ describe("listKnownWorkspaces", () => {
 
   it("returns [] when the aggregate row shapes are malformed", async () => {
     // Simulate a schema-drifted row: workspace_path not a string.
-    rows = [{ workspace_key: 42 as unknown as string, workspace_path: "", deleted: 0, updated_at: 1 }];
+    rows = [
+      { workspace_key: 42 as unknown as string, workspace_path: "", deleted: 0, updated_at: 1 },
+    ];
     const list = await listKnownWorkspaces("/fake/db.sqlite");
     expect(list).toEqual([]);
   });

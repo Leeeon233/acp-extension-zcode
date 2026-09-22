@@ -14,6 +14,7 @@ import {
   loadZcodeCredentials,
   mergeEnvWithCreds,
   resolveZcodeCommand,
+  zcodeDataBaseDirEnv,
   ZcodeBackend,
 } from "./backend/index.js";
 import { armSandboxArgv, collectSandboxWorkspaces, sandboxActive } from "./backend/sandbox.js";
@@ -21,6 +22,8 @@ import { BackgroundTaskListener } from "./handlers/background-tasks.js";
 import { enqueueSessionSend } from "./handlers/io.js";
 import { SandboxRestartBatcher, flushSandboxGrants } from "./handlers/sandbox-allow.js";
 import { LODY_AGENT_CAPABILITIES } from "./lody.js";
+import { answerProviderRuntimeHeaders } from "./handlers/server-requests.js";
+import { SessionTitleListener } from "./handlers/session-titles.js";
 import { ClientRegistry } from "./remote/broadcast.js";
 import { AGENT_INFO, clientConnectionRoot, PROTOCOL_VERSION, log, warn } from "./utils.js";
 
@@ -57,6 +60,13 @@ export interface PendingTurn {
   /** Set once session/stop has been fired for this turn, to avoid re-sending. */
   stopSent?: boolean;
   /**
+   * True once the backend ACCEPTED this turn's session/send — the turn may
+   * own a running generation from that moment (its turn.started can lag or,
+   * on a deaf stream, never arrive). stopBackendTurn's compaction guard only
+   * spares turns whose send was NEVER accepted: those own nothing.
+   */
+  sendAccepted?: boolean;
+  /**
    * Foreground execution id from the backend's `turn.started` payload. The
    * v4/command stop targets it — session/stop alone is ignored by the Aug-28
    * app-server (its abort controller is never registered; see AGENTS.md).
@@ -87,6 +97,15 @@ export interface PendingTurn {
    * current ticket on the respawned backend" instead of a user ESC pause.
    */
   sandboxRestart?: boolean;
+  /**
+   * Set when the turn was rejected because a detached auto-compact held the
+   * backend prompt lock (busy 1308): the send was never delivered and the
+   * caller told the user to resend. The goal-loop driver keys its
+   * wait-and-retry off this flag — runOneTurn never queues behind a
+   * compaction (the queued listener would inherit the compaction's whole
+   * internal-turn stream as residue).
+   */
+  compactRejected?: boolean;
 }
 
 /**
@@ -146,6 +165,14 @@ export class ZcodeAcpServer {
    */
   readonly sessionCwds = new Map<string, string>();
   /**
+   * Client-provided MCP servers per ACP session id. Like sessionCwds this
+   * survives materialization: the backend treats mcpServers as per-load
+   * runtime config, NOT persisted session state, so every later backend
+   * load/resume/reload (idle eviction, respawn, drain) must re-send them or
+   * the session silently loses its client MCP tools (#193).
+   */
+  readonly sessionMcpServers = new Map<string, acp.McpServer[]>();
+  /**
    * In-flight `session/resume` single-flight, keyed by backend session id
    * (ADR-0017 first-entry race): the hub answers the App's incubation request
    * as soon as the TUI's bridge REGISTERS — before the TUI's boot-resume
@@ -157,6 +184,67 @@ export class ZcodeAcpServer {
    * in the middle").
    */
   readonly resumeInFlight = new Map<string, Promise<unknown>>();
+  /**
+   * Backend session ids whose last settle poll hit RESUME_SETTLE_CAP_MS while
+   * hydration was still growing (see fetchMessagesSettled): a later plain
+   * session/messages read can still land mid-restore, so already-live load /
+   * resume paths re-settle before replaying (fetchMessagesForReplay). Cleared
+   * by any settle that reaches two stable reads.
+   */
+  readonly hydrationUnsettled = new Set<string>();
+  /**
+   * Largest session/messages snapshot length ever observed by a settle for a
+   * backend session id. A re-settle (marker armed by a capped settle) treats
+   * one non-growing read that reaches this watermark as caught-up: big
+   * sessions' reads take seconds each, and demanding the full two-stable
+   * plateau inside the cap again meant the marker never cleared — every
+   * session/load re-paid a capped settle (observed 2026-09-20 on a 7413-
+   * message session: 22–56s loads). Reset on backend respawn — a rehydrating
+   * session starts growing from zero again.
+   */
+  readonly hydrationWatermark = new Map<string, number>();
+  /**
+   * Backend session ids with a DETACHED auto-compact in flight (see
+   * runAutoCompactDetached in config/auto-compact.ts). The turn that armed it
+   * has already returned — cancel/preempt must not touch the compaction, the
+   * drain gate must not escalate on it, and a concurrent prompt's busy-retry
+   * extends its budget to the compaction settle bound instead of failing.
+   */
+  readonly autoCompactInFlight = new Set<string>();
+  /**
+   * Last compact terminal state per backend session id, recorded from the
+   * backend's `state.updated` notification (reasons `session_compacted` /
+   * `session_compact_cancelled` / `session_compact_failed`) — the RPC ack
+   * alone cannot distinguish success from a swallowed background failure
+   * (see ZcodeBackend.onCompactOutcome).
+   */
+  readonly compactOutcomes = new Map<string, { reason: string; at: number }>();
+  /**
+   * Last model/thought choice per backend session id (config spelling), set
+   * by every switch path (setConfigOption + the setModel/setThoughtLevel
+   * extensions) and re-applied after every resume — the backend's own
+   * selection entry can be lost (see LazySessionRecord.modelChoice), and a
+   * resumed session silently reverts to the workspace default while the
+   * editor dropdown still shows the user's choice. Survives backend
+   * respawns on purpose (it is per-session, not per-process state).
+   */
+  readonly sessionModelChoices = new Map<
+    string,
+    { model?: string; thought?: string; at?: number }
+  >();
+  /**
+   * True once THIS backend process rejected a session/send with the
+   * whole-turn busy error (-32010 "A prompt is already running for this
+   * session"). 0.16.9 source semantics (sendPrompt's activeAbortController
+   * guard, server-operations.ts): the busy window spans the ENTIRE turn, so
+   * a mid-turn send can never be silently accepted as steer — while set, the
+   * prompt path skips the drain gate's pre-send poll and lets the send
+   * busy-retry loop be the single readiness authority. 0.16.5 accepts
+   * mid-generation sends as (silently dropped) steer input, so backends
+   * that never showed the rejection keep the full drain gate. Behavioral
+   * evidence only — no version sniffing. Reset on backend respawn.
+   */
+  observedSendBusyReject = false;
   /**
    * Sandbox dynamic-allow state (ADR-0011): realpaths granted for this
    * bridge lifetime ("仅此一次" answers) — folded into the Seatbelt profile
@@ -336,6 +424,18 @@ export class ZcodeAcpServer {
   /** Per-session model cache for configOptions model dropdown. */
   readonly modelCache = new Map<string, string>();
   /**
+   * Per-session (zcodeSid) FULL model-availability list, captured from the
+   * `session/create` snapshot (`settings.model.available`). Only create/resume
+   * return the complete list with authoritative `reasoning.defaultLevel` —
+   * `session/read` answers `modelAvailability:"current"` (just the active
+   * model). Model switches need a target's default reasoning level, so this
+   * cache is the lookup; an entry that declares no levels simply has none.
+   */
+  readonly modelAvailability = new Map<
+    string,
+    Array<{ providerId?: string; modelId?: string; defaultLevel?: string }>
+  >();
+  /**
    * Per-session (zcodeSid) background-task listeners. Registered once when a
    * session is created/resumed/loaded and lives across prompts, forwarding
    * background task status + result notifications to the client outside of
@@ -343,6 +443,31 @@ export class ZcodeAcpServer {
    * (backend.listeners is now a Set per session).
    */
   readonly backgroundListeners = new Map<string, BackgroundTaskListener>();
+  /**
+   * Backend instance each session's out-of-band listeners were registered on.
+   * The backend can be REPLACED mid-session (sandbox arm-flip, dynamic allow
+   * batches, dead-reader recovery) and listeners are per-instance — when this
+   * map's entry differs from the current backend, ensureBackgroundListener
+   * re-registers (also called from the prompt path so a respawn heals on the
+   * next turn, not just on resume/load).
+   */
+  readonly backgroundListenerBackend = new Map<string, ZcodeBackend>();
+  /**
+   * Sessions (zcodeSid) whose background NOTIFICATION turn (the model
+   * summarising a finished background task) is currently running, → start
+   * time. Maintained by BackgroundTaskListener; read by the prompt path to
+   * extend the send busy-retry budget — a notification turn is a real model
+   * turn and easily outlives the normal 30s busy window, after which the
+   * user's prompt would fail outright (#194-adjacent UX).
+   */
+  readonly notifyTurnActiveSince = new Map<string, number>();
+  /**
+   * Sessions (acpSid) whose title was set by MANUAL user intent (the remote
+   * rename endpoint, or a `session.titleUpdated` push with source "custom"
+   * from another surface). The backend's later `generated` title pushes must
+   * not override these (SessionTitleListener).
+   */
+  readonly titleUserSetBy = new Set<string>();
   /**
    * Per-Bash-callId stdout snapshot already streamed via terminal_output. Used
    * by dispatchTerminalUpdate for two dedup guards:
@@ -383,9 +508,16 @@ export class ZcodeAcpServer {
    */
   ensureBackend(): ZcodeBackend {
     if (this.backend && !this.backend.isDead) return this.backend;
-    const env = mergeEnvWithCreds(loadZcodeCredentials());
+    // builtinProviderEnv injects the CLI's built-in provider table the way the
+    // desktop host does — a bare .app-bundle CLI cannot find it on its own.
+    // zcodeDataBaseDirEnv translates the bridge's ZCODE_HOME into the CLI's
+    // own ZCODE_DATA_BASE_DIR spelling so both sides read the same data tree.
+    const env = {
+      ...mergeEnvWithCreds(loadZcodeCredentials()),
+      ...builtinProviderEnv(),
+      ...zcodeDataBaseDirEnv(),
+    };
     let argv = resolveZcodeCommand();
-    Object.assign(env, builtinProviderEnv(argv, env));
     this.backendSandboxed = sandboxActive(this.sandboxRoots());
     if (this.backendSandboxed) {
       const { workspaces, extraAllow } = collectSandboxWorkspaces(this.sandboxRoots());
@@ -402,8 +534,56 @@ export class ZcodeAcpServer {
       // never be escaped from within.
       env.ZCODE_ACP_SANDBOX_ACTIVE = "1";
     }
-    this.backend = new ZcodeBackend(argv, env);
-    return this.backend;
+    const backend = new ZcodeBackend(argv, env);
+    this.backend = backend;
+    // Fresh backend process: every session rehydrates from scratch, so the
+    // settle bookkeeping from the previous instance is void.
+    this.hydrationUnsettled.clear();
+    this.hydrationWatermark.clear();
+    this.compactOutcomes.clear();
+    // …and the send-semantics evidence: the respawned process may be an
+    // older build that still accepts mid-turn sends as steer.
+    this.observedSendBusyReject = false;
+    // Answer the provider runtime-headers handshake the moment it ARRIVES:
+    // the backend asks before every model request on a zhipu-account provider,
+    // and outside a turn loop (compact's internal turn, session/goal set) the
+    // queued request went unanswered until the backend's 180s cap killed the
+    // generation ("Captcha verification request timed out" — auto-compact
+    // silently failed this way; see answerProviderRuntimeHeaders). The reply
+    // work (config reads, CLI resolution) is deferred off the shared reader
+    // loop; the backend waits seconds for this handshake, a tick is free.
+    // Captures the LOCAL instance: a respawned backend must never receive
+    // replies for a frame the dying one asked.
+    backend.providerRuntimeHeadersResponder = (id, params) => {
+      setImmediate(() => {
+        try {
+          answerProviderRuntimeHeaders(
+            backend,
+            id,
+            "interaction/requestProviderRuntimeHeaders",
+            params,
+          );
+        } catch (e) {
+          warn(
+            `provider runtime headers responder threw, declining: ` +
+              `${e instanceof Error ? e.message : String(e)}`,
+          );
+          try {
+            backend.sendReply(id, { headersApplied: false, errorMessage: "bridge error" });
+          } catch {
+            /* backend gone — nothing to answer */
+          }
+        }
+      });
+      return true;
+    };
+    // Record compact terminal states (per-session) as they arrive — compact()
+    // reads the entry after its lock wait to detect failures the RPC never
+    // reports.
+    backend.onCompactOutcome = (sid, reason) => {
+      this.compactOutcomes.set(sid, { reason, at: Date.now() });
+    };
+    return backend;
   }
 
   /**
@@ -563,14 +743,40 @@ export class ZcodeAcpServer {
    * backend's per-session listener Set.
    */
   ensureBackgroundListener(zcodeSid: string): BackgroundTaskListener {
-    const existing = this.backgroundListeners.get(zcodeSid);
-    if (existing) return existing;
     const backend = this.ensureBackend();
-    const listener = new BackgroundTaskListener(this, zcodeSid);
+    const existing = this.backgroundListeners.get(zcodeSid);
+    if (existing && this.backgroundListenerBackend.get(zcodeSid) === backend) return existing;
+    // Fresh session, or the backend was respawned since registration —
+    // (re-)register on the CURRENT instance; the old instance's listener set
+    // died with it, so there is no duplicate-registration risk.
+    const listener = existing ?? new BackgroundTaskListener(this, zcodeSid);
     this.backgroundListeners.set(zcodeSid, listener);
     backend.registerEventListener(zcodeSid, listener);
+    // The session-scoped title listener rides the same registration site and
+    // lifetime: one registration covers both out-of-band consumers.
+    backend.registerEventListener(zcodeSid, new SessionTitleListener(this, zcodeSid));
+    this.backgroundListenerBackend.set(zcodeSid, backend);
     log(`  [bg] background listener registered for ${zcodeSid}`);
     return listener;
+  }
+
+  /**
+   * Terminal records for in-flight background tasks before the backend
+   * subprocess is torn down — the CLI's in-memory task registry dies silently
+   * with the adapter, so without this the client's task cards hang in
+   * in_progress forever (#194). Best-effort; called from shutdown paths.
+   */
+  async emitBackgroundTaskShutdownRecords(): Promise<void> {
+    for (const listener of this.backgroundListeners.values()) {
+      try {
+        await listener.emitShutdownRecords();
+      } catch (e) {
+        warn(
+          `shutdown task records failed for ${listener.zcodeSid}: ` +
+            `${e instanceof Error ? e.message : String(e)}`,
+        );
+      }
+    }
   }
 
   /** Resolve the ACP session id for a zcode session id (reverse of resolveSid). */

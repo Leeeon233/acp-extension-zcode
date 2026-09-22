@@ -57,6 +57,7 @@ beforeEach(() => {
   mockDirs.clear();
   mockMtimes.clear();
   vi.stubEnv("HOME", "/fake-home");
+  vi.stubEnv("ZCODE_HOME", "");
 });
 
 afterEach(() => {
@@ -64,6 +65,19 @@ afterEach(() => {
 });
 
 describe("lazy session alias store", () => {
+  it("writes under ZCODE_HOME when it is set, ignoring HOME", () => {
+    vi.stubEnv("ZCODE_HOME", "/custom-zcode");
+
+    rememberLazySession("acp_env", "/tmp/ws");
+
+    expect(mockFiles.has("/custom-zcode/v2/acp-lazy-sessions.json")).toBe(true);
+    expect(mockFiles.has(STORE)).toBe(false);
+    expect(lookupLazySession("acp_env")).toEqual({
+      cwd: "/tmp/ws",
+      createdAt: expect.any(Number),
+    });
+  });
+
   it("records a placeholder at session/new and reads it back", () => {
     rememberLazySession("acp_1", "/tmp/ws");
 

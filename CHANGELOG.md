@@ -5,6 +5,240 @@ All notable changes to this project are documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.47.0](https://github.com/william0wang/zcode-acp/compare/v0.46.7...v0.47.0) (2026-09-22)
+
+
+### Features
+
+* settings API for ZCode configuration management ([#238](https://github.com/william0wang/zcode-acp/issues/238)) ([3f6ef1b](https://github.com/william0wang/zcode-acp/commit/3f6ef1b0a9004dcedae1fa7718bc1506e18fa236))
+
+## [0.46.7](https://github.com/william0wang/zcode-acp/compare/v0.46.6...v0.46.7) (2026-09-22)
+
+
+### Bug Fixes
+
+* scope turn-internal history reads with the backend's native pagination ([#236](https://github.com/william0wang/zcode-acp/issues/236)) ([d475e31](https://github.com/william0wang/zcode-acp/commit/d475e3105df5be87dd19a24bbbd2b4a52211c727))
+
+## [0.46.6](https://github.com/william0wang/zcode-acp/compare/v0.46.5...v0.46.6) (2026-09-21)
+
+
+### Bug Fixes
+
+* align permission replies, turn terminals, model lists and backend layout with 0.16.9 ([#234](https://github.com/william0wang/zcode-acp/issues/234)) ([4f8b41f](https://github.com/william0wang/zcode-acp/commit/4f8b41f464054af73d41d922b42bbc60f5d31ec6))
+
+## [0.46.5](https://github.com/william0wang/zcode-acp/compare/v0.46.4...v0.46.5) (2026-09-21)
+
+
+### Bug Fixes
+
+* read turnId from the event envelope so turn attribution works on 0.16.9 ([#232](https://github.com/william0wang/zcode-acp/issues/232)) ([d4dcc3f](https://github.com/william0wang/zcode-acp/commit/d4dcc3f9465d45204d8db616c8028023d97118b6))
+
+## [0.46.4](https://github.com/william0wang/zcode-acp/compare/v0.46.3...v0.46.4) (2026-09-21)
+
+
+### Bug Fixes
+
+* remember slash model switches, target /resume replay, arbitrate choices across aliases ([#230](https://github.com/william0wang/zcode-acp/issues/230)) ([3fc37ab](https://github.com/william0wang/zcode-acp/commit/3fc37ab54eb6bb00015cd6954115ad7ad1a3de2e))
+
+## [0.46.3](https://github.com/william0wang/zcode-acp/compare/v0.46.2...v0.46.3) (2026-09-21)
+
+
+### Bug Fixes
+
+* carry the TUI stats dock filter into hub-incubated windows ([#227](https://github.com/william0wang/zcode-acp/issues/227)) ([d10e521](https://github.com/william0wang/zcode-acp/commit/d10e5219a1719dcae71f7890ba04814ee60ab4e0))
+
+## [0.46.2](https://github.com/william0wang/zcode-acp/compare/v0.46.1...v0.46.2) (2026-09-21)
+
+
+### Bug Fixes
+
+* replay targeting + model-choice hardening ([#225](https://github.com/william0wang/zcode-acp/issues/225)) ([f7628eb](https://github.com/william0wang/zcode-acp/commit/f7628eb77dfe1b73b851ecb560c8904251094cc5))
+
+## [0.46.1](https://github.com/william0wang/zcode-acp/compare/v0.46.0...v0.46.1) (2026-09-21)
+
+
+### Bug Fixes
+
+* re-assert remembered model choice after resume to stop silent reverts ([#223](https://github.com/william0wang/zcode-acp/issues/223)) ([87f6189](https://github.com/william0wang/zcode-acp/commit/87f6189d2950364ba29a2e0f6344c959e565ae7f))
+
+## [0.46.0](https://github.com/william0wang/zcode-acp/compare/v0.45.0...v0.46.0) (2026-09-21)
+
+
+### Features
+
+* drain-gate fast path, subagent status lines, turn stats, mcp health panel ([#221](https://github.com/william0wang/zcode-acp/issues/221)) ([6540ab7](https://github.com/william0wang/zcode-acp/commit/6540ab774788d7e3816b3478761e0b7bc5f5539c))
+
+## [0.45.0](https://github.com/william0wang/zcode-acp/compare/v0.44.4...v0.45.0) (2026-09-21)
+
+
+### Features
+
+* align with the open-sourced ZCode backend (compact outcomes, /compact focus, 0.16.9 lock wording) ([#220](https://github.com/william0wang/zcode-acp/issues/220)) ([2527f53](https://github.com/william0wang/zcode-acp/commit/2527f536cc968afae66b2957a8d71f1c3641aa57))
+
+
+### Bug Fixes
+
+* stop injecting the provider model endpoint as the app-server service origin ([#215](https://github.com/william0wang/zcode-acp/issues/215)) ([f7f97aa](https://github.com/william0wang/zcode-acp/commit/f7f97aa4f7aaa9410c052ad6bac4ebe23287db13))
+
+## [0.44.4](https://github.com/william0wang/zcode-acp/compare/v0.44.3...v0.44.4) (2026-09-20)
+
+
+### Bug Fixes
+
+* reject prompts during auto-compact instead of queuing behind the lock ([81fed9e](https://github.com/william0wang/zcode-acp/commit/81fed9e6473156781eafe6cbbeebacfa47bf9d5a))
+
+## [0.44.3](https://github.com/william0wang/zcode-acp/compare/v0.44.2...v0.44.3) (2026-09-20)
+
+
+### Bug Fixes
+
+* bound turn-internal history reads and harden the settle watermark ([9f5a76c](https://github.com/william0wang/zcode-acp/commit/9f5a76cd394979d797503ef278bcdb005c902691))
+* merge desktop provider_config.json models into the dropdown ([7a24f36](https://github.com/william0wang/zcode-acp/commit/7a24f3637d90b3d03c0cb2265c0499ae0b6da126))
+
+## [0.44.2](https://github.com/william0wang/zcode-acp/compare/v0.44.1...v0.44.2) (2026-09-20)
+
+
+### Bug Fixes
+
+* settle big-session hydration without re-paying capped reads on every load ([b5f9773](https://github.com/william0wang/zcode-acp/commit/b5f97734f6855134afb344a57cea0af41ddc3829))
+
+## [0.44.1](https://github.com/william0wang/zcode-acp/compare/v0.44.0...v0.44.1) (2026-09-19)
+
+
+### Bug Fixes
+
+* answer provider runtime headers at arrival so compact turns survive ([45a7f01](https://github.com/william0wang/zcode-acp/commit/45a7f014dbeed17817d7f80b69ddd534e74749ee))
+* guard compaction turns from stops and scope the runtime-headers responder ([7ec703b](https://github.com/william0wang/zcode-acp/commit/7ec703b92b4afcbbda2715bc971190be2be34419))
+* harden compaction stop guard and dead-reader settle from cross review ([34e9da1](https://github.com/william0wang/zcode-acp/commit/34e9da1f4ae0ced2a1b5f0cd8720406e5688b99d))
+* re-settle hydration on capped resumes and mark load_earlier pages ([52914c3](https://github.com/william0wang/zcode-acp/commit/52914c3e03e8028a1f694cd152ed8e30a69bf8ee))
+* run auto-compact detached from the turn so cancel/preempt cannot kill it ([01d222a](https://github.com/william0wang/zcode-acp/commit/01d222a61a43780d29bf4b3c678d28126ad49089))
+
+## [0.44.0](https://github.com/william0wang/zcode-acp/compare/v0.43.4...v0.44.0) (2026-09-19)
+
+
+### Features
+
+* **config:** maintain all user preferences in the config file ([6bfb1b2](https://github.com/william0wang/zcode-acp/commit/6bfb1b24898e31f763eff8d8f5918e99f5d688d8))
+
+## [0.43.4](https://github.com/william0wang/zcode-acp/compare/v0.43.3...v0.43.4) (2026-09-19)
+
+
+### Bug Fixes
+
+* attach dummy exit listeners before the shutdown kill to close a linux race ([5ae87ac](https://github.com/william0wang/zcode-acp/commit/5ae87ac3dc2e7c599c8357e5087e4bc381026ef0))
+* **quota:** migrate opencode go to the console status API ([5b4966b](https://github.com/william0wang/zcode-acp/commit/5b4966bf9cc9b8844fb721c5ff5ad254834a6339))
+* **remote:** tear the whole TUI tree down on instance shutdown ([f776da0](https://github.com/william0wang/zcode-acp/commit/f776da088c0b216bf392ee21e6ced7d799d2b785))
+
+## [0.43.3](https://github.com/william0wang/zcode-acp/compare/v0.43.2...v0.43.3) (2026-09-18)
+
+
+### Bug Fixes
+
+* report cache-exclusive inputTokens in turn usage for correct cache hit rate ([056574a](https://github.com/william0wang/zcode-acp/commit/056574a86bcb725da77e218de9d130218f765596))
+* resume deleted sessions honestly and reload store-recovered sessions before first use ([ddafa66](https://github.com/william0wang/zcode-acp/commit/ddafa6677a55fc126b4c3305f691c2ab8b3df643))
+
+## [0.43.2](https://github.com/william0wang/zcode-acp/compare/v0.43.1...v0.43.2) (2026-09-18)
+
+
+### Bug Fixes
+
+* derive the account-to-config provider id mapping without the bundled table ([2b2fc7b](https://github.com/william0wang/zcode-acp/commit/2b2fc7b363478763d2d51f99c0dd13288ced6c5d))
+
+## [0.43.1](https://github.com/william0wang/zcode-acp/compare/v0.43.0...v0.43.1) (2026-09-18)
+
+
+### Bug Fixes
+
+* prefer the configured model context window over the backend's placeholder in usage_update ([41d719a](https://github.com/william0wang/zcode-acp/commit/41d719aa41802f0db64458d16022aa3dabcaf9f9))
+
+## [0.43.0](https://github.com/william0wang/zcode-acp/compare/v0.42.5...v0.43.0) (2026-09-18)
+
+
+### Features
+
+* adopt backend session titles and extend the busy window for background notification turns ([2cc671e](https://github.com/william0wang/zcode-acp/commit/2cc671e2c06111537e119bafd263605c0ea75167))
+
+## [0.42.5](https://github.com/william0wang/zcode-acp/compare/v0.42.4...v0.42.5) (2026-09-17)
+
+
+### Bug Fixes
+
+* answer provider runtime headers with the coding-plan API key so GLM turns run ([ce3bdec](https://github.com/william0wang/zcode-acp/commit/ce3bdec14cd9f17090ca46a8ca00d235e2e144ce))
+
+## [0.42.4](https://github.com/william0wang/zcode-acp/compare/v0.42.3...v0.42.4) (2026-09-17)
+
+
+### Bug Fixes
+
+* inject both provider-config env vars so the 3.12+ CLI uses the bundled table verbatim ([b0ecb89](https://github.com/william0wang/zcode-acp/commit/b0ecb8926860c1ee70a0f6f14aa1d2fc020f346f)), closes [#202](https://github.com/william0wang/zcode-acp/issues/202)
+
+## [0.42.3](https://github.com/william0wang/zcode-acp/compare/v0.42.2...v0.42.3) (2026-09-17)
+
+
+### Bug Fixes
+
+* push the account provider snapshot and use the 3.12+ setModel shape so coding-plan models switch ([80ad523](https://github.com/william0wang/zcode-acp/commit/80ad523d42bea857bf920f9c4fe223b17f653b57))
+
+## [0.42.2](https://github.com/william0wang/zcode-acp/compare/v0.42.1...v0.42.2) (2026-09-17)
+
+
+### Bug Fixes
+
+* inject ZCODE_BUILTIN_PROVIDER_CONFIG_FILE for bundled CLI launches ([8293b7c](https://github.com/william0wang/zcode-acp/commit/8293b7c4c3c8210e779a4f894018a8c5760010b6))
+* require sustained probe failure before pruning a hub instance ([ea918c5](https://github.com/william0wang/zcode-acp/commit/ea918c51fa50eef641f8191f828abb9e72aeb0eb))
+
+## [0.42.1](https://github.com/william0wang/zcode-acp/compare/v0.42.0...v0.42.1) (2026-09-17)
+
+
+### Bug Fixes
+
+* show Ollama Cloud dock percent at one-decimal precision and drop the constant window label ([95f01c9](https://github.com/william0wang/zcode-acp/commit/95f01c935d149b4d5c4a67e61094a3264eef1a6a))
+
+## [0.42.0](https://github.com/william0wang/zcode-acp/compare/v0.41.0...v0.42.0) (2026-09-17)
+
+
+### Features
+
+* drop the TPS dock segment and show Ollama Cloud quota with derived reset times ([83e7bcb](https://github.com/william0wang/zcode-acp/commit/83e7bcbacec46556db57edb044dd8c99f2f9c34c))
+
+## [0.41.0](https://github.com/william0wang/zcode-acp/compare/v0.40.1...v0.41.0) (2026-09-16)
+
+
+### Features
+
+* add Ollama Cloud quota card with dual-plan support and unified quota credentials in user config ([2c9a076](https://github.com/william0wang/zcode-acp/commit/2c9a076e490fab97902f977f9a7a6428ad6e7f67))
+
+## [0.40.1](https://github.com/william0wang/zcode-acp/compare/v0.40.0...v0.40.1) (2026-09-16)
+
+
+### Bug Fixes
+
+* disallow unservable Cron tools by default and record in-flight background tasks on shutdown ([#192](https://github.com/william0wang/zcode-acp/issues/192), [#194](https://github.com/william0wang/zcode-acp/issues/194)) ([444d13f](https://github.com/william0wang/zcode-acp/commit/444d13ff1b4c0bbbe9f1c5627327c67115e69ac5))
+* re-send client mcpServers on every backend session load ([#193](https://github.com/william0wang/zcode-acp/issues/193)) ([90ccc13](https://github.com/william0wang/zcode-acp/commit/90ccc138f89400cfdae86c10eb710d0e7c0c2156))
+* skip keyless builtin providers and keep self-consistent env base URL overrides ([#183](https://github.com/william0wang/zcode-acp/issues/183)) ([d510d37](https://github.com/william0wang/zcode-acp/commit/d510d37025976a200a127fa00cd44180f66457a6))
+
+## [0.40.0](https://github.com/william0wang/zcode-acp/compare/v0.39.0...v0.40.0) (2026-09-16)
+
+
+### Features
+
+* notify serve-origin clients on remote session close ([387a2c4](https://github.com/william0wang/zcode-acp/commit/387a2c4da30fe334bc503148c435b62ab9f68b70))
+
+
+### Bug Fixes
+
+* broadcast extension settings switches to every attached client ([e005045](https://github.com/william0wang/zcode-acp/commit/e0050450f904b9155bf26c97870062a961c5ddfd))
+* tell attached clients when a raced interaction ask was decided ([f5d5e5a](https://github.com/william0wang/zcode-acp/commit/f5d5e5ad625bef95284a075c8dc58d8c246bf884))
+
+## [0.39.0](https://github.com/william0wang/zcode-acp/compare/v0.38.0...v0.39.0) (2026-09-16)
+
+
+### Features
+
+* choose the initial session mode with ZCODE_ACP_MODE ([#189](https://github.com/william0wang/zcode-acp/issues/189)) ([a1aa2e0](https://github.com/william0wang/zcode-acp/commit/a1aa2e0217386ecabe57d59b33fce0cf783dbea8))
+* honor ZCODE_HOME for the config and lazy-session store paths ([#187](https://github.com/william0wang/zcode-acp/issues/187)) ([0593488](https://github.com/william0wang/zcode-acp/commit/059348851a85bb9704c2b68eca91c4f1f3a7fbf9))
+* pin the provider and model with ZCODE_PROVIDER and ZCODE_MODEL ([#188](https://github.com/william0wang/zcode-acp/issues/188)) ([6aa8999](https://github.com/william0wang/zcode-acp/commit/6aa8999f72fe2ca35ed3d4bcf05263754c60ba1c))
+
 ## [0.38.0](https://github.com/william0wang/zcode-acp/compare/v0.37.3...v0.38.0) (2026-09-15)
 
 

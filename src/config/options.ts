@@ -14,15 +14,19 @@ import { readFileSync } from "node:fs";
 import type * as acp from "@agentclientprotocol/sdk";
 
 import type { ZcodeReadResult } from "../backend/types.js";
+import { recordModelChoice } from "../lazy-sessions.js";
 import {
   clientConnectionRoot,
   CONFIG_DISPATCH,
   CONFIG_META,
   log,
+  warn,
   ZCODE_CREDS_PATH,
+  zcodePersonalProviderPath,
 } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
-import { sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
+import { configProviderIdFor } from "./account-provider.js";
+import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
 
 interface ProviderModelsJson {
   [modelId: string]: { limit?: { context?: number } } | undefined;
@@ -44,6 +48,124 @@ interface ProviderEntry {
 
 interface ConfigShape {
   provider?: Record<string, ProviderEntry>;
+}
+
+// ---------- personal provider config (3.12+) ----------
+
+/**
+ * The desktop's `provider_config.json` — where user-added providers and models
+ * land since 3.12. config.json's provider map is legacy and has stopped
+ * syncing (observed 2026-09: a model added in the desktop app was written ONLY
+ * here, so a dropdown built from config.json alone never showed it; the
+ * backend registry reads this file directly and accepts the model fine).
+ *
+ * Spelling notes: provider rule ids use the REGISTRY spelling
+ * (`account:bigmodel-individual-coding-plan`), so they normalize through
+ * `configProviderIdFor` before matching config.json's `builtin:*` keys. Model
+ * rules nest their flag under `config.enabled` (NOT top-level), and carry
+ * `config.properties.contextWindow` + `config.optionSpecs.reasoningLevel.values`.
+ */
+interface PersonalModelRule {
+  providerId?: string;
+  modelId?: string;
+  config?: {
+    enabled?: boolean;
+    properties?: { contextWindow?: number };
+    optionSpecs?: { reasoningLevel?: { values?: string[] } };
+  };
+}
+
+interface PersonalProviderRule {
+  providerId?: string;
+  providerName?: string;
+  enabled?: boolean;
+  config?: {
+    access?: { type?: string; apiKey?: string };
+    api?: { type?: string; baseUrl?: string };
+  };
+}
+
+interface PersonalProviderConfig {
+  config?: {
+    providerConfigRules?: { providerRules?: PersonalProviderRule[] };
+    modelConfigRules?: {
+      providerModelRules?: PersonalModelRule[];
+      manualProviderModelRules?: PersonalModelRule[];
+    };
+  };
+}
+
+/** provider_config.json content projected onto config.json spellings. */
+interface PersonalModels {
+  /** enabled model ids per NORMALIZED provider id, file order. */
+  modelsByProvider: Map<string, string[]>;
+  /** context window per `providerId\modelId` (formatModelValue separator). */
+  contextByModel: Map<string, number>;
+  /** reasoning level values per `providerId\modelId`, file order. */
+  reasoningByModel: Map<string, string[]>;
+  /** every provider rule, normalized id attached, file order. */
+  providers: Array<{ pid: string; rule: PersonalProviderRule }>;
+}
+
+function readPersonalProviderConfig(): PersonalProviderConfig | null {
+  try {
+    return JSON.parse(readFileSync(zcodePersonalProviderPath(), "utf8")) as PersonalProviderConfig;
+  } catch {
+    return null; // absent/unreadable (or pre-3.12 desktop) — config.json alone decides
+  }
+}
+
+function loadPersonalModels(): PersonalModels | null {
+  const pc = readPersonalProviderConfig();
+  const providerRules = pc?.config?.providerConfigRules?.providerRules ?? [];
+  const modelRules = [
+    ...(pc?.config?.modelConfigRules?.providerModelRules ?? []),
+    ...(pc?.config?.modelConfigRules?.manualProviderModelRules ?? []),
+  ];
+  if (providerRules.length === 0 && modelRules.length === 0) return null;
+  const out: PersonalModels = {
+    modelsByProvider: new Map(),
+    contextByModel: new Map(),
+    reasoningByModel: new Map(),
+    providers: [],
+  };
+  for (const rule of modelRules) {
+    if (!rule.providerId || !rule.modelId) continue;
+    if (rule.config?.enabled === false) continue;
+    const pid = configProviderIdFor(rule.providerId);
+    const ids = out.modelsByProvider.get(pid) ?? [];
+    if (!ids.includes(rule.modelId)) ids.push(rule.modelId);
+    out.modelsByProvider.set(pid, ids);
+    const key = `${pid}\\${rule.modelId}`;
+    const ctx = rule.config?.properties?.contextWindow;
+    if (ctx && ctx > 0) out.contextByModel.set(key, ctx);
+    const values = rule.config?.optionSpecs?.reasoningLevel?.values;
+    if (values?.length) out.reasoningByModel.set(key, values);
+  }
+  for (const rule of providerRules) {
+    if (!rule.providerId) continue;
+    out.providers.push({ pid: configProviderIdFor(rule.providerId), rule });
+  }
+  return out;
+}
+
+/**
+ * A model's declaration from provider_config.json only — the lookup for
+ * models that exist in the desktop's personal config but not (yet) in legacy
+ * config.json. Null when the personal config is absent or lacks the model.
+ */
+export function personalModelSpec(
+  providerId: string,
+  modelId: string,
+): { contextWindow?: number; reasoningValues?: string[] } | null {
+  const personal = loadPersonalModels();
+  if (!personal) return null;
+  const pid = configProviderIdFor(providerId);
+  const key = `${pid}\\${modelId}`;
+  const contextWindow = personal.contextByModel.get(key);
+  const reasoningValues = personal.reasoningByModel.get(key);
+  if (contextWindow === undefined && !reasoningValues) return null;
+  return { contextWindow, reasoningValues };
 }
 
 /**
@@ -74,7 +196,7 @@ export interface ModelRef {
  *     usable — has an apiKey, declares keys not required, or points at a
  *     local baseURL (llama.cpp/ollama-style providers work keyless).
  */
-function providerSelectable(pid: string, p: ProviderEntry | undefined): boolean {
+export function providerSelectable(pid: string, p: ProviderEntry | undefined): boolean {
   if (!p) return false;
   if (isBuiltinProvider(pid)) return p.enabled === true && Boolean(p.options?.apiKey);
   if (p.enabled === false) return false;
@@ -95,19 +217,62 @@ function isLocalBaseURL(url: string | undefined): boolean {
 }
 
 /**
- * Collect models from config.json for the dropdown.
+ * Append providers that exist ONLY in provider_config.json — added in the
+ * desktop app after config.json stopped syncing. Credentials come from the
+ * rule itself (`config.access.apiKey` / `config.api.baseUrl`), selectability
+ * follows the same rule as config.json entries (#156).
+ */
+function appendPersonalOnlyProviders(
+  out: ModelRef[],
+  personal: PersonalModels,
+  pinned: string | undefined,
+): void {
+  const known = new Set(out.map((m) => m.providerId));
+  for (const { pid, rule } of personal.providers) {
+    if (known.has(pid)) continue;
+    if (pinned && pid !== pinned) continue;
+    const synthesized: ProviderEntry = {
+      name: rule.providerName,
+      enabled: rule.enabled,
+      options: {
+        apiKey: rule.config?.access?.apiKey,
+        baseURL: rule.config?.api?.baseUrl,
+      },
+    };
+    if (!providerSelectable(pid, synthesized)) continue;
+    const providerName = rule.providerName ?? pid;
+    for (const modelId of personal.modelsByProvider.get(pid) ?? []) {
+      out.push({ providerId: pid, providerName, modelId });
+    }
+  }
+}
+
+/**
+ * Collect models from config.json for the dropdown, UNIONED with the desktop's
+ * provider_config.json (3.12+): models the user added in the desktop app land
+ * there and never reach legacy config.json, so without the merge the dropdown
+ * silently misses them (observed 2026-09). config.json stays authoritative for
+ * provider enablement/credentials; the personal config contributes model ids
+ * per provider, plus whole providers it describes and config.json does not.
  */
 export function loadAllModels(): ModelRef[] {
+  const personal = loadPersonalModels();
   try {
     const cfg = readConfig() as ConfigShape;
     const out: ModelRef[] = [];
+    // ZCODE_PROVIDER pins the dropdown to one provider id.
+    const pinned = process.env.ZCODE_PROVIDER;
     for (const [pid, p] of Object.entries(cfg.provider ?? {})) {
+      if (pinned && pid !== pinned) continue;
       if (!providerSelectable(pid, p)) continue;
       const providerName = p.name ?? pid;
-      for (const modelId of Object.keys(p.models ?? {})) {
+      const ids = new Set(Object.keys(p.models ?? {}));
+      for (const modelId of personal?.modelsByProvider.get(pid) ?? []) ids.add(modelId);
+      for (const modelId of ids) {
         out.push({ providerId: pid, providerName, modelId });
       }
     }
+    if (personal) appendPersonalOnlyProviders(out, personal, pinned);
     // The default-provider fallback applies only to a MISSING/empty provider
     // map (fresh install). When providers ARE configured but none is usable
     // (all keyless/未启用, #156), returning [] is correct: the fallback would
@@ -124,6 +289,11 @@ export function loadAllModels(): ModelRef[] {
     }
     return out;
   } catch {
+    // config.json unreadable — a personal-config-only setup still advertises
+    // its providers before the fresh-install default kicks in.
+    const out: ModelRef[] = [];
+    if (personal) appendPersonalOnlyProviders(out, personal, process.env.ZCODE_PROVIDER);
+    if (out.length > 0) return out;
     return [
       {
         providerId: DEFAULT_PROVIDER_ID,
@@ -134,26 +304,34 @@ export function loadAllModels(): ModelRef[] {
   }
 }
 
-/** Look up a provider entry by id (any provider, not just enabled). */
+/** Look up a provider entry by id (any provider, not just enabled).
+ *
+ *  3.12+ registries spell coding-plan providers `account:<family>-<plan>` while
+ *  config.json keeps the legacy `builtin:<family>-<plan>` — normalize before
+ *  lookup so both spellings resolve. */
 export function findProviderConfig(providerId: string): ProviderEntry | null {
   try {
     const cfg = readConfig() as ConfigShape;
-    return cfg.provider?.[providerId] ?? null;
+    return cfg.provider?.[providerId] ?? cfg.provider?.[configProviderIdFor(providerId)] ?? null;
   } catch {
     return null;
   }
 }
 
-/** Read the context-window size for a provider+model from config.json. */
+/** Read the context-window size for a provider+model: config.json first, then
+ *  the desktop's provider_config.json (models added there carry
+ *  `config.properties.contextWindow` and never reach config.json). */
 export function modelContextWindow(providerId: string, modelId: string): number {
+  const pid = configProviderIdFor(providerId);
   try {
     const cfg = readConfig() as ConfigShape;
-    const models = cfg.provider?.[providerId]?.models ?? {};
-    const entry = models[modelId];
-    return entry?.limit?.context ?? 0;
+    const models = cfg.provider?.[pid]?.models ?? {};
+    const hit = models[modelId]?.limit?.context;
+    if (hit && hit > 0) return hit;
   } catch {
-    return 0;
+    // fall through to the personal config
   }
+  return personalModelSpec(pid, modelId)?.contextWindow ?? 0;
 }
 
 /** Builtin providerIds are prefixed with `builtin:` (e.g. `builtin:bigmodel`). */
@@ -211,6 +389,17 @@ function buildModelSelectOptions(models: ModelRef[]): Array<{ value: string; nam
  * builtin provider. A value with `\` is the current provider+model encoding.
  */
 export function parseModelValue(value: string): { providerId: string; modelId: string } {
+  // New-format (3.12+) agent-definition spelling: `custom:<urlencoded
+  // providerId>:<modelId>` — e.g. custom:account%3Abigmodel-individual-coding-plan:GLM-5.3
+  // (the provider id's colons are percent-encoded, so `[^:]+` splits cleanly).
+  const custom = /^custom:([^:]+):(.+)$/.exec(value);
+  if (custom) {
+    try {
+      return { providerId: decodeURIComponent(custom[1]!), modelId: custom[2]! };
+    } catch {
+      // malformed encoding — fall through to the legacy spellings
+    }
+  }
   const idx = value.indexOf("\\");
   if (idx < 0) {
     // Builtin plain modelId — resolve to the first enabled builtin provider
@@ -345,9 +534,12 @@ export async function buildConfigOptions(
       currentMode = (modeSet.current as string) ?? currentMode;
       const modelSet = (settings.model as Record<string, unknown>) ?? {};
       // settings.model.current is { providerId, modelId, variant? } — read BOTH so
-      // we can disambiguate same-named models across providers.
+      // we can disambiguate same-named models across providers. Normalize the
+      // provider spelling (3.12+ registries answer `account:<family>-<plan>`;
+      // config.json and the dropdown use `builtin:<family>-<plan>`) so the
+      // current value matches a dropdown entry instead of duplicating it.
       const cur = (modelSet.current as { providerId?: string; modelId?: string }) ?? {};
-      if (cur.providerId) currentProviderId = cur.providerId;
+      if (cur.providerId) currentProviderId = configProviderIdFor(cur.providerId);
       if (cur.modelId) currentModelId = cur.modelId;
       const tlSet = (settings.thoughtLevel as Record<string, unknown>) ?? {};
       // `current` is absent right after session/create — fall back to the
@@ -448,11 +640,13 @@ export async function setConfigOption(
   zcodeSid: string,
   configId: string,
   value: string,
+  acpSid?: string,
 ): Promise<{ kind: "model" | "mode" | "thought"; currentValue: string } | null> {
   if (configId === "model") {
     const { applyModelSwitch } = await import("./runtime-model.js");
     const ok = await applyModelSwitch(server, zcodeSid, value);
     if (!ok) return null;
+    rememberModelChoice(server, acpSid, zcodeSid, { model: value });
     return { kind: "model", currentValue: value };
   }
   const dispatch = CONFIG_DISPATCH[configId];
@@ -465,15 +659,53 @@ export async function setConfigOption(
     15000,
   );
   if (resp.error) return null;
+  if (configId === "thought") {
+    rememberModelChoice(server, acpSid, zcodeSid, { thought: value });
+  }
   return { kind: configId as "mode" | "thought", currentValue: value };
 }
 
+/**
+ * Record the session's model/thought choice: in-memory per zcodeSid (read by
+ * the post-resume re-assert) and durably per acpSid in the lazy-alias store
+ * (read back after a bridge restart). See LazySessionRecord.modelChoice for
+ * why the backend's own persistence cannot be trusted here.
+ */
+export function rememberModelChoice(
+  server: ZcodeAcpServer,
+  acpSid: string | undefined,
+  zcodeSid: string,
+  patch: { model?: string; thought?: string },
+): void {
+  // `at` arbitrates multi-alias recovery (newer-wins in ensureRealSession):
+  // two windows can hold records for the SAME backend session, and a stale
+  // store record must not overwrite a fresher in-memory choice on re-seed.
+  const at = Date.now();
+  server.sessionModelChoices.set(zcodeSid, {
+    ...server.sessionModelChoices.get(zcodeSid),
+    ...patch,
+    at,
+  });
+  if (acpSid) recordModelChoice(acpSid, { ...patch, at });
+}
+
 /** Emit a config_option_update (+ current_mode_update for mode) after a change.
- *  Returns the rebuilt options so the caller can include them in the response.
+ *  Returns the rebuilt options (+ the advertised currentModeId for mode) so the
+ *  caller can include them in the response / mirror lastMode.
  *
- *  Every payload is ALSO broadcast to the other attached clients (the CLI
- *  window when the switch came from the phone, and vice versa) — a settings
- *  change is per-session state, not per-connection.
+ *  Every payload reaches EVERY attached client (the CLI window when the switch
+ *  came from the phone, and vice versa) — a settings change is per-session
+ *  state, not per-connection. Two shapes: a broadcast-proxy cx fans out to all
+ *  clients by itself, so the update is sent once PER SESSION ALIAS through it
+ *  (clients route by payload sessionId and drop ids they don't hold — a
+ *  client holding the conversation under another acpSid must still receive
+ *  it); a real per-connection cx sends to the initiator and then the rest via
+ *  sendSessionUpdateToOthers (which loops the aliases for the others). No
+ *  "others" leg on the proxy: it has no connectionContext to exclude anyone
+ *  by, so the leg would double-deliver.
+ *
+ *  Sends are best-effort: a dead initiator connection must not skip the
+ *  broadcast or fail the handler — the switch already succeeded backend-side.
  *
  *  For model switches, also emit a usage_update with the NEW model's context
  *  window (from config.json) so the editor's context bar refreshes immediately
@@ -484,22 +716,36 @@ export async function emitConfigOptionUpdate(
   acpSid: string,
   zcodeSid: string,
   kind: "model" | "mode" | "thought",
-): Promise<acp.SessionConfigOption[]> {
+): Promise<{ options: acp.SessionConfigOption[]; currentModeId?: string }> {
   const options = await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx));
+  const broadcastSource = isBroadcastSource(cx);
+  const send = (update: acp.SessionUpdate): Promise<void> => {
+    if (broadcastSource) {
+      return Promise.all(
+        server.sessionAliases(acpSid).map((sid) => sendSessionUpdate(cx, sid, update)),
+      ).then(() => undefined);
+    }
+    return sendSessionUpdate(cx, acpSid, update)
+      .then(() => sendSessionUpdateToOthers(server, cx, acpSid, update))
+      .catch((e: unknown) => {
+        warn(
+          `options: config update send failed (sid=${acpSid}): ${e instanceof Error ? e.message : String(e)}`,
+        );
+      });
+  };
   const configUpdate: acp.SessionUpdate = {
     sessionUpdate: "config_option_update",
     configOptions: options,
   };
-  await sendSessionUpdate(cx, acpSid, configUpdate);
-  sendSessionUpdateToOthers(server, cx, acpSid, configUpdate);
+  await send(configUpdate);
+  let currentModeId: string | undefined;
   if (kind === "mode") {
     const modes = await buildModes(server, zcodeSid);
-    const modeUpdate: acp.SessionUpdate = {
+    currentModeId = modes.currentModeId;
+    await send({
       sessionUpdate: "current_mode_update",
       currentModeId: modes.currentModeId,
-    };
-    await sendSessionUpdate(cx, acpSid, modeUpdate);
-    sendSessionUpdateToOthers(server, cx, acpSid, modeUpdate);
+    });
   }
   if (kind === "model") {
     // Refresh the context bar: the backend's projection.contextWindow lags
@@ -515,20 +761,18 @@ export async function emitConfigOptionUpdate(
       const modelOpt = options.find((o) => o.id === "model");
       const { providerId, modelId } = parseModelValue(String(modelOpt?.currentValue ?? ""));
       const size = modelContextWindow(providerId, modelId);
-      const usageUpdate: acp.SessionUpdate = {
+      await send({
         sessionUpdate: "usage_update",
         used,
         size,
-      };
-      await sendSessionUpdate(cx, acpSid, usageUpdate);
-      sendSessionUpdateToOthers(server, cx, acpSid, usageUpdate);
+      });
     } catch (e) {
       log(
         `options: usage_update after model switch failed (${e instanceof Error ? e.message : String(e)})`,
       );
     }
   }
-  return options;
+  return { options, ...(currentModeId !== undefined ? { currentModeId } : {}) };
 }
 
 // ---------- helpers ----------
@@ -538,7 +782,9 @@ async function sessionRead(server: ZcodeAcpServer, zcodeSid: string): Promise<Zc
   const resp = await backend.request(
     server.nextId(),
     "session/read",
-    { sessionId: zcodeSid },
+    // messageLimit: callers read settings/projection only; the cap stops the
+    // backend from serializing the session's whole message array for them.
+    { sessionId: zcodeSid, messageLimit: 1 },
     5000,
   );
   if (resp.error) throw new Error(resp.error.message);

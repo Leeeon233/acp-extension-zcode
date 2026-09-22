@@ -63,6 +63,21 @@ function makeServer(): { server: ZcodeAcpServer; backend: FakeBackend } {
 describe("session/fork", () => {
   it("returns the ACP spec sessionId and the extension forkedSessionId", async () => {
     const { server, backend } = makeServer();
+    const inheritedMcp = [{ name: "source-mcp", command: "node", args: ["source.js"], env: [] }];
+    server.sessionMcpServers.set("sess_acp", inheritedMcp);
+    backend.result = {
+      forkedSessionId: "zcode-fork",
+      settings: {
+        model: {
+          available: [
+            {
+              ref: { providerId: "test-provider", modelId: "test-model" },
+              reasoning: { defaultLevel: "high" },
+            },
+          ],
+        },
+      },
+    };
     const result = await fork(server, {
       sessionId: "sess_acp",
       cwd: "/tmp/project",
@@ -76,6 +91,10 @@ describe("session/fork", () => {
     expect(result.configOptions).toHaveLength(1);
     expect(server.resolveSid("zcode-fork")).toBe("zcode-fork");
     expect(server.sessionCwds.get("zcode-fork")).toBe("/tmp/project");
+    expect(server.sessionMcpServers.get("zcode-fork")).toEqual(inheritedMcp);
+    expect(server.modelAvailability.get("zcode-fork")).toEqual([
+      { providerId: "test-provider", modelId: "test-model", defaultLevel: "high" },
+    ]);
 
     const call = backend.calls.find((c) => c.method === "session/fork");
     expect(call?.params).toEqual({

@@ -87,7 +87,8 @@ the visible session terminal (TCC), breaking remote session-create.
 ```text
 GET /api/instances              → [{"id","port","pid","startedAt","workspace",
                                     "origin","sessions":[{"sessionId","title?","updatedAt"}]}]
-GET /api/instances?probe=1      → same list, but unreachable bridges are pruned first
+GET /api/instances?probe=1      → same list, minus bridges unreachable for ~8s
+                                  (one failed probe only marks them unhealthy)
 WS   /acp?instance=<id>         → proxied to that bridge's endpoint
 GET /api/instances/{id}/fs/…    → read-only session files (list + raw bytes, ADR-0004)
 ```

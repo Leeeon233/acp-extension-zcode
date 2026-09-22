@@ -30,6 +30,8 @@ import { sendTextChunk } from "../handlers/io.js";
 import { messages } from "../i18n.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { log, warn } from "../utils.js";
+import { waitForAutoCompactIdle } from "../config/auto-compact.js";
+import { autoCompactThreshold, goalMaxTurns as settingsGoalMaxTurns } from "../config/settings.js";
 import {
   clearGoalState,
   type GoalLoopState,
@@ -52,14 +54,13 @@ import {
 
 /** ENV: ZCODE_ACP_GOAL_MAX_TURNS — hard round budget before a pause. */
 export function goalMaxTurns(): number {
-  const raw = Number(process.env.ZCODE_ACP_GOAL_MAX_TURNS ?? "0");
-  return Number.isFinite(raw) && raw > 0 ? Math.floor(raw) : 100;
+  return settingsGoalMaxTurns();
 }
 
-/** Goal-loop compaction threshold: the shared env var, else 80% of window. */
+/** Goal-loop compaction threshold: the shared threshold, else 80% of window. */
 export function goalCompactThreshold(contextWindow: number): number {
-  const raw = Number(process.env.ZCODE_ACP_AUTO_COMPACT_THRESHOLD ?? "0");
-  if (Number.isFinite(raw) && raw > 0) return raw;
+  const raw = autoCompactThreshold();
+  if (raw > 0) return raw;
   return Math.floor(contextWindow * 0.8);
 }
 
@@ -293,33 +294,57 @@ export class GoalLoopDriver {
     const backend = server.ensureBackend();
     const turn: PendingTurn = { zcodeSid: this.zcodeSid, cancelled: false, goalLoop: true };
     const requestId = `goal-${this.zcodeSid}-${this.state.rounds}-${Date.now()}`;
-    await withPreemptLock(server, this.zcodeSid, async () => {
-      server.pendingTurns.set(requestId, turn);
-    });
-    // Mirror runPrompt's round-start indicator: remote clients would flip
-    // idle between rounds (runOneTurn's finally emits running:false per round).
-    for (const sid of server.sessionAliases(this.acpSid)) {
-      void server.clients
-        .broadcast()
-        .notify("$/zcode/turnState", { sessionId: sid, running: true })
-        .catch(() => undefined);
-    }
-    try {
-      return await runOneTurn(server, {
-        backend,
-        cx: server.clients.broadcast(),
-        acpSid: this.acpSid,
-        zcodeSid: this.zcodeSid,
-        requestId,
-        turn,
-        preempted: false,
-        sendText: prompt,
-        autoCompact: false,
+    // Rounds have no user to resend them: a detached compaction (armed by an
+    // earlier editor turn, or a manual /compact) busy-REJECTS the send —
+    // runOneTurn never queues behind a compaction. Wait it out BEFORE
+    // registering/subscribing (a wait before the subscribe is residue-free),
+    // and retry once the same way if a compaction still slipped in between
+    // the wait and the send.
+    for (let attempt = 0; ; attempt++) {
+      await waitForAutoCompactIdle(server, this.zcodeSid);
+      // The turn object is reused across attempts — clear the sticky reject
+      // mark so each attempt is judged by its OWN send result.
+      turn.compactRejected = false;
+      await withPreemptLock(server, this.zcodeSid, async () => {
+        server.pendingTurns.set(requestId, turn);
       });
-    } finally {
-      // flushSandboxGrants marks goalLoop turns it cancels so the round
-      // boundary can tell a backend restart apart from a user ESC.
-      this.lastSandboxRestart = turn.sandboxRestart === true;
+      // Mirror runPrompt's round-start indicator: remote clients would flip
+      // idle between rounds (runOneTurn's finally emits running:false per round).
+      for (const sid of server.sessionAliases(this.acpSid)) {
+        void server.clients
+          .broadcast()
+          .notify("$/zcode/turnState", { sessionId: sid, running: true })
+          .catch(() => undefined);
+      }
+      try {
+        const result = await runOneTurn(server, {
+          backend,
+          cx: server.clients.broadcast(),
+          acpSid: this.acpSid,
+          zcodeSid: this.zcodeSid,
+          requestId,
+          turn,
+          preempted: false,
+          sendText: prompt,
+          autoCompact: false,
+        });
+        if (!turn.compactRejected || turn.cancelled) return result;
+        if (attempt >= 1) {
+          // Both attempts compact-rejected — the round never ran. Returning
+          // the reject response would let runRounds treat it as a COMPLETED
+          // round (budget burn, stale-verdict parse, parked text settled as
+          // end_turn) — the same hazard runOneTurn throws for at its own
+          // retries-exhausted exit. Throw so run()'s crash path pauses the
+          // loop cleanly with the parked text preserved.
+          throw new Error("goal round rejected: auto-compact still running after retry");
+        }
+      } finally {
+        // flushSandboxGrants marks goalLoop turns it cancels so the round
+        // boundary can tell a backend restart apart from a user ESC.
+        this.lastSandboxRestart = turn.sandboxRestart === true;
+      }
+      await this.announce(messages().autoCompactGoalWait);
+      warn("goal-loop: round busy-rejected by a running compaction — retrying after it settles");
     }
   }
 
@@ -356,11 +381,33 @@ export class GoalLoopDriver {
     preemptInFlightTurn(this.server, this.zcodeSid, "");
   }
 
-  /** Text of the last assistant reply at or after `since` (verdict parsing input). */
-  private async lastAssistantText(since = 0): Promise<string> {
-    const { fetchMessages } = await import("../handlers/replay.js");
-    const msgs = await fetchMessages(this.server, this.zcodeSid);
-    for (let i = msgs.length - 1; i >= Math.min(since, msgs.length); i--) {
+  /**
+   * Id of the newest stored message (null when the store is empty) — the
+   * cursor the round's other reads scope themselves with. `limit: 1` makes
+   * this a tail read: the full-history transfer it replaces existed only to
+   * produce a count.
+   */
+  private async lastMessageId(): Promise<string | null> {
+    const { fetchMessages, TURN_READ } = await import("../handlers/replay.js");
+    const msgs = await fetchMessages(this.server, this.zcodeSid, { ...TURN_READ, limit: 1 });
+    return msgs[msgs.length - 1]?.info?.id ?? null;
+  }
+
+  /**
+   * Text of the last assistant reply appended after `afterId` (the whole
+   * history when null — verdict and ticket parsing read the session's final
+   * reply). A turn's reply is its newest message, so the cursor-less case
+   * caps the read at a tail window instead of transferring everything.
+   */
+  private async lastAssistantText(afterId: string | null = null): Promise<string> {
+    const { fetchMessages, TURN_READ, GOAL_TAIL_READ_LIMIT } =
+      await import("../handlers/replay.js");
+    const msgs = await fetchMessages(this.server, this.zcodeSid, {
+      ...TURN_READ,
+      afterMessageId: afterId,
+      limit: afterId ? undefined : GOAL_TAIL_READ_LIMIT,
+    });
+    for (let i = msgs.length - 1; i >= 0; i--) {
       const m = msgs[i]!;
       if (m.info.role !== "assistant") continue;
       const text = m.parts
@@ -372,26 +419,31 @@ export class GoalLoopDriver {
     return "";
   }
 
-  /** Tool-part count in the messages appended since `before` (stall signal). */
-  private async toolActivitySince(before: number): Promise<number> {
-    const { fetchMessages } = await import("../handlers/replay.js");
-    const msgs = await fetchMessages(this.server, this.zcodeSid);
+  /** Tool-part count among the messages appended after `afterId` (stall signal). */
+  private async toolActivitySince(afterId: string | null): Promise<number> {
+    const { fetchMessages, TURN_READ } = await import("../handlers/replay.js");
+    const msgs = await fetchMessages(this.server, this.zcodeSid, {
+      ...TURN_READ,
+      afterMessageId: afterId,
+    });
     let tools = 0;
-    for (let i = Math.min(before, msgs.length); i < msgs.length; i++) {
-      if (msgs[i]!.parts.some((p) => p.type === "tool")) tools++;
+    for (const m of msgs) {
+      if (m.parts.some((p) => p.type === "tool")) tools++;
     }
     return tools;
   }
 
-  private async messageCount(): Promise<number> {
-    const { fetchMessages } = await import("../handlers/replay.js");
-    return (await fetchMessages(this.server, this.zcodeSid)).length;
-  }
-
   private async contextUsed(): Promise<number> {
+    // messageLimit: only the projection is read; the cap keeps the backend
+    // from serializing the whole message array into every round's snapshot.
     const resp = await this.server
       .ensureBackend()
-      .request(this.server.nextId(), "session/read", { sessionId: this.zcodeSid }, 5000);
+      .request(
+        this.server.nextId(),
+        "session/read",
+        { sessionId: this.zcodeSid, messageLimit: 1 },
+        5000,
+      );
     if (resp.error) return 0;
     return (
       ((resp.result ?? {}) as { projection?: { contextUsed?: number } }).projection?.contextUsed ??
@@ -552,7 +604,7 @@ export class GoalLoopDriver {
         undefined;
       this.state.parkedText = undefined;
 
-      const before = await this.messageCount();
+      const before = await this.lastMessageId();
       const result = await this.runGoalTurn(
         dispatchPrompt({
           objective: this.state.objective,
@@ -620,7 +672,7 @@ export class GoalLoopDriver {
         // Prose fallback reads ONLY messages appended by the verify turn: a
         // walk-back into the dispatch reply would let the worker's own "made
         // the tests pass" verify its own work.
-        const vBefore = await this.messageCount();
+        const vBefore = await this.lastMessageId();
         const vRes = await this.runGoalTurn(verifyPrompt(ticket, vPath));
         if (this.runId !== myRun) return;
         if (vRes.stopReason === "cancelled") {
@@ -708,9 +760,15 @@ export class GoalLoopDriver {
   }
 
   private async contextWindowFromRead(): Promise<number> {
+    // messageLimit: only the projection is read (see contextUsed).
     const resp = await this.server
       .ensureBackend()
-      .request(this.server.nextId(), "session/read", { sessionId: this.zcodeSid }, 5000);
+      .request(
+        this.server.nextId(),
+        "session/read",
+        { sessionId: this.zcodeSid, messageLimit: 1 },
+        5000,
+      );
     if (resp.error) return 0;
     return (
       ((resp.result ?? {}) as { projection?: { contextWindow?: number } }).projection

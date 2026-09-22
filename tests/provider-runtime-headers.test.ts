@@ -21,7 +21,22 @@ vi.mock("../src/handlers/io.js", () => ({
   sendSessionUpdate: vi.fn().mockResolvedValue(undefined),
 }));
 
-import { handleServerRequests } from "../src/handlers/server-requests.js";
+// Coding-plan request auth resolves against the user's real HOME files
+// (config.json + the builtin table); the hermetic tests mock both lookups.
+vi.mock("../src/config/account-provider.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/config/account-provider.js")>();
+  return {
+    ...actual,
+    codingPlanRequestAuthFor: vi.fn((providerId: string | undefined): { apiKey: string } | null =>
+      providerId === "account:bigmodel-individual-coding-plan" ? { apiKey: "test-key" } : null,
+    ),
+  };
+});
+
+import {
+  answerProviderRuntimeHeaders,
+  handleServerRequests,
+} from "../src/handlers/server-requests.js";
 
 function makeServer(): ZcodeAcpServer {
   return {
@@ -83,5 +98,75 @@ describe("interaction/requestProviderRuntimeHeaders", () => {
       headersApplied: false,
       errorMessage: "turn cancelled",
     });
+  });
+
+  it("serves the coding-plan API key for an individual-plan account provider", async () => {
+    const server = makeServer();
+    const backend = makeBackend([
+      {
+        id: 303,
+        method: "interaction/requestProviderRuntimeHeaders",
+        params: {
+          requestId: "zs1:provider-runtime-headers:2",
+          sessionId: "zs1",
+          providerId: "account:bigmodel-individual-coding-plan",
+          modelSelection: {
+            providerId: "account:bigmodel-individual-coding-plan",
+            modelId: "GLM-5.3",
+          },
+          reason: "model-request",
+        },
+      },
+    ]);
+    const cx = { request: vi.fn() } as unknown as acp.AgentContext;
+
+    const handled = await handleServerRequests(server, backend, cx, "s1");
+    expect(handled).toBe(true);
+    expect(backend.sendReply).toHaveBeenCalledWith(303, {
+      headersApplied: true,
+      requestAuth: { apiKey: "test-key" },
+    });
+    expect(cx.request).not.toHaveBeenCalled();
+  });
+});
+
+describe("answerProviderRuntimeHeaders (arrival-time responder)", () => {
+  // The backend asks for runtime headers before EVERY model request on a
+  // zhipu-account provider; outside a turn loop (compact's internal turn,
+  // session/goal set) the queued request went unanswered and the generation
+  // died at the backend's 180s cap ("Captcha verification request timed
+  // out" — auto-compact silently failed that way). The responder answers at
+  // frame ARRIVAL; these tests pin its contract with the client hook.
+  it("returns false for non-headers methods — the caller keeps its own handling", () => {
+    const backend = makeBackend([]);
+    expect(answerProviderRuntimeHeaders(backend, 1, "interaction/requestPermission", {})).toBe(
+      false,
+    );
+    expect(backend.sendReply).not.toHaveBeenCalled();
+  });
+
+  it("answers the coding-plan key inline with the same result shape as the queue path", () => {
+    const backend = makeBackend([]);
+    expect(
+      answerProviderRuntimeHeaders(backend, 88, "interaction/requestProviderRuntimeHeaders", {
+        providerId: "account:bigmodel-individual-coding-plan",
+      }),
+    ).toBe(true);
+    expect(backend.sendReply).toHaveBeenCalledWith(88, {
+      headersApplied: true,
+      requestAuth: { apiKey: "test-key" },
+    });
+  });
+
+  it("declines a keyless provider inline instead of leaving the ask to time out", () => {
+    const backend = makeBackend([]);
+    expect(
+      answerProviderRuntimeHeaders(backend, "zid-1", "interaction/requestProviderRuntimeHeaders", {
+        providerId: "builtin:bigmodel-start-plan",
+      }),
+    ).toBe(true);
+    const [id, result] = vi.mocked(backend.sendReply).mock.calls[0]!;
+    expect(id).toBe("zid-1");
+    expect((result as { headersApplied?: boolean }).headersApplied).toBe(false);
   });
 });

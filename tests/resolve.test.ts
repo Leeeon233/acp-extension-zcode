@@ -14,19 +14,20 @@
  * sqlite-capable.
  */
 
-import { mkdtempSync, mkdirSync, rmSync, realpathSync, symlinkSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, realpathSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { builtinProviderEnv, resolveZcodeCommand } from "../src/backend/resolve.js";
+import { resolveZcodeCommand } from "../src/backend/resolve.js";
 
 const SAVED = {
   ZCODE_BIN: process.env.ZCODE_BIN,
   ZCODE_NODE: process.env.ZCODE_NODE,
   ZCODE_KEEP_HAPPY_EYEBALLS: process.env.ZCODE_KEEP_HAPPY_EYEBALLS,
   ZCODE_DISALLOWED_TOOLS: process.env.ZCODE_DISALLOWED_TOOLS,
+  ZCODE_ENABLE_AUTOMATION_TOOLS: process.env.ZCODE_ENABLE_AUTOMATION_TOOLS,
 };
 
 afterEach(() => {
@@ -64,7 +65,12 @@ describe("resolveZcodeCommand Happy Eyeballs args", () => {
     expect(argv.indexOf("--dns-result-order=ipv4first")).toBeLessThan(
       argv.indexOf("/nonexistent/zcode.cjs"),
     );
-    expect(argv.slice(-2)).toEqual(["app-server", "--stdio"]);
+    expect(argv.slice(-4)).toEqual([
+      "app-server",
+      "--stdio",
+      "--disallowed-tools",
+      "CronCreate CronList CronUpdate CronDelete",
+    ]);
   });
 
   it("drops both flags when ZCODE_KEEP_HAPPY_EYEBALLS is set", () => {
@@ -76,13 +82,33 @@ describe("resolveZcodeCommand Happy Eyeballs args", () => {
 });
 
 describe("resolveZcodeCommand disallowed tools", () => {
-  it("passes no --disallowed-tools when the env var is unset", () => {
+  const CRON_DEFAULTS = "CronCreate CronList CronUpdate CronDelete";
+
+  it("disallows the Cron* tools by default — the bridge cannot serve automation/* (#192)", () => {
     delete process.env.ZCODE_DISALLOWED_TOOLS;
-    expect(nativeLaunchArgs()).toEqual(["/usr/bin/zcode", "app-server", "--stdio"]);
+    expect(nativeLaunchArgs()).toEqual([
+      "/usr/bin/zcode",
+      "app-server",
+      "--stdio",
+      "--disallowed-tools",
+      CRON_DEFAULTS,
+    ]);
   });
 
-  it("passes ZCODE_DISALLOWED_TOOLS through verbatim as one argument", () => {
+  it("merges ZCODE_DISALLOWED_TOOLS with the Cron* defaults (dedup, normalized to spaces)", () => {
     process.env.ZCODE_DISALLOWED_TOOLS = "Bash,Write";
+    expect(nativeLaunchArgs()).toEqual([
+      "/usr/bin/zcode",
+      "app-server",
+      "--stdio",
+      "--disallowed-tools",
+      `Bash Write ${CRON_DEFAULTS}`,
+    ]);
+  });
+
+  it("passes ZCODE_DISALLOWED_TOOLS verbatim when automation tools are opted in", () => {
+    process.env.ZCODE_DISALLOWED_TOOLS = "Bash,Write";
+    process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
     expect(nativeLaunchArgs()).toEqual([
       "/usr/bin/zcode",
       "app-server",
@@ -92,13 +118,56 @@ describe("resolveZcodeCommand disallowed tools", () => {
     ]);
   });
 
+  it("omits --disallowed-tools entirely on the opt-in path when the env var is unset", () => {
+    delete process.env.ZCODE_DISALLOWED_TOOLS;
+    process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
+    expect(nativeLaunchArgs()).toEqual(["/usr/bin/zcode", "app-server", "--stdio"]);
+  });
+
   it("appends the flag after the script path on the JS launch path too", () => {
     process.env.ZCODE_BIN = "/nonexistent/zcode.cjs";
     process.env.ZCODE_NODE = process.execPath;
     process.env.ZCODE_DISALLOWED_TOOLS = "Bash Write";
     const argv = resolveZcodeCommand();
-    expect(argv.slice(-4)).toEqual(["app-server", "--stdio", "--disallowed-tools", "Bash Write"]);
+    expect(argv.slice(-2)).toEqual(["--disallowed-tools", `Bash Write ${CRON_DEFAULTS}`]);
     expect(argv.indexOf("/nonexistent/zcode.cjs")).toBeLessThan(argv.indexOf("app-server"));
+  });
+});
+
+describe("zcodeDataBaseDirEnv (ZCODE_HOME → ZCODE_DATA_BASE_DIR)", () => {
+  // The bridge reads the data tree through ZCODE_HOME (it replaces ~/.zcode
+  // outright), but the backend's contract is ZCODE_DATA_BASE_DIR — the PARENT
+  // of .zcode (packages/services/src/paths.ts:11,33-45). Without the
+  // translation both sides read different trees (split-brain discovery).
+  const savedHome = process.env.ZCODE_HOME;
+
+  afterEach(() => {
+    if (savedHome === undefined) delete process.env.ZCODE_HOME;
+    else process.env.ZCODE_HOME = savedHome;
+  });
+
+  it("derives the parent directory of the isolated data root", async () => {
+    const { zcodeDataBaseDirEnv } = await import("../src/backend/resolve.js");
+    process.env.ZCODE_HOME = "/tmp/isolated-zcode-home";
+    // ZCODE_HOME replaces ~/.zcode OUTRIGHT, and the backend's contract is the
+    // PARENT of .zcode — so the translation is a plain dirname.
+    expect(zcodeDataBaseDirEnv()).toEqual({
+      ZCODE_DATA_BASE_DIR: path.dirname("/tmp/isolated-zcode-home"),
+    });
+  });
+
+  it("resolves a relative ZCODE_HOME against the cwd", async () => {
+    const { zcodeDataBaseDirEnv } = await import("../src/backend/resolve.js");
+    process.env.ZCODE_HOME = "rel-home";
+    expect(zcodeDataBaseDirEnv()).toEqual({
+      ZCODE_DATA_BASE_DIR: path.dirname(path.resolve("rel-home")),
+    });
+  });
+
+  it("returns {} when ZCODE_HOME is unset (ambient ZCODE_DATA_BASE_DIR passes through)", async () => {
+    const { zcodeDataBaseDirEnv } = await import("../src/backend/resolve.js");
+    delete process.env.ZCODE_HOME;
+    expect(zcodeDataBaseDirEnv()).toEqual({});
   });
 });
 
@@ -127,54 +196,6 @@ function providerFixture(layout: "desktop" | "npm" = "desktop") {
 }
 
 describe("provider startup environment", () => {
-  it.each(["desktop", "npm"] as const)("pairs provider paths for %s layout", (layout) => {
-    const f = providerFixture(layout);
-    expect(builtinProviderEnv(f.argv, f.env)).toEqual({
-      ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: f.builtin,
-      ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: f.personal,
-    });
-  });
-
-  it("follows an extensionless symlink to the CLI entry", () => {
-    const f = providerFixture();
-    const bin = path.join(f.root, "zcode");
-    symlinkSync(f.entry, bin);
-    expect(builtinProviderEnv([bin, "app-server", "--stdio"], f.env)).toHaveProperty(
-      "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE",
-      f.builtin,
-    );
-  });
-
-  it("preserves explicit host configuration instead of mixing installations", () => {
-    const f = providerFixture();
-    const env = {
-      ...f.env,
-      ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: "/custom/builtin.json",
-      ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/custom/personal.json",
-    };
-    expect(builtinProviderEnv(f.argv, env)).toEqual({
-      ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: "/custom/builtin.json",
-      ZCODE_PERSONAL_PROVIDER_CONFIG_FILE: "/custom/personal.json",
-    });
-  });
-
-  it("leaves personal bootstrap to the CLI when no personal config exists", () => {
-    const f = providerFixture();
-    rmSync(f.personal);
-    expect(builtinProviderEnv(f.argv, f.env)).toEqual({
-      ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: f.builtin,
-    });
-  });
-
-  it("leaves old layouts and missing binaries unchanged", () => {
-    const f = providerFixture();
-    rmSync(f.builtin);
-    expect(builtinProviderEnv(f.argv, f.env)).toEqual({});
-    rmSync(f.entry);
-    expect(builtinProviderEnv(f.argv, f.env)).toEqual({});
-    expect(builtinProviderEnv([process.execPath, "app-server", "--stdio"], {})).toEqual({});
-  });
-
   it("passes both configs to the backend spawned by the server", async () => {
     const f = providerFixture();
     // Synthetic backend: fail exactly at the missing-provider startup boundary.
@@ -194,6 +215,7 @@ describe("provider startup environment", () => {
     );
     vi.stubEnv("ZCODE_BIN", f.entry);
     vi.stubEnv("ZCODE_NODE", process.execPath);
+    vi.stubEnv("ZCODE_HOME", path.join(f.root, ".zcode"));
     vi.stubEnv("ZCODE_DATA_BASE_DIR", f.root);
     vi.stubEnv("ZCODE_BUILTIN_PROVIDER_CONFIG_FILE", "");
     vi.stubEnv("ZCODE_PERSONAL_PROVIDER_CONFIG_FILE", "");

@@ -185,6 +185,25 @@ async function handleClose(
   }
   log(`remote: session ${sessionId.slice(0, 8)} closed from remote (discovery retired)`);
   const terminate = serveTerminateDecision(advertisedSessionCount(server));
+  if (terminate !== null) {
+    // Serve-origin only: the incubated window's conversation was retired.
+    // $/zcode/session_closed lets its martty quit cleanly (last tab) or drop
+    // the session's tab; editor-origin bridges stay silent — a remote retire
+    // must never close a window the user launched themselves (ADR-0006's
+    // self-heal: a touched session reappears). One copy PER session alias:
+    // clients route by payload sessionId, and a client may hold the
+    // conversation under a different acpSid. Awaited BEFORE the response so
+    // it flushes before the terminate path's signals — racedNotify caps the
+    // wait per client, so this cannot hang the close. Clients that don't
+    // know the method (old martty, editors) ignore it.
+    await Promise.all(
+      server
+        .sessionAliases(sessionId)
+        .map((sid) =>
+          server.clients.notifyEach("$/zcode/session_closed", () => ({ sessionId: sid })),
+        ),
+    );
+  }
   sendJson(res, 200, { ok: true });
   if (terminate?.terminate) terminateAfterFlush(terminate, res);
 }
