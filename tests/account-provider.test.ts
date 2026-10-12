@@ -17,18 +17,24 @@
  * All fixtures are hermetic temp files; nothing touches the real ~/.zcode.
  */
 
-import { createHash } from "node:crypto";
+import { createCipheriv, createHash, randomBytes } from "node:crypto";
 import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { zcodeCfgPath, dataRoot } = vi.hoisted(() => {
+import { resolveCredentialSecret } from "../src/backend/credential-store.js";
+
+const { zcodeCfgPath, zcodeStorePath, dataRoot } = vi.hoisted(() => {
   // utils.js computes ZCODE_CREDS_PATH at import time, so the fixture dir is
   // created in the hoisted block and the env-less path is patched via the
   // module mock below.
-  return { zcodeCfgPath: { value: "" }, dataRoot: { value: "" } };
+  return {
+    zcodeCfgPath: { value: "" },
+    zcodeStorePath: { value: "" },
+    dataRoot: { value: "" },
+  };
 });
 
 vi.mock("../src/utils.js", async (importOriginal) => {
@@ -38,6 +44,7 @@ vi.mock("../src/utils.js", async (importOriginal) => {
     get ZCODE_CREDS_PATH() {
       return zcodeCfgPath.value;
     },
+    zcodeCredentialsPath: () => zcodeStorePath.value,
   };
 });
 
@@ -50,6 +57,7 @@ vi.mock("../src/backend/resolve.js", () => ({
 import {
   accountProviderIdFor,
   buildAccountProviderConfig,
+  codingPlanRequestAuthFor,
   configProviderIdFor,
 } from "../src/config/account-provider.js";
 
@@ -78,6 +86,13 @@ const TABLE = {
             builtinModelIds: ["GLM-5.3", "GLM-5.3-Flash"],
           },
         },
+        {
+          providerId: "account:bigmodel-team-coding-plan",
+          config: {
+            access: { type: "zhipu-account", mode: "team-coding-plan", accountType: "bigmodel" },
+            builtinModelIds: ["GLM-5.3"],
+          },
+        },
       ],
     },
   },
@@ -91,6 +106,7 @@ beforeEach(() => {
   const v2 = path.join(root, ".zcode", "v2");
   mkdirSync(v2, { recursive: true });
   zcodeCfgPath.value = path.join(v2, "config.json");
+  zcodeStorePath.value = path.join(v2, "credentials.json");
   dataRoot.value = v2;
   tablePath = path.join(root, "config", "provider", "zcode-builtin.json");
   mkdirSync(path.dirname(tablePath), { recursive: true });
@@ -247,5 +263,116 @@ describe("buildAccountProviderConfig", () => {
       }),
     );
     expect(buildAccountProviderConfig()).toBeNull();
+  });
+});
+
+/** Encrypt a value the way ZCode's credential store does (enc:v1: wire form). */
+function encryptCredential(plain: string): string {
+  const key = createHash("sha256").update(resolveCredentialSecret()).digest();
+  const iv = randomBytes(12);
+  const cipher = createCipheriv("aes-256-gcm", key, iv);
+  const cipherText = Buffer.concat([cipher.update(plain, "utf8"), cipher.final()]);
+  return `enc:v1:${iv.toString("base64url")}.${cipher
+    .getAuthTag()
+    .toString("base64url")}.${cipherText.toString("base64url")}`;
+}
+
+/** Seed the encrypted credential store (issue #320's fresh desktop-only layout). */
+function writeCredentialStore(entries: Record<string, string>): void {
+  const encrypted = Object.fromEntries(
+    Object.entries(entries).map(([key, value]) => [key, encryptCredential(value)]),
+  );
+  writeFileSync(zcodeStorePath.value, JSON.stringify(encrypted));
+}
+
+describe("fresh desktop-only layout — encrypted store entitlement (#320)", () => {
+  const INDIVIDUAL_KEY =
+    "account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:108:api-key";
+  const TEAM_KEY =
+    "account-provider:coding-plan:account:bigmodel-team-coding-plan:account:108:api-key";
+
+  it("entitles the individual plan from the stored api-key when cache and config.json are absent", () => {
+    writeCredentialStore({
+      [INDIVIDUAL_KEY]: "stored-individual-key",
+      [TEAM_KEY]: "stored-team-key",
+    });
+    const payload = buildAccountProviderConfig();
+    expect(payload!.providers["account:bigmodel-individual-coding-plan"]!.access.entitled).toBe(
+      true,
+    );
+    // Key presence is not entitlement: the desktop keeps a team key even when
+    // the plan is not held (observed 2026-10 against a real store).
+    expect(payload!.providers["account:bigmodel-team-coding-plan"]!.access.entitled).toBe(false);
+    expect(payload!.providers["account:zai-individual-coding-plan"]!.access.entitled).toBe(false);
+  });
+
+  it("never lets the store override an explicit desktop verdict", () => {
+    writeCredentialStore({ [INDIVIDUAL_KEY]: "stored-individual-key" });
+    writeFileSync(
+      path.join(root, ".zcode", "v2", "coding-plan-cache.json"),
+      JSON.stringify({
+        entryStatus: {
+          items: { "builtin:bigmodel-coding-plan": { status: "unavailable" } },
+        },
+      }),
+    );
+    expect(
+      buildAccountProviderConfig()!.providers["account:bigmodel-individual-coding-plan"]!.access
+        .entitled,
+    ).toBe(false);
+  });
+
+  it("never lets the store override config.json's builtin enablement signal", () => {
+    writeCredentialStore({ [INDIVIDUAL_KEY]: "stored-individual-key" });
+    // A builtin entry that is present but disabled is still a verdict-bearing
+    // signal — the store must not resurrect it.
+    writeFileSync(
+      zcodeCfgPath.value,
+      JSON.stringify({
+        provider: { "builtin:bigmodel-coding-plan": { enabled: false } },
+      }),
+    );
+    expect(
+      buildAccountProviderConfig()!.providers["account:bigmodel-individual-coding-plan"]!.access
+        .entitled,
+    ).toBe(false);
+  });
+
+  it("treats an undecryptable store as empty", () => {
+    writeFileSync(
+      zcodeStorePath.value,
+      JSON.stringify({ [INDIVIDUAL_KEY]: "enc:v1:garbage.not-encrypted-at-all" }),
+    );
+    expect(
+      buildAccountProviderConfig()!.providers["account:bigmodel-individual-coding-plan"]!.access
+        .entitled,
+    ).toBe(false);
+  });
+
+  it("serves the stored api-key when config.json never existed", () => {
+    writeCredentialStore({ [INDIVIDUAL_KEY]: "stored-individual-key" });
+    expect(codingPlanRequestAuthFor("account:bigmodel-individual-coding-plan")).toEqual({
+      apiKey: "stored-individual-key",
+    });
+  });
+
+  it("prefers config.json's key over the stored one", () => {
+    writeCredentialStore({ [INDIVIDUAL_KEY]: "stored-individual-key" });
+    writeFileSync(
+      zcodeCfgPath.value,
+      JSON.stringify({
+        provider: {
+          "builtin:bigmodel-coding-plan": { enabled: true, options: { apiKey: "legacy-key" } },
+        },
+      }),
+    );
+    expect(codingPlanRequestAuthFor("account:bigmodel-individual-coding-plan")).toEqual({
+      apiKey: "legacy-key",
+    });
+  });
+
+  it("never serves a team plan key from the store", () => {
+    writeCredentialStore({ [TEAM_KEY]: "stored-team-key" });
+    expect(codingPlanRequestAuthFor("account:bigmodel-team-coding-plan")).toBeNull();
   });
 });

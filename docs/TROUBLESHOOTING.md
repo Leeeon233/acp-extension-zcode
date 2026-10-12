@@ -27,6 +27,10 @@
    ```
    - If not found, set: `export ZCODE_BIN=/path/to/zcode`
 
+   Which engine binary the bridge actually resolved — the `resolve: launching
+zcode with …` line, including every probe fallback — only prints with
+   `ZCODE_ACP_DEBUG=1`; set it before reporting backend-resolution issues (#320).
+
 3. Check the ZCode configuration:
 
    ```bash
@@ -104,8 +108,11 @@ account provider. A `headersApplied:false` answer makes the turn fail with
 -32031 and retry. The bridge (0.42.5+) answers with the coding plan's API key
 from `~/.zcode/v2/config.json` (`codingPlanRequestAuthFor`) — if sends still
 fail, check that the enabled `builtin:bigmodel-coding-plan` entry carries a
-non-empty `options.apiKey` in that file. Start-plan providers stay declined
-(Aliyun captcha — desktop app only, issue #123).
+non-empty `options.apiKey` in that file. On a fresh desktop-only install that
+never wrote `config.json`, both the entitlement snapshot and the request key
+come from the encrypted store `~/.zcode/v2/credentials.json` instead (#320) —
+log into the ZCode desktop app once so it exists. Start-plan providers stay
+declined (Aliyun captcha — desktop app only, issue #123).
 
 ### Authentication / credential errors (401, provider auth failed)
 
