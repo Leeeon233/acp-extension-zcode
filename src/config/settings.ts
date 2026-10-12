@@ -54,11 +54,18 @@ export function initialSessionMode(env: NodeJS.ProcessEnv = process.env): string
   return env.ZCODE_ACP_MODE || "yolo";
 }
 
-/** Successful turn-end status as assistant text (default ON); warnings are unaffected. */
-export function showCompletionStatus(env: NodeJS.ProcessEnv = process.env): boolean {
+/**
+ * Successful turn-end status as assistant text; warnings are unaffected.
+ * Resolves the EXPLICIT preference only — config file first, then env.
+ * `undefined` means no explicit preference, so the caller applies the
+ * client default (TUI clients keep the line, editor clients do not).
+ */
+export function showCompletionStatus(env: NodeJS.ProcessEnv = process.env): boolean | undefined {
   const file = loadUserConfig(env).session?.showCompletionStatus;
   if (file !== undefined) return file;
-  return !/^(0|false|off|no)$/i.test((env.ZCODE_ACP_SHOW_COMPLETION_STATUS ?? "").trim());
+  const explicit = (env.ZCODE_ACP_SHOW_COMPLETION_STATUS ?? "").trim();
+  if (explicit === "") return undefined;
+  return !/^(0|false|off|no)$/i.test(explicit);
 }
 
 /**

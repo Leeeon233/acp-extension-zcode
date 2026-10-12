@@ -100,6 +100,7 @@ describe("dispatchEvent TurnInfo rendering", () => {
   );
 
   it("success + full cacheStats renders cache counts and compacted cache-read tokens", async () => {
+    vi.stubEnv("ZCODE_ACP_SHOW_COMPLETION_STATUS", "1");
     const { cx, sent } = mockContext();
     await dispatchEvent(
       new ZcodeAcpServer(),
@@ -126,6 +127,7 @@ describe("dispatchEvent TurnInfo rendering", () => {
   });
 
   it("success + cacheStats without cacheReadTokens omits the token part", async () => {
+    vi.stubEnv("ZCODE_ACP_SHOW_COMPLETION_STATUS", "1");
     const { cx, sent } = mockContext();
     await dispatchEvent(
       new ZcodeAcpServer(),
@@ -142,6 +144,7 @@ describe("dispatchEvent TurnInfo rendering", () => {
   });
 
   it("success without cacheStats renders the bare completion line", async () => {
+    vi.stubEnv("ZCODE_ACP_SHOW_COMPLETION_STATUS", "1");
     const { cx, sent } = mockContext();
     await dispatchEvent(
       new ZcodeAcpServer(),
@@ -176,6 +179,45 @@ describe("dispatchEvent TurnInfo rendering", () => {
     );
     expect(textOf(sent[0]!)).toBe("⚠ stopped early: cancelled");
   });
+
+  it("successful status defaults off for editor clients with no explicit preference", async () => {
+    const { cx, sent } = mockContext();
+    await dispatchEvent(
+      new ZcodeAcpServer(),
+      cx,
+      SID,
+      { kind: "TurnInfo", resultType: "success" },
+      "editor-default",
+    );
+    expect(sent).toHaveLength(0);
+  });
+
+  it("successful status defaults on for the Martty TUI", async () => {
+    const { cx, sent } = mockContext();
+    const server = new ZcodeAcpServer();
+    server.marttyClientSeen = true;
+    await dispatchEvent(
+      server,
+      cx,
+      SID,
+      { kind: "TurnInfo", resultType: "success" },
+      "martty-default",
+    );
+    expect(sent).toHaveLength(1);
+    expect(textOf(sent[0]!)).toBe("✓ completed");
+  });
+
+  it("warnings still reach editor clients with no explicit preference", async () => {
+    const { cx, sent } = mockContext();
+    await dispatchEvent(
+      new ZcodeAcpServer(),
+      cx,
+      SID,
+      { kind: "TurnInfo", resultType: "cancelled" },
+      "editor-warning",
+    );
+    expect(textOf(sent[0]!)).toBe("⚠ stopped early: cancelled");
+  });
 });
 
 describe("translate → dispatch end-to-end", () => {
@@ -198,6 +240,7 @@ describe("translate → dispatch end-to-end", () => {
   });
 
   it("emits the status line as the LAST session/update of the turn", async () => {
+    vi.stubEnv("ZCODE_ACP_SHOW_COMPLETION_STATUS", "1");
     const { cx, sent } = mockContext();
     const server = new ZcodeAcpServer();
     const t = new EventTranslator();

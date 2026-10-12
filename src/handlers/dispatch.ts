@@ -84,7 +84,7 @@ export async function dispatchEvent(
         await dispatchUsageDelta(server, cx, sid, ev);
         break;
       case "TurnInfo":
-        await dispatchTurnInfo(cx, sid, ev, chunkMsgId);
+        await dispatchTurnInfo(server, cx, sid, ev, chunkMsgId);
         break;
       case "TextDelta":
         await sendSessionUpdate(cx, sid, {
@@ -380,16 +380,22 @@ async function dispatchTerminalUpdate(
  * backend sent no cacheStats); any non-success resultType is surfaced
  * verbatim as a warning-flavored line. Distinct messageId (chunkMsgId
  * prefix) so editors keep it a separate message from the reply text.
+ *
+ * The success line ships only where it has a home: the Martty TUI (its
+ * timeline expects it) or an explicit config/env opt-in. Editor clients that
+ * render only the last assistant message of a turn — or fold everything but
+ * it — would bury the real reply behind this line (observed in T3 Code,
+ * pingdotgg/t3code#18080), so the default for them is off.
  */
 async function dispatchTurnInfo(
+  server: ZcodeAcpServer,
   cx: acp.AgentContext,
   acpSid: string,
   ev: Extract<InternalEvent, { kind: "TurnInfo" }>,
   chunkMsgId: string,
 ): Promise<void> {
-  // Some clients display only the last assistant message of a turn. Let users
-  // keep the actual reply in that position without hiding unsuccessful stops.
-  if (ev.resultType === "success" && !showCompletionStatus()) return;
+  const statusLineOn = showCompletionStatus() ?? server.hasMarttyClient();
+  if (ev.resultType === "success" && !statusLineOn) return;
   const m = messages();
   let line: string;
   if (ev.resultType === "success") {
