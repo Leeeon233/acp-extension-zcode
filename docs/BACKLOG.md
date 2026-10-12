@@ -66,19 +66,25 @@ New in 3.15.1, bridge-relevant:
    `ZCODE_ACP_MODE=guarded` cannot brick session/new); interactive `setMode`
    failures surface the backend's own enum error. `approvalMode` on
    permission requests is an optional passthrough field — no handler change.
-2. **`dynamicWorkflowMode` (onDemand)** — optional param on `session/create`,
-   `session/resume`, `workspace/updateDynamicWorkflowPolicy`; absent mode =
-   act on the boolean (alwaysOn) for old hosts. Pairs with the bridge's
-   workflow-gate local override, which already models `onDemand`.
-   **ALIGNED (2026-10-12)**: an `onDemand` verdict now carries
-   `dynamicWorkflowMode` on BOTH channels — the policy push attaches it
-   (`alwaysOn` is the boolean's implied default upstream and stays implicit),
-   and create/resume attach it once the generation's mode-carrying push was
+2. **Dynamic-workflow mode (onDemand)** — optional param on `session/create`,
+   `session/resume` (key: `dynamicWorkflowMode`) and on
+   `workspace/updateDynamicWorkflowPolicy` (key: `mode` — the surfaces spell
+   it DIFFERENTLY); absent mode = act on the boolean (alwaysOn) for old hosts.
+   Pairs with the bridge's workflow-gate local override, which already models
+   `onDemand`. **ALIGNED (2026-10-12, push key FIXED same day)**: an
+   `onDemand` verdict now carries the mode on BOTH channels — the policy push
+   attaches it under its own `mode` key (`alwaysOn` is the boolean's implied
+   default upstream and stays implicit), and create/resume attach
+   `dynamicWorkflowMode` once the generation's mode-carrying push was
    ACCEPTED (`server.workflowModeOnWire`; 0.16.9 and 3.15.1 both self-report
-   0.16.9, so the probe outcome is the only discriminator). An
-   unrecognized-key rejection retries the push boolean-only (upstream-host
-   compat, launch.md DWG-02). A mode-shape change (alwaysOn ↔ onDemand flip)
-   re-arms the once-per-generation push guard.
+   0.16.9, so the probe outcome is the only discriminator). The first cut
+   shipped the push as `dynamicWorkflowMode` — this audit note itself had
+   mis-transcribed the key, the strict schema silently bounced it into the
+   boolean-only compat retry (onDemand never reached the backend; mock tests
+   cannot catch a wire-key mismatch — always re-read the zod schema, not the
+   audit summary). An unrecognized-key rejection retries the push
+   boolean-only (upstream-host compat, launch.md DWG-02). A mode-shape change
+   (alwaysOn ↔ onDemand flip) re-arms the once-per-generation push guard.
 3. **`highspeed` provider account-access mode** (加速卡) — enum extension only;
    the builtin table carries no modes, coding-plan snapshots unaffected.
 4. **Session event-store retention** — sealed-turn eviction in the in-memory

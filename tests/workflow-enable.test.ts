@@ -87,7 +87,8 @@ const GATE_DISABLED = Promise.resolve({
 
 /** Fake backend: records every request; answers the RPCs the flows need.
  * `rejectWorkflowMode` mimics a 0.16.9-era backend whose strict schema rejects
- * the 3.15.1 `dynamicWorkflowMode` key on the FIRST policy push. */
+ * the 3.15.1 `mode` key on the FIRST policy push (the push key is `mode`;
+ * session/create·resume spell it `dynamicWorkflowMode`). */
 function fakeBackend(
   opts: { rejectWorkflowMode?: boolean } = {},
 ): ZcodeBackend & { calls: Array<{ method: string; params: unknown }> } {
@@ -103,7 +104,7 @@ function fakeBackend(
         if (opts.rejectWorkflowMode && policyCalls === 1) {
           return {
             id,
-            error: { code: -32602, message: "Unrecognized key: dynamicWorkflowMode" },
+            error: { code: -32602, message: "Unrecognized key: mode" },
           };
         }
         return { id, result: {} };
@@ -355,6 +356,8 @@ describe("pushDynamicWorkflowPolicy (process-wide enable channel)", () => {
   });
 });
 
+// Wire keys differ per surface (upstream zcode-protocol/index.ts): the policy
+// push carries `mode`, session/create·resume carry `dynamicWorkflowMode`.
 describe("dynamicWorkflowMode pass-through (3.15.1 onDemand)", () => {
   const GATE_ONDEMAND = Promise.resolve({
     mode: "onDemand" as const,
@@ -377,7 +380,7 @@ describe("dynamicWorkflowMode pass-through (3.15.1 onDemand)", () => {
 
     const pushes = calls.filter((c) => c.method === "workspace/updateDynamicWorkflowPolicy");
     expect(pushes).toHaveLength(1); // once per generation per push shape
-    expect(pushes[0].params).toMatchObject({ enabled: true, dynamicWorkflowMode: "onDemand" });
+    expect(pushes[0].params).toMatchObject({ enabled: true, mode: "onDemand" });
 
     const creates = calls.filter((c) => c.method === "session/create");
     expect(creates).toHaveLength(3);
@@ -404,8 +407,8 @@ describe("dynamicWorkflowMode pass-through (3.15.1 onDemand)", () => {
 
     const pushes = calls.filter((c) => c.method === "workspace/updateDynamicWorkflowPolicy");
     expect(pushes).toHaveLength(2); // mode-carrying attempt + boolean-only retry
-    expect(pushes[0].params).toHaveProperty("dynamicWorkflowMode");
-    expect(pushes[1].params).not.toHaveProperty("dynamicWorkflowMode");
+    expect(pushes[0].params).toHaveProperty("mode");
+    expect(pushes[1].params).not.toHaveProperty("mode");
     expect(pushes[1].params).toMatchObject({ enabled: true });
 
     for (const c of calls.filter((x) => x.method === "session/create")) {
@@ -427,7 +430,7 @@ describe("dynamicWorkflowMode pass-through (3.15.1 onDemand)", () => {
 
     const pushes = calls.filter((c) => c.method === "workspace/updateDynamicWorkflowPolicy");
     expect(pushes).toHaveLength(1);
-    expect(pushes[0].params).not.toHaveProperty("dynamicWorkflowMode");
+    expect(pushes[0].params).not.toHaveProperty("mode");
     expect(pushes[0].params).toMatchObject({ enabled: true });
     for (const c of calls.filter((x) => x.method === "session/create")) {
       expect(c.params).not.toHaveProperty("dynamicWorkflowMode");

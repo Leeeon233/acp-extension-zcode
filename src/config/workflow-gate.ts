@@ -267,9 +267,13 @@ export interface WorkflowPolicyTarget {
 
 const POLICY_PUSH_TIMEOUT_MS = 10_000;
 
-/** 0.16.9-era strict-zod rejection text for the 3.15.1 mode key. */
-function rejectsDynamicWorkflowMode(message: string | undefined): boolean {
-  return !!message && /dynamicworkflowmode/i.test(message) && /unrecognized/i.test(message);
+/**
+ * 0.16.9-era strict-zod rejection of the policy push's `mode` key
+ * ("Unrecognized key: mode", quoted or bare). Word-bounded so an unrelated
+ * unrecognized key does not trigger the boolean-only compat retry.
+ */
+function rejectsPolicyModeKey(message: string | undefined): boolean {
+  return !!message && /unrecognized/i.test(message) && /\bmode\b/i.test(message);
 }
 
 /**
@@ -283,14 +287,16 @@ function rejectsDynamicWorkflowMode(message: string | undefined): boolean {
  * only log — the per-session flag keeps working even when the push lands on
  * an older backend.
  *
- * 3.15.1 pass-through: an `onDemand` verdict additionally carries
- * `dynamicWorkflowMode` — `alwaysOn` is the boolean's implied default upstream
- * (dynamic-workflow-policy.ts: mode = params ?? preferences ?? "alwaysOn"),
- * so only onDemand needs the field. A backend whose strict schema rejects the
- * key (0.16.9 — which 3.15.1's app-server still self-reports, so the probe
- * outcome is the only discriminator) gets the upstream-host compat treatment:
- * retry with the boolean alone. Returns true only when a mode-carrying push
- * was ACCEPTED — the per-session channel may then carry the mode too.
+ * 3.15.1 pass-through: an `onDemand` verdict additionally carries the mode —
+ * under this method's OWN key `mode` (the push schema spells it `mode` while
+ * session/create·resume spell it `dynamicWorkflowMode`; upstream
+ * dynamic-workflow-policy.ts reads params.mode, absent → preferences →
+ * `alwaysOn`, so only onDemand needs the field). A backend whose strict
+ * schema rejects the key (0.16.9 — which 3.15.1's app-server still
+ * self-reports, so the probe outcome is the only discriminator) gets the
+ * upstream-host compat treatment: retry with the boolean alone. Returns true
+ * only when a mode-carrying push was ACCEPTED — the per-session channel may
+ * then carry the mode too.
  */
 export async function pushDynamicWorkflowPolicy(
   backend: WorkflowPolicyTarget,
@@ -307,11 +313,11 @@ export async function pushDynamicWorkflowPolicy(
     const resp = await backend.request(
       nextId(),
       "workspace/updateDynamicWorkflowPolicy",
-      { ...base, dynamicWorkflowMode: mode },
+      { ...base, mode },
       POLICY_PUSH_TIMEOUT_MS,
     );
-    if (resp.error && rejectsDynamicWorkflowMode(resp.error.message)) {
-      log("workflow-gate: backend rejects dynamicWorkflowMode — retrying boolean-only");
+    if (resp.error && rejectsPolicyModeKey(resp.error.message)) {
+      log("workflow-gate: backend rejects the mode key — retrying boolean-only");
       await pushPolicyParams(backend, nextId, base);
       return false;
     }
