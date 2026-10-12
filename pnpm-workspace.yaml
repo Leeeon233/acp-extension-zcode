@@ -1,6 +1,11 @@
 allowBuilds:
   esbuild: true
 minimumReleaseAgeExclude:
-  - zcode-acp-martty@0.2.39-zcode.5 || 0.2.39-zcode.6
+  - zcode-acp-martty@0.2.39-zcode.5 || 0.2.39-zcode.6 || 0.3.1-zcode.1
+  - zcode-acp-martty-darwin-arm64@0.3.1-zcode.1
+  - zcode-acp-martty-darwin-x64@0.3.1-zcode.1
+  - zcode-acp-martty-linux-arm64@0.3.1-zcode.1
+  - zcode-acp-martty-linux-x64@0.3.1-zcode.1
+  - zcode-acp-martty-win32-x64@0.3.1-zcode.1
 onlyBuiltDependencies:
   - esbuild

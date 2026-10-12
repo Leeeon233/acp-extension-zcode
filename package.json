@@ -7,7 +7,7 @@
   "author": "ZCode ACP Server Contributors",
   "repository": {
     "type": "git",
-    "url": "https://github.com/william0wang/zcode-acp.git"
+    "url": "git+https://github.com/william0wang/zcode-acp.git"
   },
   "homepage": "https://github.com/william0wang/zcode-acp#readme",
   "bugs": {
@@ -51,7 +51,7 @@
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.3.0",
     "ws": "^8.21.3",
-    "zcode-acp-martty": "0.2.39-zcode.6"
+    "zcode-acp-martty": "0.3.1-zcode.1"
   },
   "peerDependencies": {
     "zod": "^3.25.0 || ^4.0.0"

@@ -15,8 +15,8 @@ importers:
         specifier: ^8.21.3
         version: 8.21.3
       zcode-acp-martty:
-        specifier: 0.2.39-zcode.6
-        version: 0.2.39-zcode.6
+        specifier: 0.3.1-zcode.1
+        version: 0.3.1-zcode.1
     devDependencies:
       '@eslint/js':
         specifier: ^9.0.0
@@ -75,6 +75,35 @@ packages:
 
   '@deepseek-ai/cosmokit@1.8.3':
     resolution: {integrity: sha512-qBo+ronVM6Eu2WNVJXi8JcMiqZ19T9BRIpV+5qJUFPXjGH/Z0QKcQMC/IZJ7L394YTOtJgcovbk9qP0w2GsBXQ==}
+
+  '@deepseek-ai/libreoffice-kit-darwin-arm64@0.1.1':
+    resolution: {integrity: sha512-D6NBvtoNpm9pOgBXGQTdxpds1tYMeiFKhGJgnXF/SE0124ZM8j0AOXI7cZ8CErHctqIoVYP+gKWCrnQl4we41A==}
+    engines: {node: '>=22.19.0'}
+    cpu: [arm64]
+    os: [darwin]
+
+  '@deepseek-ai/libreoffice-kit-darwin-x64@0.1.1':
+    resolution: {integrity: sha512-VcAqzmzDbRySLBnpRNYSEd+fDmAtdgL1hQMjRf4sFnQuz7m1vipQ00DtlqFG/T+9uCc20bMIyiDWh8zfYObW3w==}
+    engines: {node: '>=22.19.0'}
+    cpu: [x64]
+    os: [darwin]
+
+  '@deepseek-ai/libreoffice-kit-wasm@0.1.1':
+    resolution: {integrity: sha512-YuKZJdDhR/0GeTZUHJsJvachJR8ZiS4lcrL+lxUF2GLRwXcMikN0zAQOA+6kD/nRI+vlHsCkX0KvHaKvfae79Q==}
+    engines: {node: '>=22.19.0'}
+    os: [linux]
+
+  '@deepseek-ai/libreoffice-kit-win32-arm64@0.1.2':
+    resolution: {integrity: sha512-+JMKIDfLfpQEIeWWJBkKeAGJ8Niiv6SLQ1SFMh8K28eUOSaLLGPt4j7ywEWtyKCtXenD+VRlKo5gZlqDmCtNCg==}
+    engines: {node: '>=22.19.0'}
+    cpu: [arm64]
+    os: [win32]
+
+  '@deepseek-ai/libreoffice-kit-win32-x64@0.1.2':
+    resolution: {integrity: sha512-EUuTMnFF404uVVZz0j2oAoHY0Xhobdg0jChUUm74sudwaqxTM9rvgUYEWbeJd95oVjIParMdsb4hLdAhZ10BIw==}
+    engines: {node: '>=22.19.0'}
+    cpu: [x64]
+    os: [win32]
 
   '@esbuild/aix-ppc64@0.21.5':
     resolution: {integrity: sha512-1SDgH6ZSPTlggy1yI6+Dbkiz8xzpHJEVAlF/AM1tHPLsf5STom9rwtjE4hKAF20FfXXNTFqEYXyJNWh1GiZedQ==}
@@ -282,8 +311,8 @@ packages:
   '@lobehub/icons-static-svg@1.95.0':
     resolution: {integrity: sha512-VSObF66DUVQe0EK3xbIoFcw+Fcia1+bLVFkMsQbmz0zCceMxPmoLImS5VM5SM7zL+/NarZ11/ySNfkekcomIkQ==}
 
-  '@openma/deepseek-harness-acp@0.4.31':
-    resolution: {integrity: sha512-6cebBQF5qztQMAqZtJtzM2WZTyUjzX029gz/AGuw0uVD7giCpiv/NBWxy3DOrqW8zBAC++bvZm5phXycVm/jsQ==}
+  '@openma/deepseek-harness-acp@0.4.37':
+    resolution: {integrity: sha512-C0DVNbrY7NMwYK2z5IYgOI67st/X+r6YMKnlaNUQuEnB3sDUAwHUD5sUtnkqVY4sHwm3Ul9XwOA9RmpVPL5MyQ==}
     engines: {node: '>=22.15'}
     hasBin: true
     peerDependencies:
@@ -989,6 +1018,36 @@ packages:
     resolution: {integrity: sha512-7++dFhtcx3353uBaq8DDR4NuxBetBzC7ZQOhmTQInHEd6bSrXdiEyzCvG07Z44UYdLShWUyXt5M/yhz8ekcb1A==}
     engines: {node: '>=8'}
 
+  sherpa-onnx-darwin-arm64@1.13.8:
+    resolution: {integrity: sha512-FPNgJMgnWVl/KhRTIhG3KL3A4Om63Rn4YKXc9/uHY7SzLcvqLJLc/h7UBWJwduXvv7K18t5NpxHR6XgXn4sjWw==}
+    cpu: [arm64]
+    os: [darwin]
+
+  sherpa-onnx-darwin-x64@1.13.8:
+    resolution: {integrity: sha512-7BLRpjM6w4f9W46/nmkmq8lEKUayhebvcpslCVQ+6QN2uReYlZEMDZlSpXMjme+hUFrPfRz8P3UNq8ep/4d19g==}
+    cpu: [x64]
+    os: [darwin]
+
+  sherpa-onnx-linux-arm64@1.13.8:
+    resolution: {integrity: sha512-Tlg7a70b/Wge3OF8IgTHF9jhSVCsLyKQKhwc4BsJ5A+dL/SrFtGBjzuHp4XeLhiiOT7afCxX5PdSn/D4c8Lnuw==}
+    cpu: [arm64]
+    os: [linux]
+
+  sherpa-onnx-linux-x64@1.13.8:
+    resolution: {integrity: sha512-6plnhjagsSeTntCgnlag86hWbs/uZE9Crms1LgOb68/1nKsIQjMd+WG519m+aPwT6TrsBOiEMzrx41t8sL5L5g==}
+    cpu: [x64]
+    os: [linux]
+
+  sherpa-onnx-win-ia32@1.13.8:
+    resolution: {integrity: sha512-H0Ojln9hfvM+pxWqW0cnjB/XK8/JPq4/k0IWu2JpY5Z458M3zv+XC3Hu+wmot3AoH/K1Bgt23n/tTKtPV9x8qg==}
+    cpu: [ia32]
+    os: [win32]
+
+  sherpa-onnx-win-x64@1.13.8:
+    resolution: {integrity: sha512-oZF1c9VPOKtMwn83Bboc5XSWL+76BRoyB3eUuVnCknBKxwSULZU2Foia9VHWzU+n4I12rPsP6z6H9Rp1hD9o8g==}
+    cpu: [x64]
+    os: [win32]
+
   siginfo@2.0.0:
     resolution: {integrity: sha512-ybx0WO1/8bSBLEWXZvEd7gMW3Sn3JFlW3TvX1nREbDLRNQNaeNN8WK0meBwPdAaOI7TtRRRJn/Es1zhrrCHu7g==}
 
@@ -1148,13 +1207,48 @@ packages:
     resolution: {integrity: sha512-YgvUTfwqyc7UXVMrB+SImsVYSmTS8X/tSrtdNZMImM+n7+QTriRXyXim0mBrTXNeqzVF0KWGgHPeiyViFFrNDw==}
     engines: {node: '>=18'}
 
+  yaml@2.9.1:
+    resolution: {integrity: sha512-3NxN8+78OdzbT7C/WjGsyfPAtJaN3FNDsWxv7Y7mcDsT/oOmgW8BpyQQFFBnvZE3j9Y2Sdz1ULFLezL7Eb2yFw==}
+    engines: {node: '>= 14.6'}
+    hasBin: true
+
   yocto-queue@0.1.0:
     resolution: {integrity: sha512-rVksvsnNCdJ/ohGc6xgPwyN8eheCxsiLM8mxuE/t/mOVqJewPuO1miLpTHQiRgTKCLexL4MeAFVagts7HmNZ2Q==}
     engines: {node: '>=10'}
 
-  zcode-acp-martty@0.2.39-zcode.6:
-    resolution: {integrity: sha512-tQuJyKlyTqa626PVOnoj/BGaVZ5An9rOG3vrkv3wuGAiJoV3FZU3hJvMEBfI32QaCNMvEQ7dnOawXVCe4vz29g==}
-    engines: {node: '>=18'}
+  zcode-acp-martty-darwin-arm64@0.3.1-zcode.1:
+    resolution: {integrity: sha512-QSPSBBjHZohKfrI08+NVaHT3HQ1OHZ3ZHPqZt9JdKLXJkriEPdOyxMidtn0bA1dp1JaSivU8mwn5w6uKbL3f2A==}
+    engines: {node: '>=22.19.0'}
+    cpu: [arm64]
+    os: [darwin]
+
+  zcode-acp-martty-darwin-x64@0.3.1-zcode.1:
+    resolution: {integrity: sha512-cnlcD3gvxnhgIxNJQezLC0ElZda4a0zta+z1kbE2UdCD8+lqx1TVCe3Hxgg5LI1mNrnO5D9BDnGgr/SHdwLwmw==}
+    engines: {node: '>=22.19.0'}
+    cpu: [x64]
+    os: [darwin]
+
+  zcode-acp-martty-linux-arm64@0.3.1-zcode.1:
+    resolution: {integrity: sha512-EpV/PrnIpe+fnpubvrIOOXWfZCi0vVhavS32vDZHmlFa6S0FRhjIl/ySTfGyG5JwU11Q8geEI5cR+fLkWenUgQ==}
+    engines: {node: '>=22.19.0'}
+    cpu: [arm64]
+    os: [linux]
+
+  zcode-acp-martty-linux-x64@0.3.1-zcode.1:
+    resolution: {integrity: sha512-W2GkamAGvfOiN8xlIyjYXJ5Hb8uVrfsPEZh1Wrs0PJzRx1Eqdi3/fs1Sjahk91TikDw5MBB67Kh6Hth4Ymjsvw==}
+    engines: {node: '>=22.19.0'}
+    cpu: [x64]
+    os: [linux]
+
+  zcode-acp-martty-win32-x64@0.3.1-zcode.1:
+    resolution: {integrity: sha512-j3nOFFu6iHv6Tr/CX1BWhPeVcuPbh7Q84/70+Ui7b2d15f1c2nqjxj3wBJkAhNvEqyMUgddLNe5a1N6VfwyWPA==}
+    engines: {node: '>=22.19.0'}
+    cpu: [x64]
+    os: [win32]
+
+  zcode-acp-martty@0.3.1-zcode.1:
+    resolution: {integrity: sha512-KM4S90AMrkfYGkQXy60P5v7XSQMB0tW3unhQV8vMh78BCd73KDdfZOTMvzefVR9ytXY8MjpzE9By1UAb2DfYUQ==}
+    engines: {node: '>=22.19.0'}
     hasBin: true
 
   zod@3.25.76:
@@ -1179,6 +1273,21 @@ snapshots:
       '@standard-schema/spec': 1.1.0
 
   '@deepseek-ai/cosmokit@1.8.3': {}
+
+  '@deepseek-ai/libreoffice-kit-darwin-arm64@0.1.1':
+    optional: true
+
+  '@deepseek-ai/libreoffice-kit-darwin-x64@0.1.1':
+    optional: true
+
+  '@deepseek-ai/libreoffice-kit-wasm@0.1.1':
+    optional: true
+
+  '@deepseek-ai/libreoffice-kit-win32-arm64@0.1.2':
+    optional: true
+
+  '@deepseek-ai/libreoffice-kit-win32-x64@0.1.2':
+    optional: true
 
   '@esbuild/aix-ppc64@0.21.5':
     optional: true
@@ -1319,11 +1428,24 @@ snapshots:
 
   '@lobehub/icons-static-svg@1.95.0': {}
 
-  '@openma/deepseek-harness-acp@0.4.31':
+  '@openma/deepseek-harness-acp@0.4.37':
     dependencies:
       '@agentclientprotocol/sdk': 1.4.0(zod@4.4.3)
       tar: 7.5.22
+      yaml: 2.9.1
       zod: 4.4.3
+    optionalDependencies:
+      '@deepseek-ai/libreoffice-kit-darwin-arm64': 0.1.1
+      '@deepseek-ai/libreoffice-kit-darwin-x64': 0.1.1
+      '@deepseek-ai/libreoffice-kit-wasm': 0.1.1
+      '@deepseek-ai/libreoffice-kit-win32-arm64': 0.1.2
+      '@deepseek-ai/libreoffice-kit-win32-x64': 0.1.2
+      sherpa-onnx-darwin-arm64: 1.13.8
+      sherpa-onnx-darwin-x64: 1.13.8
+      sherpa-onnx-linux-arm64: 1.13.8
+      sherpa-onnx-linux-x64: 1.13.8
+      sherpa-onnx-win-ia32: 1.13.8
+      sherpa-onnx-win-x64: 1.13.8
 
   '@resvg/resvg-js-android-arm-eabi@2.6.2':
     optional: true
@@ -1974,6 +2096,24 @@ snapshots:
 
   shebang-regex@3.0.0: {}
 
+  sherpa-onnx-darwin-arm64@1.13.8:
+    optional: true
+
+  sherpa-onnx-darwin-x64@1.13.8:
+    optional: true
+
+  sherpa-onnx-linux-arm64@1.13.8:
+    optional: true
+
+  sherpa-onnx-linux-x64@1.13.8:
+    optional: true
+
+  sherpa-onnx-win-ia32@1.13.8:
+    optional: true
+
+  sherpa-onnx-win-x64@1.13.8:
+    optional: true
+
   siginfo@2.0.0: {}
 
   source-map-js@1.2.1: {}
@@ -2104,16 +2244,39 @@ snapshots:
 
   yallist@5.0.0: {}
 
+  yaml@2.9.1: {}
+
   yocto-queue@0.1.0: {}
 
-  zcode-acp-martty@0.2.39-zcode.6:
+  zcode-acp-martty-darwin-arm64@0.3.1-zcode.1:
+    optional: true
+
+  zcode-acp-martty-darwin-x64@0.3.1-zcode.1:
+    optional: true
+
+  zcode-acp-martty-linux-arm64@0.3.1-zcode.1:
+    optional: true
+
+  zcode-acp-martty-linux-x64@0.3.1-zcode.1:
+    optional: true
+
+  zcode-acp-martty-win32-x64@0.3.1-zcode.1:
+    optional: true
+
+  zcode-acp-martty@0.3.1-zcode.1:
     dependencies:
       '@deepseek-ai/cordis': 4.0.2
       '@lobehub/icons-static-svg': 1.95.0
-      '@openma/deepseek-harness-acp': 0.4.31
+      '@openma/deepseek-harness-acp': 0.4.37
       '@resvg/resvg-js': 2.6.2
       cross-spawn: 7.0.6
       node-downloader-helper: 2.1.11
+    optionalDependencies:
+      zcode-acp-martty-darwin-arm64: 0.3.1-zcode.1
+      zcode-acp-martty-darwin-x64: 0.3.1-zcode.1
+      zcode-acp-martty-linux-arm64: 0.3.1-zcode.1
+      zcode-acp-martty-linux-x64: 0.3.1-zcode.1
+      zcode-acp-martty-win32-x64: 0.3.1-zcode.1
     transitivePeerDependencies:
       - '@deepseek-ai/cordis-plugin-include'
       - '@deepseek-ai/cordis-plugin-loader'
