@@ -273,7 +273,10 @@ describe("compact() busy window (manual /compact)", () => {
     const running = compact(server, { sessionId: SID_A }, cx);
     await flush();
     await flush();
-    const idle = waitForAutoCompactIdle(server, SID_Z, 2_000);
+    // Generous deadline: the assertion guards release-on-clear semantics, not
+    // latency — a 2s wall clock expired twice on loaded 2-core CI runners
+    // (the release publish job) while the flag removal was merely starved.
+    const idle = waitForAutoCompactIdle(server, SID_Z, 30_000);
     gate.releaseCompact({ id: 1, result: ACCEPTED } as ZcodeResponse);
     await running;
     // The wait releases only once the manual compaction leaves the set —
