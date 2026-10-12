@@ -37,7 +37,7 @@ own distribution channel (explicitly not in the settings page or `$` panel)
 — no overlap with the bridge's filesystem skill discovery.
 
 **3.15.1 sync (2026-10-12, commit `aac47556` — checkout synced, targeted audit,
-alignment items pending)**: single upstream release commit (11,736 files).
+alignment items 1/2/4 DONE 2026-10-12; 3 is enum-only, 5 needs nothing by design)**: single upstream release commit (11,736 files).
 app-server still self-reports `0.16.9`; the desktop app on this machine is at
 3.14.5 and its bundle contains NONE of the 3.15.1 protocol surface except the
 `highspeed` account-mode schema strings — no live breakage today. Verified
@@ -57,22 +57,44 @@ New in 3.15.1, bridge-relevant:
    → broker; sub-agent yolo derivations tighten to guarded). Ships with
    `permission_full_access` persisted receipts (yolo escalation covering
    queued items) and `approvalMode:"user-once"` on `permission_requested`.
-   The bridge's mode lists are hardcoded WITHOUT guarded —
-   `src/config/options.ts` (`availableModes` fallback), `src/utils.ts`
-   (mode catalog), `src/config/user-config.ts` (`SESSION_MODES` validation) —
-   surfacing it is the pending alignment item (`auto` stays internal-only
-   upstream).
+   **ALIGNED (2026-10-12)**: `guarded` added to the bridge's mode vocabulary
+   (`availableModes`, `CONFIG_META`, `SESSION_MODES`, `/mode` hint);
+   `auto` dropped from the advertised dropdowns (internal-only upstream, still
+   wire-valid and accepted by user config). Pre-3.15 resilience: a backend
+   whose mode enum rejects `guarded` gets `session/create` retried once
+   WITHOUT the mode key (the dropdown leads the rollout, config
+   `ZCODE_ACP_MODE=guarded` cannot brick session/new); interactive `setMode`
+   failures surface the backend's own enum error. `approvalMode` on
+   permission requests is an optional passthrough field — no handler change.
 2. **`dynamicWorkflowMode` (onDemand)** — optional param on `session/create`,
    `session/resume`, `workspace/updateDynamicWorkflowPolicy`; absent mode =
    act on the boolean (alwaysOn) for old hosts. Pairs with the bridge's
-   workflow-gate local override, which already models `onDemand` — pass it
-   through in `ensureWorkflowPolicyPushed` + create/resume (not yet done).
+   workflow-gate local override, which already models `onDemand`.
+   **ALIGNED (2026-10-12)**: an `onDemand` verdict now carries
+   `dynamicWorkflowMode` on BOTH channels — the policy push attaches it
+   (`alwaysOn` is the boolean's implied default upstream and stays implicit),
+   and create/resume attach it once the generation's mode-carrying push was
+   ACCEPTED (`server.workflowModeOnWire`; 0.16.9 and 3.15.1 both self-report
+   0.16.9, so the probe outcome is the only discriminator). An
+   unrecognized-key rejection retries the push boolean-only (upstream-host
+   compat, launch.md DWG-02). A mode-shape change (alwaysOn ↔ onDemand flip)
+   re-arms the once-per-generation push guard.
 3. **`highspeed` provider account-access mode** (加速卡) — enum extension only;
    the builtin table carries no modes, coding-plan snapshots unaffected.
 4. **Session event-store retention** — sealed-turn eviction in the in-memory
    event store (memory-leak fix; `session-mapper.ts` now tolerates
-   `messageCount` in place of `messages`); audit against the bridge's
-   replay/hydration watermark guards before the app rolls to 3.15.x.
+   `messageCount` in place of `messages`). **AUDITED (2026-10-12, no bridge
+   action)**: eviction runs at APPEND time (`in-memory-session-event-store.ts`
+   — transient buckets by turnId are dropped one turn AFTER seal, when the
+   next `TurnStarted` arrives), so the live `session/event` stream has already
+   delivered everything the bridge consumes before anything is evicted; the
+   slimming (`model_request` payload `messages` → `messageCount`) touches a
+   payload the bridge never reads. The bridge uses neither `session/events`
+   nor `session/subscribe {afterSeq}` (the two surfaces where eviction would
+   create gaps), and replay reads `session/messages` from the persistent
+   store, not the in-memory one — the hydration-watermark guards are
+   unaffected. Revisit only if the bridge adopts pull-mode event history
+   (the `session/events` candidate above).
 5. **Host-capability methods** — `mcp/ui*` family (plugin UI), `workflows/save`
    - `workflows/forRun`, `topic/resource/*` (bot remote history),
      `bot/channel/reply`, `subagents/readRuntimeConfig` (only armed when the

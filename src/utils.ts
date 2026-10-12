@@ -133,8 +133,8 @@ export const SLASH_COMMANDS = [
   { name: "fork", description: "Fork the session at the latest checkpoint" },
   {
     name: "mode",
-    description: "Switch permission mode (plan/build/edit/yolo)",
-    input: { hint: "plan|build|edit|yolo" },
+    description: "Switch permission mode (plan/build/edit/guarded/yolo)",
+    input: { hint: "plan|build|edit|guarded|yolo" },
   },
   {
     name: "model",
@@ -174,8 +174,8 @@ export const CONFIG_META = {
       { value: "plan", name: "plan" },
       { value: "build", name: "build" },
       { value: "edit", name: "edit" },
+      { value: "guarded", name: "guarded" },
       { value: "yolo", name: "yolo" },
-      { value: "auto", name: "auto" },
     ],
   },
   thought: {

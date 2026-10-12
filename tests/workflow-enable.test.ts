@@ -85,14 +85,29 @@ const GATE_DISABLED = Promise.resolve({
   source: "remote" as const,
 });
 
-/** Fake backend: records every request; answers the RPCs the flows need. */
-function fakeBackend(): ZcodeBackend & { calls: Array<{ method: string; params: unknown }> } {
+/** Fake backend: records every request; answers the RPCs the flows need.
+ * `rejectWorkflowMode` mimics a 0.16.9-era backend whose strict schema rejects
+ * the 3.15.1 `dynamicWorkflowMode` key on the FIRST policy push. */
+function fakeBackend(
+  opts: { rejectWorkflowMode?: boolean } = {},
+): ZcodeBackend & { calls: Array<{ method: string; params: unknown }> } {
   const calls: Array<{ method: string; params: unknown }> = [];
   let created = 0;
+  let policyCalls = 0;
   const backend = {
     isDead: false,
     request: async (id: number, method: string, params: unknown) => {
       calls.push({ method, params });
+      if (method === "workspace/updateDynamicWorkflowPolicy") {
+        policyCalls += 1;
+        if (opts.rejectWorkflowMode && policyCalls === 1) {
+          return {
+            id,
+            error: { code: -32602, message: "Unrecognized key: dynamicWorkflowMode" },
+          };
+        }
+        return { id, result: {} };
+      }
       switch (method) {
         case "session/create":
           created += 1;
@@ -322,12 +337,12 @@ describe("pushDynamicWorkflowPolicy (process-wide enable channel)", () => {
 
   it("-32601 (method absent) is a logged no-op — resolves, never throws", async () => {
     const { target } = recordingBackend({ code: -32601, message: "Method not found" });
-    await expect(pushDynamicWorkflowPolicy(target, () => 1, "/tmp/ws")).resolves.toBeUndefined();
+    await expect(pushDynamicWorkflowPolicy(target, () => 1, "/tmp/ws")).resolves.toBe(false);
   });
 
   it("other error responses resolve best-effort", async () => {
     const { target } = recordingBackend({ code: -32000, message: "boom" });
-    await expect(pushDynamicWorkflowPolicy(target, () => 1, "/tmp/ws")).resolves.toBeUndefined();
+    await expect(pushDynamicWorkflowPolicy(target, () => 1, "/tmp/ws")).resolves.toBe(false);
   });
 
   it("a thrown request resolves best-effort (backend gone mid-flight)", async () => {
@@ -336,6 +351,141 @@ describe("pushDynamicWorkflowPolicy (process-wide enable channel)", () => {
         throw new Error("pipe broken");
       },
     };
-    await expect(pushDynamicWorkflowPolicy(target, () => 1, "/tmp/ws")).resolves.toBeUndefined();
+    await expect(pushDynamicWorkflowPolicy(target, () => 1, "/tmp/ws")).resolves.toBe(false);
+  });
+});
+
+describe("dynamicWorkflowMode pass-through (3.15.1 onDemand)", () => {
+  const GATE_ONDEMAND = Promise.resolve({
+    mode: "onDemand" as const,
+    enabled: true,
+    source: "remote" as const,
+  });
+  const flush = () => new Promise<void>((r) => setImmediate(r));
+
+  it("carries the mode on the policy push and, once accepted, on create/resume", async () => {
+    const { server, calls } = makeServer();
+    server.backendWorkflowGate = GATE_ONDEMAND;
+    server.pendingSessions.set("sess_od1", { cwd: "/tmp/ws" });
+    await ensureRealSession(server, "sess_od1");
+    await flush();
+    server.pendingSessions.set("sess_od2", { cwd: "/tmp/ws" });
+    await ensureRealSession(server, "sess_od2");
+    await flush();
+    server.pendingSessions.set("sess_od3", { cwd: "/tmp/ws" });
+    await ensureRealSession(server, "sess_od3");
+
+    const pushes = calls.filter((c) => c.method === "workspace/updateDynamicWorkflowPolicy");
+    expect(pushes).toHaveLength(1); // once per generation per push shape
+    expect(pushes[0].params).toMatchObject({ enabled: true, dynamicWorkflowMode: "onDemand" });
+
+    const creates = calls.filter((c) => c.method === "session/create");
+    expect(creates).toHaveLength(3);
+    // Exactly when the accepted-push flag lands relative to the earlier
+    // creates is microtask timing; the invariants are: every create stays
+    // enabled, and the create AFTER the flush carries the mode.
+    for (const c of creates) {
+      expect(c.params).toMatchObject({ dynamicWorkflowEnabled: true });
+    }
+    expect(creates[2].params).toMatchObject({ dynamicWorkflowMode: "onDemand" });
+  });
+
+  it("old backend: unrecognized-key rejection retries boolean-only; create never carries the mode", async () => {
+    const server = new ZcodeAcpServer();
+    const { backend, calls } = fakeBackend({ rejectWorkflowMode: true });
+    server.backend = backend;
+    server.backendWorkflowGate = GATE_ONDEMAND;
+    server.pendingSessions.set("sess_old1", { cwd: "/tmp/ws" });
+    await ensureRealSession(server, "sess_old1");
+    await flush();
+    server.pendingSessions.set("sess_old2", { cwd: "/tmp/ws" });
+    await ensureRealSession(server, "sess_old2");
+    await flush();
+
+    const pushes = calls.filter((c) => c.method === "workspace/updateDynamicWorkflowPolicy");
+    expect(pushes).toHaveLength(2); // mode-carrying attempt + boolean-only retry
+    expect(pushes[0].params).toHaveProperty("dynamicWorkflowMode");
+    expect(pushes[1].params).not.toHaveProperty("dynamicWorkflowMode");
+    expect(pushes[1].params).toMatchObject({ enabled: true });
+
+    for (const c of calls.filter((x) => x.method === "session/create")) {
+      expect(c.params).toMatchObject({ dynamicWorkflowEnabled: true });
+      expect(c.params).not.toHaveProperty("dynamicWorkflowMode");
+    }
+    expect(server.workflowModeOnWire).toBe(false);
+  });
+
+  it("alwaysOn gate: the push stays boolean-only (implied default upstream)", async () => {
+    const { server, calls } = makeServer();
+    server.backendWorkflowGate = GATE_ENABLED;
+    server.pendingSessions.set("sess_ao1", { cwd: "/tmp/ws" });
+    await ensureRealSession(server, "sess_ao1");
+    await flush();
+    server.pendingSessions.set("sess_ao2", { cwd: "/tmp/ws" });
+    await ensureRealSession(server, "sess_ao2");
+    await flush();
+
+    const pushes = calls.filter((c) => c.method === "workspace/updateDynamicWorkflowPolicy");
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0].params).not.toHaveProperty("dynamicWorkflowMode");
+    expect(pushes[0].params).toMatchObject({ enabled: true });
+    for (const c of calls.filter((x) => x.method === "session/create")) {
+      expect(c.params).not.toHaveProperty("dynamicWorkflowMode");
+    }
+  });
+});
+
+describe("guarded mode vs a pre-3.15 backend (create fallback)", () => {
+  /** Fake backend whose mode enum rejects `guarded` (3.14.5-era zod text). */
+  function guardedRejectingBackend(): ZcodeBackend & {
+    calls: Array<{ method: string; params: unknown }>;
+  } {
+    const calls: Array<{ method: string; params: unknown }> = [];
+    let created = 0;
+    const backend = {
+      isDead: false,
+      request: async (id: number, method: string, params: unknown) => {
+        calls.push({ method, params });
+        if (method === "session/create" && (params as { mode?: string }).mode === "guarded") {
+          return {
+            id,
+            error: {
+              code: -32602,
+              message:
+                "Invalid enum value. Expected 'plan' | 'build' | 'edit' | 'yolo' | 'auto', received 'guarded'",
+            },
+          };
+        }
+        switch (method) {
+          case "session/create":
+            created += 1;
+            return { id, result: { session: { sessionId: `sess_g_${created}`, title: "" } } };
+          default:
+            return { id, result: {} };
+        }
+      },
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    return { backend, calls };
+  }
+
+  it("retries session/create without the mode key when the enum rejects guarded", async () => {
+    vi.stubEnv("ZCODE_ACP_MODE", "guarded");
+    try {
+      const server = new ZcodeAcpServer();
+      const { backend, calls } = guardedRejectingBackend();
+      server.backend = backend;
+      server.pendingSessions.set("sess_guarded", { cwd: "/tmp/ws" });
+
+      await expect(ensureRealSession(server, "sess_guarded")).resolves.toBe("sess_g_1");
+
+      const creates = calls.filter((c) => c.method === "session/create");
+      expect(creates).toHaveLength(2);
+      expect(creates[0].params).toMatchObject({ mode: "guarded" });
+      expect(creates[1].params).not.toHaveProperty("mode");
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 });

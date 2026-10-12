@@ -239,8 +239,10 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** The session modes the backend's own mode select offers (mirrors CONFIG_META). */
-const SESSION_MODES = new Set(["plan", "build", "edit", "yolo", "auto"]);
+/** The session modes the backend's own mode select offers (mirrors CONFIG_META).
+ * `guarded` is new in 3.15.1; `auto` stays accepted (wire-valid) though the
+ * dropdown no longer advertises it. */
+const SESSION_MODES = new Set(["plan", "build", "edit", "guarded", "yolo", "auto"]);
 
 /**
  * Dynamic-workflow gate override domain — mirrors upstream DYNAMIC_WORKFLOW_MODES

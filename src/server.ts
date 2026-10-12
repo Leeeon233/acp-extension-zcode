@@ -287,6 +287,19 @@ export class ZcodeAcpServer {
    */
   workflowPolicyPushed = false;
   /**
+   * The push shape the current generation carried ("onDemand" | "alwaysOn" |
+   * "boolean" | null) — a mode change re-arms the once-per-generation guard
+   * (config/workflow-gate.ts). Reset at every spawn.
+   */
+  workflowPolicyPushedMode: "onDemand" | "alwaysOn" | "boolean" | null = null;
+  /**
+   * True once this backend generation ACCEPTED a mode-carrying policy push —
+   * only then may session/create·resume carry `dynamicWorkflowMode` (3.15.1;
+   * older strict schemas reject the key with no cheap retry on that path).
+   * Reset at every spawn.
+   */
+  workflowModeOnWire = false;
+  /**
    * The full slash-command list (set once by buildAgentApp in index.ts).
    * Read by the gate-aware menu catch-up (resendMenuAfterGateSettled in
    * handlers/session.ts): a cold bridge's session/new snapshot predates the
@@ -659,6 +672,8 @@ export class ZcodeAcpServer {
     // session-always grants mirror the backend's own session ruleset, which
     // dies with the runtime.
     this.workflowPolicyPushed = false;
+    this.workflowPolicyPushedMode = null;
+    this.workflowModeOnWire = false;
     this.sessionAutoAllows.clear();
     // builtinProviderEnv injects the CLI's built-in provider table the way the
     // desktop host does — a bare .app-bundle CLI cannot find it on its own.

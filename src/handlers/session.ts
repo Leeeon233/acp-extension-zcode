@@ -115,7 +115,16 @@ function workspaceFor(cwd?: string): { workspacePath: string; workspaceKey: stri
 }
 
 /**
- * Dynamic-workflow session flag (desktop-host parity, src/config/workflow-gate.ts):
+ * A pre-3.15 backend's strict mode-enum rejection of `guarded` (zod wording:
+ * "Invalid enum value. Expected 'plan' | …, received 'guarded'"). Drove the
+ * create retry below — the mode is advertised ahead of backend rollouts.
+ */
+function rejectsModeGuarded(message: string | undefined): boolean {
+  return !!message && /guarded/i.test(message) && /invalid/i.test(message);
+}
+
+/**
+ * Dynamic-workflow session flags (desktop-host parity, src/config/workflow-gate.ts):
  * `{dynamicWorkflowEnabled:true}` rides every session/create·resume when the
  * EFFECTIVE gate (local override first, else the pinned remote verdict) is
  * enabled; otherwise NOTHING is written — the backend's zod schemas are
@@ -125,15 +134,27 @@ function workspaceFor(cwd?: string): { workspacePath: string; workspaceKey: stri
  * free (it resolved at backend spawn); the cold-path bound is the gate fetch's
  * 6s timeout, well under a backend boot. Fork and sub-agent sessions copy the
  * flag inside the backend — no bridge-side injection point for those.
+ *
+ * 3.15.1: an onDemand verdict additionally carries `dynamicWorkflowMode` —
+ * alwaysOn is the boolean's implied default upstream, so only onDemand needs
+ * the field. The mode key rides ONLY after the generation's mode-carrying
+ * policy push was ACCEPTED (`server.workflowModeOnWire`): older backends
+ * reject the key with "Unrecognized key" and create/resume has no retry.
  */
 async function workflowFlag(
   server: ZcodeAcpServer,
-): Promise<{ dynamicWorkflowEnabled: true } | Record<string, never>> {
+): Promise<
+  { dynamicWorkflowEnabled: true; dynamicWorkflowMode?: "onDemand" } | Record<string, never>
+> {
   // A local override flipped on since spawn also owes the backend its policy
   // push (once per generation; a boolean check on this hot path).
   ensureWorkflowPolicyPushed(server);
   const gate = await effectiveWorkflowGate(server);
-  return gate?.enabled ? { dynamicWorkflowEnabled: true } : {};
+  if (!gate?.enabled) return {};
+  if (gate.mode === "onDemand" && server.workflowModeOnWire) {
+    return { dynamicWorkflowEnabled: true, dynamicWorkflowMode: "onDemand" };
+  }
+  return { dynamicWorkflowEnabled: true };
 }
 
 /**
@@ -770,7 +791,17 @@ export async function ensureRealSession(
         log(`session/create carrying ${remembered.length} remembered client MCP server(s)`);
       }
     }
-    const resp = await backend.request(server.nextId(), "session/create", createParams, 15000);
+    let resp = await backend.request(server.nextId(), "session/create", createParams, 15000);
+    if (resp.error && rejectsModeGuarded(resp.error.message)) {
+      // 3.15.1's `guarded` on a pre-3.15 backend: the strict mode enum rejects
+      // it and the whole create dies. Retry without the mode key (the backend
+      // default then applies) and say so once — a session that works beats a
+      // configured mode that bricks session/new.
+      warn('session/create: backend rejects mode "guarded" — retrying with its default mode');
+      const rest = { ...createParams };
+      delete rest.mode;
+      resp = await backend.request(server.nextId(), "session/create", rest, 15000);
+    }
     if (resp.error) {
       throw new Error(`zcode create failed: ${resp.error.message ?? ""}`);
     }

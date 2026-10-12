@@ -108,18 +108,18 @@ ZCode CLI 内置于桌面应用中，默认不会加到 `PATH`。用 `ZCODE_BIN`
 
 ```jsonc
 {
-  "lang": "zh",                           // 用户可见文案语言:"zh" | "en"
-  "debug": false,                         // 详细诊断日志(ZCODE_ACP_DEBUG=1)
-  "session": { "mode": "yolo" },          // 新会话初始 mode:plan|build|edit|yolo|auto
+  "lang": "zh", // 用户可见文案语言:"zh" | "en"
+  "debug": false, // 详细诊断日志(ZCODE_ACP_DEBUG=1)
+  "session": { "mode": "yolo" }, // 新会话初始 mode:plan|build|edit|guarded|yolo|auto（guarded 需 3.15.1+ 后端，旧后端自动回退）
   "autoCompact": { "threshold": 240000 }, // 上下文用到 N token 时自动压缩(不设 = 关闭)
   "goal": {
-    "maxTurns": 100,                      // goal/auto 循环回合预算
-    "mode": "backend"                     // "backend" 恢复旧的后端 /goal 路由
+    "maxTurns": 100, // goal/auto 循环回合预算
+    "mode": "backend", // "backend" 恢复旧的后端 /goal 路由
   },
-  "interaction": { "timeoutMs": 0 },      // 权限请求等待上限,毫秒(0 = 一直等)
-  "sandbox": { "enabled": false },        // 全局 Seatbelt 开关(项目级: sandbox.json)
-  "remote": { /* 见远程访问 */ },
-  "quota": { /* quota 卡片凭据 */ }
+  "interaction": { "timeoutMs": 0 }, // 权限请求等待上限,毫秒(0 = 一直等)
+  "sandbox": { "enabled": false }, // 全局 Seatbelt 开关(项目级: sandbox.json)
+  "remote": {/* 见远程访问 */},
+  "quota": {/* quota 卡片凭据 */},
 }
 ```
 
@@ -142,8 +142,8 @@ ZCode CLI 内置于桌面应用中，默认不会加到 `PATH`。用 `ZCODE_BIN`
 | `ZCODE_BIN`                        | `zcode`          | ZCode CLI 二进制文件路径或其 `.cjs` 入口                                                                                                                                                                                                                                            |
 | `ZCODE_NODE`                       | _（自动发现）_   | 显式指定运行 `ZCODE_BIN` 的 Node 二进制（必须支持 `node:sqlite`）                                                                                                                                                                                                                   |
 | `ZCODE_MODEL`                      | _（来自 config） | 覆盖当前使用的模型 id                                                                                                                                                                                                                                                               |
-| `ZCODE_DISALLOWED_TOOLS`            | _（Cron 工具）_  | 以空格或逗号分隔的工具名，作为 `--disallowed-tools` 传给 app-server，并与内置默认值合并——默认禁用 `CronCreate CronList CronUpdate CronDelete`（桥接层无法应答后端的 `automation/*` 客户端请求，这些工具对模型可见但必然失败，见 #192）。 |
-| `ZCODE_ENABLE_AUTOMATION_TOOLS`     | _（未设置）      | 设为 `1` 取消对 Cron* 工具的默认禁用——仅对真正实现了后端 `automation/*` 端口的宿主有意义。 |
+| `ZCODE_DISALLOWED_TOOLS`           | _（Cron 工具）_  | 以空格或逗号分隔的工具名，作为 `--disallowed-tools` 传给 app-server，并与内置默认值合并——默认禁用 `CronCreate CronList CronUpdate CronDelete`（桥接层无法应答后端的 `automation/*` 客户端请求，这些工具对模型可见但必然失败，见 #192）。                                            |
+| `ZCODE_ENABLE_AUTOMATION_TOOLS`    | _（未设置）      | 设为 `1` 取消对 Cron* 工具的默认禁用——仅对真正实现了后端 `automation/*` 端口的宿主有意义。                                                                                                                                                                                          |
 | `ZCODE_ACP_AUTO_COMPACT_THRESHOLD` | _（未设置）      | 触发自动压缩的绝对 token 阈值。每次回合成功完成后（`end_turn`），若 `contextUsed >= 阈值`，服务端会自动调用 `session/compact` 压缩上下文，为下一个 prompt 腾出空间。设为 `0` 或不设置则禁用（默认）。例如 `240000` 表示上下文达 24 万 token 时触发压缩。压缩目标由 ZCode 后端决定。 |
 | `ZCODE_ACP_DEBUG`                  | _（未设置）      | 设为 `1` 可开启详细诊断日志（事件流、探测循环、状态更新）。默认安静——只输出警告类日志（后端管道错误、命令/权限失败、锁等待超时）。诊断桥接问题时开启；日志出现在 `Zed.log` 中，前缀为 `[zcode-acp]`。                                                                               |
 | `ZCODE_ACP_REMOTE`                 | _（未设置）_     | 设为 `1` 启用[远程访问](#远程访问)——通过 WebSocket 向更多 ACP 客户端提供相同会话。                                                                                                                                                                                                  |

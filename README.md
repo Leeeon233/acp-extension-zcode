@@ -153,7 +153,7 @@ at bridge start just like its env var.
   "lang": "zh", // user-facing strings: "zh" | "en"
   "debug": false, // verbose diagnostics (ZCODE_ACP_DEBUG=1)
   "session": {
-    "mode": "yolo", // initial mode: plan|build|edit|yolo|auto
+    "mode": "yolo", // initial mode: plan|build|edit|guarded|yolo|auto (guarded: 3.15.1+, falls back on older backends)
     "showCompletionStatus": true, // successful turn-end assistant status (default true)
   },
   "autoCompact": { "threshold": 240000 }, // compact once N tokens are used (unset = off)

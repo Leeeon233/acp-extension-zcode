@@ -267,6 +267,11 @@ export interface WorkflowPolicyTarget {
 
 const POLICY_PUSH_TIMEOUT_MS = 10_000;
 
+/** 0.16.9-era strict-zod rejection text for the 3.15.1 mode key. */
+function rejectsDynamicWorkflowMode(message: string | undefined): boolean {
+  return !!message && /dynamicworkflowmode/i.test(message) && /unrecognized/i.test(message);
+}
+
 /**
  * Push the process-wide dynamic-workflow policy to the backend
  * (`workspace/updateDynamicWorkflowPolicy {enabled:true}`) — the first of the
@@ -277,30 +282,75 @@ const POLICY_PUSH_TIMEOUT_MS = 10_000;
  * (upstream dynamic-workflow-policy.ts). Best-effort: never throws, failures
  * only log — the per-session flag keeps working even when the push lands on
  * an older backend.
+ *
+ * 3.15.1 pass-through: an `onDemand` verdict additionally carries
+ * `dynamicWorkflowMode` — `alwaysOn` is the boolean's implied default upstream
+ * (dynamic-workflow-policy.ts: mode = params ?? preferences ?? "alwaysOn"),
+ * so only onDemand needs the field. A backend whose strict schema rejects the
+ * key (0.16.9 — which 3.15.1's app-server still self-reports, so the probe
+ * outcome is the only discriminator) gets the upstream-host compat treatment:
+ * retry with the boolean alone. Returns true only when a mode-carrying push
+ * was ACCEPTED — the per-session channel may then carry the mode too.
  */
 export async function pushDynamicWorkflowPolicy(
   backend: WorkflowPolicyTarget,
   nextId: () => number,
   cwd: string,
+  mode?: "onDemand",
+): Promise<boolean> {
+  const base = { workspace: { workspacePath: cwd, workspaceKey: cwd }, enabled: true };
+  if (!mode) {
+    await pushPolicyParams(backend, nextId, base);
+    return false;
+  }
+  try {
+    const resp = await backend.request(
+      nextId(),
+      "workspace/updateDynamicWorkflowPolicy",
+      { ...base, dynamicWorkflowMode: mode },
+      POLICY_PUSH_TIMEOUT_MS,
+    );
+    if (resp.error && rejectsDynamicWorkflowMode(resp.error.message)) {
+      log("workflow-gate: backend rejects dynamicWorkflowMode — retrying boolean-only");
+      await pushPolicyParams(backend, nextId, base);
+      return false;
+    }
+    if (resp.error) {
+      logPolicyError(resp.error);
+      return false;
+    }
+    return true;
+  } catch (e) {
+    log(`workflow-gate: policy push threw (${e instanceof Error ? e.message : String(e)})`);
+    return false;
+  }
+}
+
+async function pushPolicyParams(
+  backend: WorkflowPolicyTarget,
+  nextId: () => number,
+  params: Record<string, unknown>,
 ): Promise<void> {
   try {
     const resp = await backend.request(
       nextId(),
       "workspace/updateDynamicWorkflowPolicy",
-      { workspace: { workspacePath: cwd, workspaceKey: cwd }, enabled: true },
+      params,
       POLICY_PUSH_TIMEOUT_MS,
     );
-    if (resp.error) {
-      if (resp.error.code === -32601) {
-        // Backend build without the method — a no-op, not a failure
-        // (precedent: workspace/updateProviderRegistry, handlers/session.ts).
-        log("workflow-gate: backend has no workspace/updateDynamicWorkflowPolicy — skipped");
-      } else {
-        log(`workflow-gate: policy push failed: ${resp.error.message}`);
-      }
-    }
+    if (resp.error) logPolicyError(resp.error);
   } catch (e) {
     log(`workflow-gate: policy push threw (${e instanceof Error ? e.message : String(e)})`);
+  }
+}
+
+function logPolicyError(error: { code?: number | string; message?: string }): void {
+  if (error.code === -32601) {
+    // Backend build without the method — a no-op, not a failure
+    // (precedent: workspace/updateProviderRegistry, handlers/session.ts).
+    log("workflow-gate: backend has no workspace/updateDynamicWorkflowPolicy — skipped");
+  } else {
+    log(`workflow-gate: policy push failed: ${error.message ?? "unknown error"}`);
   }
 }
 
@@ -311,21 +361,50 @@ export async function pushDynamicWorkflowPolicy(
 export interface WorkflowPolicyServer extends WorkflowGateHolder {
   readonly backend: WorkflowPolicyTarget | null;
   workflowPolicyPushed: boolean;
+  /**
+   * The mode shape the current generation's push carried ("boolean" = enabled
+   * alone). A mode CHANGE re-arms the once-per-generation guard so an App
+   * toggle flip between alwaysOn/onDemand reaches the backend process.
+   */
+  workflowPolicyPushedMode: "onDemand" | "alwaysOn" | "boolean" | null;
+  /**
+   * True once a mode-carrying push was ACCEPTED by this backend generation —
+   * only then may session/create·resume carry `dynamicWorkflowMode` (their
+   * strict schemas reject unknown keys and there is no cheap retry there).
+   */
+  workflowModeOnWire: boolean;
   nextId(): number;
   projectCwd(): string;
+}
+
+/** Fold a gate verdict into the push shape ("unknown" → boolean-only). */
+function pushShapeFor(mode: DynamicWorkflowMode | "unknown"): "onDemand" | "alwaysOn" | "boolean" {
+  if (mode === "onDemand" || mode === "alwaysOn") return mode;
+  return "boolean";
 }
 
 /**
  * Flip-aware second enable channel: the spawn-time push only covers a backend
  * born under an ENABLED verdict; a local override flipped on later (the App
  * settings toggle) must still reach the backend process. Once per backend
- * generation — the boolean check keeps the per-create/resume call site free.
+ * generation per push SHAPE — the boolean check keeps the per-create/resume
+ * call site free.
  */
 export function ensureWorkflowPolicyPushed(server: WorkflowPolicyServer): void {
-  if (server.workflowPolicyPushed) return;
-  if (!effectiveWorkflowGateNow(server)?.enabled) return;
+  const gate = effectiveWorkflowGateNow(server);
+  if (!gate?.enabled) return;
   const backend = server.backend;
   if (!backend) return;
+  const shape = pushShapeFor(gate.mode);
+  if (server.workflowPolicyPushed && server.workflowPolicyPushedMode === shape) return;
   server.workflowPolicyPushed = true;
-  void pushDynamicWorkflowPolicy(backend, () => server.nextId(), server.projectCwd());
+  server.workflowPolicyPushedMode = shape;
+  void pushDynamicWorkflowPolicy(
+    backend,
+    () => server.nextId(),
+    server.projectCwd(),
+    shape === "onDemand" ? "onDemand" : undefined,
+  ).then((accepted) => {
+    if (accepted) server.workflowModeOnWire = true;
+  });
 }

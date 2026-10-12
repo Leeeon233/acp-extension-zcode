@@ -252,7 +252,9 @@ describe("Bug 3: thought configOption metadata matches Python", () => {
 
   it("uses lowercase mode option names", () => {
     const names = CONFIG_META.mode.options.map((o) => o.name);
-    expect(names).toEqual(["plan", "build", "edit", "yolo", "auto"]);
+    // 3.15.1: guarded added; auto stays wire-valid but is no longer advertised
+    // (internal-only upstream).
+    expect(names).toEqual(["plan", "build", "edit", "guarded", "yolo"]);
   });
 });
 

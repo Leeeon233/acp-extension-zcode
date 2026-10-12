@@ -452,10 +452,13 @@ export async function buildModes(
   }
   return {
     currentModeId: currentMode,
-    // ZCode 3.3.0 mode enum: plan/build/edit/yolo/auto. settings.mode only
-    // carries `current` (no `available` list, unlike thoughtLevel), so the full
-    // enum is advertised here.
-    availableModes: ["plan", "build", "edit", "yolo", "auto"].map((m) => ({
+    // ZCode mode enum: plan/build/edit/guarded/yolo/auto — guarded is new in
+    // 3.15.1 (yolo semantics + a one-time approval on AST-recognized dangerous
+    // shell commands); `auto` stays internal-only upstream, so the dropdown
+    // does not advertise it (the backend still accepts it on the wire).
+    // settings.mode only carries `current` (no `available` list, unlike
+    // thoughtLevel), so the vocabulary is advertised here.
+    availableModes: ["plan", "build", "edit", "guarded", "yolo"].map((m) => ({
       id: m,
       name: capitalize(m),
     })),
