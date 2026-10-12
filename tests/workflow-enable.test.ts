@@ -488,4 +488,43 @@ describe("guarded mode vs a pre-3.15 backend (create fallback)", () => {
       vi.unstubAllEnvs();
     }
   });
+
+  it("a misconfigured mode is NOT rescued when the 3.15.1 enum merely lists guarded", async () => {
+    // ZCODE_ACP_MODE is unvalidated; a typo must fail honestly even though the
+    // 3.15.1 rejection text contains 'guarded' (in the EXPECTED list) — the
+    // fallback may only fire for a create that actually SENT 'guarded'.
+    vi.stubEnv("ZCODE_ACP_MODE", "planx");
+    try {
+      const server = new ZcodeAcpServer();
+      const calls: Array<{ method: string; params: unknown }> = [];
+      const backend = {
+        isDead: false,
+        request: async (id: number, method: string, params: unknown) => {
+          calls.push({ method, params });
+          if (method === "session/create") {
+            return {
+              id,
+              error: {
+                code: -32602,
+                message:
+                  "Invalid enum value. Expected 'plan' | 'build' | 'edit' | 'guarded' | 'yolo' | 'auto', received 'planx'",
+              },
+            };
+          }
+          return { id, result: {} };
+        },
+        registerEventListener: () => {},
+        unregisterEventListener: () => {},
+      } as unknown as ZcodeBackend;
+      server.backend = backend;
+      server.pendingSessions.set("sess_typo", { cwd: "/tmp/ws" });
+
+      await expect(ensureRealSession(server, "sess_typo")).rejects.toThrow(/planx/);
+
+      const creates = calls.filter((c) => c.method === "session/create");
+      expect(creates).toHaveLength(1); // no silent mode-dropping retry
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
 });

@@ -112,7 +112,7 @@ export interface QuotaUserConfig {
 
 /** The `session` section: session defaults and output preferences. */
 export interface SessionUserConfig {
-  /** Mode a new session starts in (plan/build/edit/yolo/auto — the backend's own modes). */
+  /** Mode a new session starts in (plan/build/edit/guarded/yolo/auto — the backend's own modes). */
   mode?: string;
   /** Show successful turn-end status as assistant text (default true). */
   showCompletionStatus?: boolean;

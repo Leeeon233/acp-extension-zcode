@@ -118,6 +118,9 @@ function workspaceFor(cwd?: string): { workspacePath: string; workspaceKey: stri
  * A pre-3.15 backend's strict mode-enum rejection of `guarded` (zod wording:
  * "Invalid enum value. Expected 'plan' | …, received 'guarded'"). Drove the
  * create retry below — the mode is advertised ahead of backend rollouts.
+ * The message alone cannot decide it: a 3.15.1 enum error for a DIFFERENT
+ * misconfigured mode LISTS `guarded` among the expected values, so the retry
+ * additionally gates on the create having actually sent `guarded`.
  */
 function rejectsModeGuarded(message: string | undefined): boolean {
   return !!message && /guarded/i.test(message) && /invalid/i.test(message);
@@ -792,7 +795,7 @@ export async function ensureRealSession(
       }
     }
     let resp = await backend.request(server.nextId(), "session/create", createParams, 15000);
-    if (resp.error && rejectsModeGuarded(resp.error.message)) {
+    if (resp.error && createParams.mode === "guarded" && rejectsModeGuarded(resp.error.message)) {
       // 3.15.1's `guarded` on a pre-3.15 backend: the strict mode enum rejects
       // it and the whole create dies. Retry without the mode key (the backend
       // default then applies) and say so once — a session that works beats a

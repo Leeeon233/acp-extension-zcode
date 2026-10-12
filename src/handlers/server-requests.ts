@@ -1347,7 +1347,7 @@ export function answerProviderRuntimeHeaders(
     sel ?? (params as { providerId?: string }).providerId,
   );
   if (requestAuth) {
-    log("  provider runtime headers: serving the coding-plan API key (config.json)");
+    log("  provider runtime headers: serving the coding-plan API key (config.json or store)");
     sendZcodeReply(backend, reqId, { headersApplied: true, requestAuth });
     return true;
   }
