@@ -36,6 +36,10 @@ function makeServer(opts?: { martty?: boolean }): ZcodeAcpServer {
     hasMarttyClient: () => opts?.martty ?? true,
     nextId: () => 1,
     resolveSid: () => undefined,
+    // A "connected" client so a failed ask rejects (decline) instead of
+    // holding for reconnect — these cases simulate a client that answers
+    // with an error, not an empty registry.
+    clients: { size: 1 },
   } as unknown as ZcodeAcpServer;
 }
 

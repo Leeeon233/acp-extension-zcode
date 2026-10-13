@@ -156,6 +156,13 @@ export interface TuiUserConfig {
 export interface SandboxUserConfig {
   /** true = arm the sandbox globally (same as ZCODE_ACP_SANDBOX=1). */
   enabled?: boolean;
+  /**
+   * Milliseconds a sandbox ask waits inside an unattended context (goal-loop
+   * round, workflow-run parent session) before ending no-decision so the
+   * chain keeps moving. 0 = wait forever even unattended. Per-project
+   * allow/deny content stays in sandbox.json — this is pacing, not content.
+   */
+  unattendedAskTimeoutMs?: number;
 }
 
 /** The `relay` sub-section of `push`: static-IP proxy for the WeCom API. */
@@ -384,13 +391,22 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
   });
 
   result.sandbox = parseSection(parsed, "sandbox", file, (body, label) => {
+    const out: SandboxUserConfig = {};
     const enabled = body["enabled"];
-    if (enabled === undefined) return {};
-    if (typeof enabled === "boolean") return { enabled };
-    warn(
-      `config: ${label}.enabled=${JSON.stringify(enabled)} in ${file} is not a boolean — ignoring`,
-    );
-    return {};
+    if (enabled !== undefined) {
+      if (typeof enabled === "boolean") out.enabled = enabled;
+      else warn(`config: ${label}.enabled=${JSON.stringify(enabled)} is not a boolean — ignoring`);
+    }
+    const timeout = body["unattendedAskTimeoutMs"];
+    if (timeout !== undefined) {
+      if (typeof timeout === "number" && Number.isFinite(timeout) && timeout >= 0)
+        out.unattendedAskTimeoutMs = Math.floor(timeout);
+      else
+        warn(
+          `config: ${label}.unattendedAskTimeoutMs=${JSON.stringify(timeout)} is not a non-negative number — ignoring`,
+        );
+    }
+    return out;
   });
 
   // An empty string is a VALID value here (martty reads it as "hide every

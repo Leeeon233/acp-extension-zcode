@@ -447,3 +447,16 @@ export function stopPollersForSession(zcodeSid: string): void {
 export function workflowPollerActive(runId: string): boolean {
   return activeRuns.has(runId);
 }
+
+/**
+ * Does this backend session still have an in-flight workflow run? The
+ * sandbox unattended-context check reads this: a session whose workflow is
+ * flying must not block on a human answer (its parent receives results and
+ * steers the run), so its sandbox asks use the unattended timeout.
+ */
+export function hasActiveWorkflowRun(zcodeSid: string): boolean {
+  for (const run of activeRuns.values()) {
+    if (run.zcodeSid === zcodeSid) return true;
+  }
+  return false;
+}

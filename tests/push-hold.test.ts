@@ -1,14 +1,17 @@
 /**
- * Offline interaction hold (push-backend-requirements §6) — the four required
- * regression scenarios, driven through the real broadcast registry and
- * requestWithTimeout:
+ * Offline interaction hold (§6) — the required regression scenarios, driven
+ * through the real broadcast registry and requestWithTimeout:
  *
  *   1. zero clients + push ACTIVE  → the wait does NOT settle (no decline)
  *   2. a client attaching mid-wait  → the re-send reaches it, its answer wins
  *   3. turn cancel while held       → the wait escapes as interrupted
- *   4. zero clients + push inactive → today's behaviour: immediate decline
+ *   4. zero clients + push inactive → ALSO holds — push config only decides
+ *      notification, never the ask's lifetime
+ *   5. ask fired at a client whose connection then died → holds (the
+ *      phone-sleep case: ordinary connection error, not NoClientsError)
  */
 
+import type * as acp from "@agentclientprotocol/sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 const h = vi.hoisted(() => ({ active: false }));
@@ -132,7 +135,7 @@ describe("offline interaction hold (§6)", () => {
     expect(typeof (await wait)).toBe("symbol");
   });
 
-  it("4. zero clients + push inactive → declines immediately (today's behaviour)", async () => {
+  it("4. zero clients + push inactive → still holds (push only decides notification)", async () => {
     h.active = false;
     const server = new ZcodeAcpServer();
     const cx = server.clients.broadcast();
@@ -142,6 +145,42 @@ describe("offline interaction hold (§6)", () => {
       ),
       new Promise((r) => setTimeout(() => r({ settled: false }), 200)),
     ]);
-    expect(outcome).toEqual({ settled: true, value: null });
+    expect(outcome).toEqual({ settled: false });
+  });
+
+  it("5. ask fired at a client whose connection then died → holds for reconnect", async () => {
+    // The observed phone-sleep case: the ask was dispatched while the app was
+    // still connected, the socket died mid-wait, and every attempt failed
+    // with an ORDINARY connection error — not the typed NoClientsError. The
+    // wait must still hold (no auto-decline) and re-send at the next attach.
+    vi.useFakeTimers();
+    const server = new ZcodeAcpServer();
+    const cx = {
+      request: () => Promise.reject(new Error("connection closed")),
+      notify: async () => {},
+    };
+    const wait = requestWithTimeout(
+      server,
+      cx as unknown as acp.AgentContext,
+      "session/request_permission",
+      PERM_PARAMS,
+      "perm",
+      0,
+    );
+    await vi.advanceTimersByTimeAsync(0); // let the attempt fail + hold
+
+    const asked: string[] = [];
+    const client = {
+      notify: async () => {},
+      request: async (method: string) => {
+        asked.push(method);
+        return { outcome: { optionId: "allow_once" } };
+      },
+    };
+    resendPendingInteractions(server, client, "s1");
+    await vi.advanceTimersByTimeAsync(400); // past RESEND_DELAY_MS (300)
+
+    expect(asked).toEqual(["session/request_permission"]);
+    await expect(wait).resolves.toEqual({ outcome: { optionId: "allow_once" } });
   });
 });

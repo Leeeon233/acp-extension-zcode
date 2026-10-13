@@ -51,14 +51,13 @@ import { codingPlanRequestAuthFor } from "../config/account-provider.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
 import { interactionTimeoutMs } from "../config/settings.js";
 import { messages } from "../i18n.js";
-import { pushActive } from "../push/config.js";
 import {
   armAskWatchdog,
   clearAskWatchdog,
   pushInteractionIfOffline,
   pushSourceLabel,
 } from "../push/push.js";
-import { NoClientsError, type ClientLike } from "../remote/broadcast.js";
+import { type ClientLike } from "../remote/broadcast.js";
 import { clientConnectionRoot, log, warn } from "../utils.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { sendSessionUpdate } from "./io.js";
@@ -186,10 +185,12 @@ function createActiveInteraction(
  * connected clients); later attempts are targeted re-sends at clients that
  * attached mid-wait. The first attempt to answer resolves the race and aborts
  * every other attempt's controller; when all in-flight attempts fail instead,
- * the race rejects with the first error (surfaces like a single-client failure).
+ * the race rejects with the first error (surfaces like a single-client failure)
+ * — UNLESS nobody is left to answer, in which case it HOLDS.
  */
 function fireInteractionAttempt(
   entry: ActiveInteraction,
+  server: ZcodeAcpServer,
   send: (options: acp.SendRequestOptions) => Promise<unknown>,
 ): void {
   const ctrl = new AbortController();
@@ -219,13 +220,18 @@ function fireInteractionAttempt(
       entry.controllers.delete(ctrl);
       if (entry.firstError === undefined) entry.firstError = err;
       if (!entry.settled && entry.inFlight === 0) {
-        if (err instanceof NoClientsError && pushActive()) {
-          // Offline interaction with push ACTIVE (§6): do NOT settle — leave
-          // the race pending so resendPendingInteractions re-sends at the next
-          // client attach; the turn-cancel racer / connection close / optional
-          // timeoutMs remain the escapes (requestWithTimeout's cleanup still
-          // deregisters the entry if one of those wins).
-          log(`  ⏸ ${entry.label} unanswered with no clients — holding (push active)`);
+        // Hold whenever NO client can answer, regardless of WHY the attempts
+        // died: the ask may have been fired at zero clients (typed
+        // NoClientsError), or at a phone whose socket then died with the ask
+        // in flight (ordinary connection error — observed 2026-10-13 as the
+        // sandbox ask "expiring" into an auto-decline while the phone slept).
+        // The push config only decides whether a notification goes out
+        // (armAskWatchdog + the zero-clients observer), never the ask's
+        // lifetime; the escapes stay the answer, the turn cancel, and an
+        // explicit timeoutMs (requestWithTimeout's cleanup still deregisters
+        // the entry if one of those wins).
+        if (server.clients.size === 0) {
+          log(`  ⏸ ${entry.label} unanswered with no clients — holding for reconnect`);
           return;
         }
         entry.settled = true;
@@ -265,7 +271,7 @@ export function resendPendingInteractions(
     log(`  ⟳ ${entry.label} still unanswered, re-sending to reconnected client (sid=${acpSid})`);
     const timer = setTimeout(() => {
       if (entry.settled) return;
-      fireInteractionAttempt(entry, (options) =>
+      fireInteractionAttempt(entry, server, (options) =>
         client.request(entry.method, entry.params, options),
       );
     }, RESEND_DELAY_MS);
@@ -1093,7 +1099,7 @@ export async function requestWithTimeout(
       return null;
     }),
   ];
-  fireInteractionAttempt(entry, (options) => cx.request(method, params as never, options));
+  fireInteractionAttempt(entry, server, (options) => cx.request(method, params as never, options));
 
   // Connection-close detection: replaces the old finite timeout as the crash
   // guard. `cx.signal` is an AbortSignal that fires when the stream closes;

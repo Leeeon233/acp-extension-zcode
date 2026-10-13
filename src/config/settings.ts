@@ -90,6 +90,18 @@ export function globalSandboxEnabled(env: NodeJS.ProcessEnv = process.env): bool
   return raw === "1" || raw === "true";
 }
 
+/**
+ * Sandbox ask timeout inside unattended contexts (goal-loop round, workflow
+ * parent): ms before the ask ends no-decision so the chain keeps moving;
+ * 0 = wait forever even unattended. Default 60s.
+ */
+export function sandboxUnattendedAskTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const file = loadUserConfig(env).sandbox?.unattendedAskTimeoutMs;
+  if (file !== undefined) return file;
+  const raw = Number(env.ZCODE_ACP_SANDBOX_UNATTENDED_ASK_TIMEOUT_MS ?? "60000");
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 60000;
+}
+
 /** Verbose diagnostic logging flag. */
 export function debugEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
   const file = loadUserConfig(env).debug;

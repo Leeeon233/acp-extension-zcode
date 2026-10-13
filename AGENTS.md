@@ -762,7 +762,42 @@ payload}` for years and the translator read `payload["turnId"]`, which on
     Ask debounce marks are timestamps: a user decision (or a structural
     hint) pins forever; a FAILED ask (timeout / killed by another grant's
     restart / instantly-rejecting client) cools down 60s and may re-ask —
-    the old permanent mute left the model on a bare EPERM with no way out. Well-known system temp trees (/tmp → /private/tmp,
+    the old permanent mute left the model on a bare EPERM with no way out.
+    **The allow loop OWNS turn pacing while its ask is open (ADR-0032,
+    2026-10-13)** — three layers, all born from one live report (remote
+    phone: popup "expired" unanswered, model free-ran on, the WeCom notice
+    pointed at a dead ask). (1) FREEZE: a real ask first sends the stop pair
+    — the EPERM result already reached the model and it works past the
+    denial otherwise; structural early-returns (island/over-broad/
+    deny-listed/generic/debounce) never freeze. Every settled outcome then
+    ends the round `cancelled` + continuation: allow → the batched restart
+    as before; rejection/timeout/an ask that died UNDELIVERED (all attempts
+    failed while clients were around — the turn is already frozen, and
+    nothing will re-trigger the EPERM, so a bare warn would strand the round
+    on the stop's half reply) → same backend, continuation pointing the
+    model at already-granted dirs (it only ever saw a bare EPERM; the
+    undelivered case keeps the 60s cooldown mark — not a user decision). Goal
+    rounds take the sandboxRestart mark instead (driver re-dispatches). The
+    turn loop HOLDS the round while the batch window still has the session's
+    grant (`waitForSandboxBatchFlush` after the ask returns) — the freeze's
+    stop leaves a terminal event in the backlog, and processing it before
+    the flush would end the round end_turn, drop it from pendingTurns, and
+    orphan the grant's continuation. (2) HOLD: an ask whose every attempt
+    failed holds as long as the registry is EMPTY at failure time — zero
+    clients at fire OR every connection dying mid-wait (the phone-sleep
+    case: ordinary connection error, NOT the typed NoClientsError the old
+    §6 branch keyed on); the push config only decides notification, never
+    ask lifetime. (3) UNATTENDED TIMEOUT: goal-loop rounds and sessions
+    with an in-flight workflow run (the parent must receive results and
+    steer) ask with `sandbox.unattendedAskTimeoutMs` (user config, default
+    60s, 0 = wait forever); on timeout the ask ends NO-DECISION — nothing
+    persisted, path pinned in memory for the REST of the context only
+    (lazily re-checked: loop stop / run settle un-pins, so a returning user
+    regains grant control). A timeout is NOT a rejection: rejection is a
+    user decision with persistence semantics (reject_always writes the deny
+    list); the timeout's continuation says "denied for the rest of this
+    automated run — write inside granted directories", never "forever".
+  Well-known system temp trees (/tmp → /private/tmp,
     /var/tmp, /private/var/folders) are DEFAULT-ALLOWED — tools hardcode /tmp
     and $TMPDIR names only the per-user /var/folders leaf; don't "tighten"
     them back into popup storms (verify-sandbox.sh fixtures moved to HOME for

@@ -61,6 +61,10 @@ describe("askSessionPick elicitation wire format", () => {
         throw new Error("Invalid params");
       },
     } as unknown as acp.AgentContext;
+    // A connected-but-rejecting client: with an EMPTY registry the failed ask
+    // would now hold for reconnect (offline-interaction hold), which is not
+    // what this case models.
+    server.clients.add(cx);
 
     const picked = await askSessionPick(server, cx, "acp_thread_1", [
       { sessionId: "ztarget", label: "a session" },

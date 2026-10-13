@@ -105,6 +105,7 @@ import {
   GENERIC_HINT_KEY,
   handleSandboxDenial,
   READ_ONLY_TOOLS,
+  waitForSandboxBatchFlush,
 } from "./sandbox-allow.js";
 import { handleServerRequests } from "./server-requests.js";
 
@@ -4149,8 +4150,33 @@ export async function runEventTurn(
         // ordinary filesystem permissions.
         const denial = extractSandboxDenial(outputText);
         if (denial) {
-          await handleSandboxDenial(server, cx, acpSid, denial, toolCallId, turn);
+          await handleSandboxDenial(
+            server,
+            cx,
+            acpSid,
+            denial,
+            toolCallId,
+            turn,
+            // Freeze callback: the stop pair halts the backend's generation
+            // for the duration of the ask (the model must not work past the
+            // EPERM it caused). stopSent is marked so the cancelled-exit
+            // guard below does not fire a redundant second stop.
+            async (t) => {
+              t.stopSent = true;
+              await stopBackendTurn(server, t.zcodeSid, t);
+            },
+          );
           if (turn.cancelled) return turnResult(translator, "cancelled");
+          // An allow settled with the turn FROZEN: the stop's terminal event
+          // sits in the backlog and would end the round end_turn BEFORE the
+          // batch flush cancels it and queues the continuation — which would
+          // orphan the grant (the flush only continues sessions with an
+          // in-flight turn). Hold until the window flushes; the flush's
+          // cancel then wins and prompt() consumes the continuation.
+          if (server.sandboxRestartBatcher.pendingFor(acpSid)) {
+            await waitForSandboxBatchFlush(server, acpSid);
+            if (turn.cancelled) return turnResult(translator, "cancelled");
+          }
         } else {
           // No path parsed — one generic hint per session, not one per retry.
           let asked = server.sandboxAskedPaths.get(acpSid);
