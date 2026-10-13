@@ -178,6 +178,18 @@ describe("session/new lazy creation", () => {
     const modeOpt = resp.configOptions.find((o) => o.id === "mode");
     expect(modeOpt?.currentValue).toBe("yolo");
   });
+
+  it("advertises the configured initial mode for the pending session (display matches create)", async () => {
+    vi.stubEnv("ZCODE_ACP_MODE", "build");
+    const server = new ZcodeAcpServer();
+    const resp = await newSession(server, newSessionParams("/tmp/ws"));
+
+    // Before materialization there is no backend read to consult — the
+    // placeholder must already show the mode session/create will send.
+    expect(resp.modes.currentModeId).toBe("build");
+    const modeOpt = resp.configOptions.find((o) => o.id === "mode");
+    expect(modeOpt?.currentValue).toBe("build");
+  });
 });
 
 describe("ensureRealSession", () => {

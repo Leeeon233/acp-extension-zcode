@@ -26,8 +26,9 @@ import {
   zcodePersonalProviderPath,
 } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
-import { configProviderIdFor } from "./account-provider.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
+import { configProviderIdFor } from "./account-provider.js";
+import { initialSessionMode } from "./settings.js";
 
 interface ProviderModelsJson {
   [modelId: string]: { limit?: { context?: number } } | undefined;
@@ -431,7 +432,10 @@ export async function buildModes(
   server: ZcodeAcpServer,
   zcodeSid: string | null,
 ): Promise<acp.SessionModeState> {
-  let currentMode = "yolo";
+  // Pending sessions (and a failed session/read) fall back to the configured
+  // initial mode — the exact value session/create sends at materialization —
+  // so the indicator never shows a mode the session will not run in.
+  let currentMode = initialSessionMode();
   if (zcodeSid !== null) {
     try {
       const read = await sessionRead(server, zcodeSid);
@@ -490,8 +494,9 @@ export function orderThoughtVariants(variants: string[]): Array<{ value: string;
 
 /** Build the ACP configOptions array (3 items: model/mode/thought).
  *  zcodeSid null = pending session — skip the backend read and use defaults;
- *  mode defaults to "yolo" (the mode session/create hardcodes) so the dropdown
- *  matches the mode indicator for a fresh session.
+ *  mode defaults to the configured initial mode (initialSessionMode — what
+ *  session/create sends at materialization) so the dropdown matches the mode
+ *  indicator for a fresh session.
  *  `receiverRoot` is the clientConnectionRoot of the client the array is
  *  delivered to — the quota pseudo-option is appended only for martty
  *  connections (ADR-0021); other receivers get the spec-clean 3 options. */
@@ -502,7 +507,7 @@ export async function buildConfigOptions(
 ): Promise<acp.SessionConfigOption[]> {
   let currentProviderId = "";
   let currentModelId = DEFAULT_MODEL_ID;
-  let currentMode = zcodeSid === null ? "yolo" : "build";
+  let currentMode = zcodeSid === null ? initialSessionMode() : "build";
   // Matches the enabled provider's default reasoning variants (GLM-5.3:
   // max/high/low, default max). Pending sessions show this until the real
   // session/read thoughtLevel arrives.
