@@ -9,15 +9,18 @@
  * The response mirrors the CLI card's data model so clients can reproduce it
  * exactly: one GLM section (plan level + per-window items with per-model
  * details), one Opencode Go section (rolling/weekly/monthly windows, the
- * relative reset countdown converted to an absolute timestamp), and one
- * Ollama Cloud section (session/weekly/monthly fractions as percents, with
- * the derived reset moments when available — the API itself returns none).
- * Provider failures are reported per-section as
+ * relative reset countdown converted to an absolute timestamp), one Ollama
+ * Cloud section (session/weekly/monthly fractions as percents, with the
+ * derived reset moments when available — the API itself returns none), and
+ * one CLIProxy section (per-Gemini-account per-model usage fractions as
+ * percents with reset moments). Provider failures are reported per-section as
  * `kind` strings rather than throwing — the client renders the same status
  * line the CLI would (a `not_configured` section is simply omitted, matching
  * the CLI).
  */
 
+import { parseRemoteConfig } from "../remote/config.js";
+import type { CpQueryResult } from "../quota/cliproxy/types.js";
 import { queryCombined } from "../quota/combined.js";
 import type { OcQueryResult } from "../quota/ollama-cloud/types.js";
 import type { GoQueryResult, GoWindowKey } from "../quota/opencode-go/types.js";
@@ -83,10 +86,34 @@ export interface OcUsageStats {
   usage?: OcUsageDetail;
 }
 
+/** One CLIProxy Gemini model: usage fraction converted to a percent. */
+export interface CpModelEntry {
+  name: string;
+  usedPercent: number;
+  resetsAt?: number;
+}
+
+/** One CLIProxy Gemini account and its per-model usage. */
+export interface CpAccountEntry {
+  label: string;
+  models: CpModelEntry[];
+}
+
+/**
+ * CLIProxy section — `accounts` present only on success, plus the count of
+ * non-Gemini accounts the proxy routes (informational tail for clients).
+ */
+export interface CpUsageStats {
+  kind: CpQueryResult["kind"];
+  accounts?: CpAccountEntry[];
+  otherAccounts?: number;
+}
+
 export interface UsageStatsResult {
   glm: GlmUsageStats;
   opencode: GoUsageStats;
   ollama: OcUsageStats;
+  cliproxy: CpUsageStats;
 }
 
 /** Window labels matching the CLI's card (`5h` / `Week` / `Month`). */
@@ -170,8 +197,71 @@ function toOcStats(result: OcQueryResult): OcUsageStats {
   return { kind: "success", windows, ...(usage !== undefined && { usage }) };
 }
 
+/** CLIProxy models pass through with the 0..1 fraction converted to percent. */
+function toCpStats(result: CpQueryResult, otherCount: number): CpUsageStats {
+  if (result.kind !== "success") return { kind: result.kind };
+  return {
+    kind: "success",
+    accounts: result.accounts.map((account) => ({
+      label: account.label,
+      models: account.models.map((model) => ({
+        name: model.name,
+        usedPercent: model.used * 100,
+        ...(model.resetAt !== undefined && { resetsAt: model.resetAt }),
+      })),
+    })),
+    ...(otherCount > 0 && { otherAccounts: otherCount }),
+  };
+}
+
 /** `account/usage_stats` handler — all providers, queried in parallel. */
 export async function accountUsageStats(): Promise<UsageStatsResult> {
-  const { glm, go, oc } = await queryCombined("all");
-  return { glm: toGlmStats(glm), opencode: toGoStats(go), ollama: toOcStats(oc) };
+  const { glm, go, oc, cp, cpOtherCount } = await queryCombined("all");
+  return {
+    glm: toGlmStats(glm),
+    opencode: toGoStats(go),
+    ollama: toOcStats(oc),
+    cliproxy: toCpStats(cp, cpOtherCount),
+  };
+}
+
+/**
+ * Budget for the hub-first lookup in {@link accountUsageStatsViaHub}. Longer
+ * than the dock's 500ms (live.ts): this answers an explicit client request,
+ * and the hub's own cache may be cold — better to wait than to fire a second
+ * full provider sweep in this process. A down hub still falls back instantly
+ * (loopback connect-refused), so the budget only ever waits on a live hub.
+ */
+const HUB_QUOTA_BUDGET_MS = 2_000;
+
+/**
+ * Hub-first `account/usage_stats` — quota traffic converges on the hub's
+ * cache whenever one exists (same policy as the dock refresher, live.ts), so
+ * many clients/bridges translate to one upstream sweep per TTL window. Any
+ * failure (no remote config, hub down, budget exceeded) falls back to the
+ * local {@link accountUsageStats} — the normal path for local-only setups.
+ */
+export async function accountUsageStatsViaHub(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<UsageStatsResult> {
+  const remote = parseRemoteConfig(env);
+  if (remote) {
+    try {
+      const resp = await fetch(`http://${remote.hubHost}:${remote.hubPort}/api/quota`, {
+        headers: { Authorization: `Bearer ${remote.token}` },
+        signal: AbortSignal.timeout(HUB_QUOTA_BUDGET_MS),
+      });
+      if (resp.ok) {
+        const body = (await resp.json()) as Partial<UsageStatsResult>;
+        // Require the `cliproxy` section too: an older hub without it would
+        // silently hide the section from clients. The hub auto-upgrades onto
+        // the current dist, so the skew window is short; meanwhile a local
+        // query keeps the answer complete.
+        if (body.glm && body.cliproxy) return body as UsageStatsResult;
+      }
+    } catch {
+      // hub absent/restarting — local fallback below
+    }
+  }
+  return accountUsageStats();
 }

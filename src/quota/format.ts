@@ -16,6 +16,7 @@
  */
 
 import { pickOverlay, renderColorBar } from "./color.js";
+import type { CpQueryResult } from "./cliproxy/types.js";
 import type { OcQueryResult } from "./ollama-cloud/types.js";
 import type { GoQueryResult } from "./opencode-go/types.js";
 import { roundTenth } from "./rounding.js";
@@ -371,6 +372,31 @@ export function formatOcDockSegment(oc: OcQueryResult): string | null {
 export function composeQuotaDock(...segments: (string | null)[]): string | null {
   const parts = segments.filter((s): s is string => s !== null);
   return parts.length > 0 ? parts.join(" · ") : null;
+}
+
+/**
+ * Compact CLIProxy segment for the dock: the single TIGHTEST Gemini model
+ * across all proxy accounts, as `cp 63% 10-15` — percent plus the reset date
+ * (Gemini quota windows reset within a day, so a clock time adds nothing the
+ * date doesn't). With several accounts the maximum is the actionable number;
+ * the full per-account breakdown lives in the card. `null` when the proxy is
+ * not usable (not configured, auth error, unavailable) or has no models.
+ */
+export function formatCpDockSegment(cp: CpQueryResult): string | null {
+  if (cp.kind !== "success") return null;
+  let worst: { used: number; resetAt?: number } | null = null;
+  for (const account of cp.accounts) {
+    for (const model of account.models) {
+      if (!worst || model.used > worst.used) {
+        worst = { used: model.used, resetAt: model.resetAt };
+      }
+    }
+  }
+  if (!worst) return null;
+  const pct = roundTenth(Math.max(0, Math.min(100, worst.used * 100)));
+  const label = Number.isInteger(pct) ? String(pct) : pct.toFixed(1);
+  const date = formatResetDate(worst.resetAt);
+  return `cp ${label}%${date ? ` ${date}` : ""}`;
 }
 
 /**

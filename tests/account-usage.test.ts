@@ -10,7 +10,10 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { queryCombinedMock } = vi.hoisted(() => ({ queryCombinedMock: vi.fn() }));
+const { queryCombinedMock, remoteConfigMock } = vi.hoisted(() => ({
+  queryCombinedMock: vi.fn(),
+  remoteConfigMock: vi.fn(),
+}));
 
 vi.mock("../src/quota/combined.js", async () => {
   const actual = await vi.importActual<typeof import("../src/quota/combined.js")>(
@@ -19,19 +22,23 @@ vi.mock("../src/quota/combined.js", async () => {
   return { ...actual, queryCombined: queryCombinedMock };
 });
 
-import { accountUsageStats } from "../src/handlers/account.js";
+vi.mock("../src/remote/config.js", () => ({ parseRemoteConfig: remoteConfigMock }));
+
+import { accountUsageStats, accountUsageStatsViaHub } from "../src/handlers/account.js";
 import type { CombinedResult } from "../src/quota/combined.js";
 
 const NOW = 1_700_000_000_000;
 
 beforeEach(() => {
   queryCombinedMock.mockReset();
+  remoteConfigMock.mockReset();
   vi.useFakeTimers();
   vi.setSystemTime(NOW);
 });
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllGlobals();
 });
 
 describe("accountUsageStats", () => {
@@ -61,6 +68,8 @@ describe("accountUsageStats", () => {
       },
       go: { kind: "not_configured" },
       oc: { kind: "not_configured" },
+      cp: { kind: "not_configured" },
+      cpOtherCount: 0,
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
@@ -91,6 +100,8 @@ describe("accountUsageStats", () => {
         monthly: null, // absent window is dropped, not rendered as "(no data)"
       },
       oc: { kind: "not_configured" },
+      cp: { kind: "not_configured" },
+      cpOtherCount: 0,
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
@@ -109,6 +120,8 @@ describe("accountUsageStats", () => {
       glm: { kind: "auth_error" },
       go: { kind: "auth_error" },
       oc: { kind: "auth_error" },
+      cp: { kind: "auth_error" },
+      cpOtherCount: 0,
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
@@ -116,6 +129,7 @@ describe("accountUsageStats", () => {
       glm: { kind: "auth_error" },
       opencode: { kind: "auth_error" },
       ollama: { kind: "auth_error" },
+      cliproxy: { kind: "auth_error" },
     });
   });
 
@@ -124,6 +138,8 @@ describe("accountUsageStats", () => {
       glm: { kind: "success", level: "pro", items: [] },
       go: { kind: "not_configured" },
       oc: { kind: "not_configured" },
+      cp: { kind: "not_configured" },
+      cpOtherCount: 0,
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
@@ -136,6 +152,8 @@ describe("accountUsageStats", () => {
       glm: { kind: "unavailable" },
       go: { kind: "not_configured" },
       oc: { kind: "success", session: 0.31, weekly: 0.675, fetchedAt: NOW },
+      cp: { kind: "not_configured" },
+      cpOtherCount: 0,
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
@@ -158,6 +176,8 @@ describe("accountUsageStats", () => {
         monthlyResetAt: NOW + 5 * 86_400_000,
         fetchedAt: NOW,
       },
+      cp: { kind: "not_configured" },
+      cpOtherCount: 0,
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
@@ -172,6 +192,8 @@ describe("accountUsageStats", () => {
       glm: { kind: "unavailable" },
       go: { kind: "not_configured" },
       oc: { kind: "success", monthly: 0.006, fetchedAt: NOW },
+      cp: { kind: "not_configured" },
+      cpOtherCount: 0,
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
@@ -197,6 +219,8 @@ describe("accountUsageStats", () => {
         outputTokens: 940_919,
         fetchedAt: NOW,
       },
+      cp: { kind: "not_configured" },
+      cpOtherCount: 0,
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
@@ -225,10 +249,123 @@ describe("accountUsageStats", () => {
       glm: { kind: "unavailable" },
       go: { kind: "not_configured" },
       oc: { kind: "success", usageUsd: 0.44, plan: "free", fetchedAt: NOW },
+      cp: { kind: "not_configured" },
+      cpOtherCount: 0,
     } satisfies CombinedResult);
 
     const out = await accountUsageStats();
     expect(out.ollama.windows).toEqual([]);
     expect(out.ollama.usage).toEqual({ plan: "free", usageUsd: 0.44, window: "30d" });
+  });
+
+  it("maps CLIProxy Gemini accounts to per-model percents", async () => {
+    queryCombinedMock.mockResolvedValue({
+      glm: { kind: "unavailable" },
+      go: { kind: "not_configured" },
+      oc: { kind: "not_configured" },
+      cp: {
+        kind: "success",
+        fetchedAt: NOW,
+        accounts: [
+          {
+            label: "will",
+            provider: "antigravity",
+            models: [
+              { name: "gemini-2.5-pro", used: 0.634, resetAt: NOW + 3_600_000 },
+              { name: "gemini-2.5-flash", used: 0.21 },
+            ],
+          },
+        ],
+      },
+      cpOtherCount: 2,
+    } satisfies CombinedResult);
+
+    const out = await accountUsageStats();
+    expect(out.cliproxy.kind).toBe("success");
+    expect(out.cliproxy.accounts).toEqual([
+      {
+        label: "will",
+        models: [
+          { name: "gemini-2.5-pro", usedPercent: 63.4, resetsAt: NOW + 3_600_000 },
+          { name: "gemini-2.5-flash", usedPercent: 21 },
+        ],
+      },
+    ]);
+    expect(out.cliproxy.otherAccounts).toBe(2);
+  });
+
+  it("reports CLIProxy failures as a section kind, not an omission", async () => {
+    queryCombinedMock.mockResolvedValue({
+      glm: { kind: "unavailable" },
+      go: { kind: "not_configured" },
+      oc: { kind: "not_configured" },
+      cp: { kind: "auth_error" },
+      cpOtherCount: 0,
+    } satisfies CombinedResult);
+
+    expect((await accountUsageStats()).cliproxy).toEqual({ kind: "auth_error" });
+  });
+});
+
+describe("accountUsageStatsViaHub", () => {
+  const HUB_BODY = {
+    glm: { kind: "unavailable" },
+    opencode: { kind: "not_configured" },
+    ollama: { kind: "not_configured" },
+    cliproxy: { kind: "not_configured" },
+  };
+  const LOCAL_RESULT = {
+    glm: { kind: "unavailable" },
+    opencode: { kind: "not_configured" },
+    ollama: { kind: "not_configured" },
+    cliproxy: { kind: "not_configured" },
+  };
+  const LOCAL_COMBINED = {
+    glm: { kind: "unavailable" },
+    go: { kind: "not_configured" },
+    oc: { kind: "not_configured" },
+    cp: { kind: "not_configured" },
+    cpOtherCount: 0,
+  };
+
+  it("serves the hub's cached body instead of querying locally", async () => {
+    remoteConfigMock.mockReturnValue({ hubHost: "127.0.0.1", hubPort: 9911, token: "tok" });
+    const fetchMock = vi.fn().mockResolvedValue({ ok: true, json: async () => HUB_BODY });
+    vi.stubGlobal("fetch", fetchMock);
+
+    await expect(accountUsageStatsViaHub({})).resolves.toEqual(HUB_BODY);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "http://127.0.0.1:9911/api/quota",
+      expect.objectContaining({ headers: { Authorization: "Bearer tok" } }),
+    );
+    expect(queryCombinedMock).not.toHaveBeenCalled();
+  });
+
+  it("falls back to a local query when the hub body lacks cliproxy (older hub)", async () => {
+    remoteConfigMock.mockReturnValue({ hubHost: "127.0.0.1", hubPort: 9911, token: "tok" });
+    const staleBody = { glm: { kind: "unavailable" }, opencode: {}, ollama: {} };
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, json: async () => staleBody }));
+    queryCombinedMock.mockResolvedValue(LOCAL_COMBINED satisfies CombinedResult);
+
+    await expect(accountUsageStatsViaHub({})).resolves.toEqual(LOCAL_RESULT);
+    expect(queryCombinedMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("falls back to a local query when the hub is unreachable", async () => {
+    remoteConfigMock.mockReturnValue({ hubHost: "127.0.0.1", hubPort: 9911, token: "tok" });
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("connect refused")));
+    queryCombinedMock.mockResolvedValue(LOCAL_COMBINED satisfies CombinedResult);
+
+    await expect(accountUsageStatsViaHub({})).resolves.toEqual(LOCAL_RESULT);
+  });
+
+  it("queries locally when remote is off", async () => {
+    remoteConfigMock.mockReturnValue(null);
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    queryCombinedMock.mockResolvedValue(LOCAL_COMBINED satisfies CombinedResult);
+
+    await expect(accountUsageStatsViaHub({})).resolves.toEqual(LOCAL_RESULT);
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 });

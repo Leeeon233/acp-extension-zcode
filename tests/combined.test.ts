@@ -69,6 +69,7 @@ import {
   formatCombinedCardPlain,
   queryCombined,
 } from "../src/quota/combined.js";
+import type { CpQueryResult } from "../src/quota/cliproxy/types.js";
 import type { OcQueryResult } from "../src/quota/ollama-cloud/types.js";
 import type { GoQueryResult } from "../src/quota/opencode-go/types.js";
 import type { QuotaResult } from "../src/quota/types.js";
@@ -78,6 +79,7 @@ const mockedOcFetch = vi.mocked(fetchOcUsage);
 
 /** Default oc fixture: unconfigured → section silently dropped in all mode. */
 const OC_NONE: OcQueryResult = { kind: "not_configured" };
+const CP_NONE: CpQueryResult = { kind: "not_configured" };
 
 // Real-shape GLM fixture (same as tests/quota.test.ts).
 const GLM_SUCCESS: QuotaResult = {
@@ -116,7 +118,7 @@ describe("defaultGoWindows", () => {
 describe("formatCombinedCard — all mode", () => {
   it("renders both sections — no banner, sections separated by a blank line", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "all" },
     );
     const lines = out.split("\n");
@@ -138,7 +140,13 @@ describe("formatCombinedCard — all mode", () => {
 
   it("silently drops the Go section when Go is not_configured", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: { kind: "not_configured" }, oc: OC_NONE },
+      {
+        glm: GLM_SUCCESS,
+        go: { kind: "not_configured" },
+        oc: OC_NONE,
+        cp: CP_NONE,
+        cpOtherCount: 0,
+      },
       { provider: "all" },
     );
     expect(out).toContain("GLM Coding Plan");
@@ -148,7 +156,7 @@ describe("formatCombinedCard — all mode", () => {
 
   it("shows the Go error line when Go is unavailable (not silently dropped)", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: { kind: "unavailable" }, oc: OC_NONE },
+      { glm: GLM_SUCCESS, go: { kind: "unavailable" }, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "all" },
     );
     expect(out).toContain("Opencode Go");
@@ -157,7 +165,7 @@ describe("formatCombinedCard — all mode", () => {
 
   it("shows the Go auth_error line when the cookie expired", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: { kind: "auth_error" }, oc: OC_NONE },
+      { glm: GLM_SUCCESS, go: { kind: "auth_error" }, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "all" },
     );
     expect(out).toContain("auth expired");
@@ -165,7 +173,7 @@ describe("formatCombinedCard — all mode", () => {
 
   it("wraps in a ```text fence in formatCombinedCard", () => {
     const fenced = formatCombinedCard(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "all" },
     );
     expect(fenced.startsWith("```text\n")).toBe(true);
@@ -175,7 +183,7 @@ describe("formatCombinedCard — all mode", () => {
   it("color mode paints both sections with ANSI escapes", () => {
     const ESC = String.fromCharCode(27);
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "all", color: true },
     );
     // Both the GLM bar (24%) and the Go bar (42%) must carry ANSI bg escapes.
@@ -189,7 +197,7 @@ describe("formatCombinedCard — all mode", () => {
   it("color mode respects provider=glm (paints GLM, no Go section)", () => {
     const ESC = String.fromCharCode(27);
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "glm", color: true },
     );
     expect(out).toContain(`${ESC}[48;2;`);
@@ -199,7 +207,7 @@ describe("formatCombinedCard — all mode", () => {
   describe("refresh line (refreshSuffix)", () => {
     it("places the refresh countdown on the separator row between sections, right-aligned", () => {
       const out = formatCombinedCardPlain(
-        { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+        { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
         { provider: "all", refreshSuffix: "refresh in 25s" },
       );
       const lines = out.split("\n");
@@ -213,7 +221,13 @@ describe("formatCombinedCard — all mode", () => {
     it("keeps the refresh row position even when Go is not_configured (only GLM)", () => {
       // Only GLM renders → refresh still trails the first section at the same row.
       const out = formatCombinedCardPlain(
-        { glm: GLM_SUCCESS, go: { kind: "not_configured" }, oc: OC_NONE },
+        {
+          glm: GLM_SUCCESS,
+          go: { kind: "not_configured" },
+          oc: OC_NONE,
+          cp: CP_NONE,
+          cpOtherCount: 0,
+        },
         { provider: "all", refreshSuffix: "refresh in 25s" },
       );
       const lines = out.split("\n");
@@ -225,7 +239,7 @@ describe("formatCombinedCard — all mode", () => {
 
     it("omits the refresh line entirely when no refreshSuffix is given", () => {
       const out = formatCombinedCardPlain(
-        { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+        { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
         { provider: "all" },
       );
       expect(out).not.toContain("refresh");
@@ -235,7 +249,7 @@ describe("formatCombinedCard — all mode", () => {
 
     it("appends the refresh line after the GLM card in glm mode", () => {
       const out = formatCombinedCardPlain(
-        { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+        { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
         { provider: "glm", refreshSuffix: "refresh in 3s" },
       );
       const lines = out.split("\n");
@@ -245,7 +259,7 @@ describe("formatCombinedCard — all mode", () => {
 
     it("appends the refresh line after the Go card in go mode", () => {
       const out = formatCombinedCardPlain(
-        { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+        { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
         { provider: "go", refreshSuffix: "refresh in 9s" },
       );
       const lines = out.split("\n");
@@ -257,7 +271,7 @@ describe("formatCombinedCard — all mode", () => {
 describe("formatCombinedCard — glm mode", () => {
   it("renders only GLM (header + divider + body, no banner)", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "glm" },
     );
     const lines = out.split("\n");
@@ -269,7 +283,7 @@ describe("formatCombinedCard — glm mode", () => {
 
   it("GLM non-success → just the fallback prose, no header/divider", () => {
     const out = formatCombinedCardPlain(
-      { glm: { kind: "unavailable" }, go: GO_SUCCESS, oc: OC_NONE },
+      { glm: { kind: "unavailable" }, go: GO_SUCCESS, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "glm" },
     );
     expect(out).toMatch(/unavailable/i);
@@ -281,7 +295,7 @@ describe("formatCombinedCard — glm mode", () => {
 describe("formatCombinedCard — go mode", () => {
   it("renders only Opencode Go with all three windows", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE },
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_NONE, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "go", goWindows: ["rolling", "weekly", "monthly"] },
     );
     const lines = out.split("\n");
@@ -295,7 +309,13 @@ describe("formatCombinedCard — go mode", () => {
 
   it("Go not_configured in go mode surfaces the help line (not silently dropped)", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: { kind: "not_configured" }, oc: OC_NONE },
+      {
+        glm: GLM_SUCCESS,
+        go: { kind: "not_configured" },
+        oc: OC_NONE,
+        cp: CP_NONE,
+        cpOtherCount: 0,
+      },
       { provider: "go" },
     );
     expect(out).toContain("not configured");
@@ -423,7 +443,7 @@ describe("formatCombinedCard — oc section", () => {
 
   it("renders the Ollama Cloud section below Opencode Go in all mode", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_SUCCESS },
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_SUCCESS, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "all" },
     );
     expect(out).toContain(" Ollama Cloud");
@@ -436,7 +456,13 @@ describe("formatCombinedCard — oc section", () => {
 
   it("silently drops the oc section when not_configured (all mode)", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: { kind: "not_configured" } },
+      {
+        glm: GLM_SUCCESS,
+        go: GO_SUCCESS,
+        oc: { kind: "not_configured" },
+        cp: CP_NONE,
+        cpOtherCount: 0,
+      },
       { provider: "all" },
     );
     expect(out).not.toContain("Ollama Cloud");
@@ -444,7 +470,13 @@ describe("formatCombinedCard — oc section", () => {
 
   it("shows the oc error line when the key is bad (auth_error, all mode)", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: { kind: "auth_error" } },
+      {
+        glm: GLM_SUCCESS,
+        go: GO_SUCCESS,
+        oc: { kind: "auth_error" },
+        cp: CP_NONE,
+        cpOtherCount: 0,
+      },
       { provider: "all" },
     );
     expect(out).toContain("Ollama Cloud");
@@ -453,7 +485,7 @@ describe("formatCombinedCard — oc section", () => {
 
   it("oc mode renders only the Ollama Cloud section", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_SUCCESS },
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_SUCCESS, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "oc" },
     );
     const lines = out.split("\n");
@@ -464,7 +496,13 @@ describe("formatCombinedCard — oc section", () => {
 
   it("oc not_configured in oc mode surfaces the help line", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: { kind: "not_configured" } },
+      {
+        glm: GLM_SUCCESS,
+        go: GO_SUCCESS,
+        oc: { kind: "not_configured" },
+        cp: CP_NONE,
+        cpOtherCount: 0,
+      },
       { provider: "oc" },
     );
     expect(out).toContain("not configured");
@@ -473,7 +511,7 @@ describe("formatCombinedCard — oc section", () => {
 
   it("refresh suffix appears once, after the first section, even with three sections", () => {
     const out = formatCombinedCardPlain(
-      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_SUCCESS },
+      { glm: GLM_SUCCESS, go: GO_SUCCESS, oc: OC_SUCCESS, cp: CP_NONE, cpOtherCount: 0 },
       { provider: "all", refreshSuffix: "refresh in 25s" },
     );
     const lines = out.split("\n");

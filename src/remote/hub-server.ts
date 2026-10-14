@@ -70,10 +70,12 @@ import { BOOT_RESUME_TRIGGER } from "../handlers/session.js";
 import { createSettingsHandler } from "./settings-endpoint.js";
 import {
   composeQuotaDock,
+  formatCpDockSegment,
   formatGoDockSegment,
   formatOcDockSegment,
   formatQuotaDock,
 } from "../quota/format.js";
+import { queryCpUsage } from "../quota/cliproxy/index.js";
 import { queryQuota } from "../quota/index.js";
 import { queryOcUsage } from "../quota/ollama-cloud/index.js";
 import { queryGoUsage } from "../quota/opencode-go/index.js";
@@ -911,8 +913,11 @@ function getQuotaDock(): Promise<{ formatted: string | null; fetchedAt: number }
     queryOcUsage()
       .then(formatOcDockSegment)
       .catch(() => null),
-  ]).then(([glm, go, oc]) => {
-    dockCache = { formatted: composeQuotaDock(glm, go, oc), at: Date.now() };
+    queryCpUsage()
+      .then((cp) => formatCpDockSegment(cp.result))
+      .catch(() => null),
+  ]).then(([glm, go, oc, cp]) => {
+    dockCache = { formatted: composeQuotaDock(glm, go, oc, cp), at: Date.now() };
     return { formatted: dockCache.formatted, fetchedAt: dockCache.at };
   });
 }

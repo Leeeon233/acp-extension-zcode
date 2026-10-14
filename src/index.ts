@@ -17,7 +17,7 @@ import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { z } from "zod";
 
-import { accountUsageStats } from "./handlers/account.js";
+import { accountUsageStatsViaHub } from "./handlers/account.js";
 import { installCrashGuards } from "./crash-guards.js";
 import {
   cancel,
@@ -231,8 +231,11 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       )
       // Account-level plan quota for remote clients (non-standard; Proposal
       // 0002). Pull-only, no session required; errors carry the failure kind in
-      // `data.kind` so clients can hide the quota UI.
-      .onRequest("account/usage_stats", z.object({}).passthrough(), () => accountUsageStats())
+      // `data.kind` so clients can hide the quota UI. Hub-first: converge on
+      // the hub's cached /api/quota when remote is on, local query otherwise.
+      .onRequest("account/usage_stats", z.object({}).passthrough(), () =>
+        accountUsageStatsViaHub(),
+      )
       .onRequest("session/prompt", (ctx) => {
         // Mirror the user's message to every other client before the turn
         // starts — the prompting client renders it locally, the others only

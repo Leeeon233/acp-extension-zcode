@@ -28,6 +28,11 @@ vi.mock("../src/quota/index.js", () => ({ queryQuota: queryQuotaMock }));
 const { queryOcUsageMock } = vi.hoisted(() => ({ queryOcUsageMock: vi.fn() }));
 vi.mock("../src/quota/ollama-cloud/index.js", () => ({ queryOcUsage: queryOcUsageMock }));
 
+// CLIProxy dock segment — same isolation: an inherited config or env pair
+// must not reach the remote relay from tests.
+const { queryCpUsageMock } = vi.hoisted(() => ({ queryCpUsageMock: vi.fn() }));
+vi.mock("../src/quota/cliproxy/index.js", () => ({ queryCpUsage: queryCpUsageMock }));
+
 // tasks-index surface the delete routes consult. Defaults mirror the real
 // module under a hermetic HOME (no index): no known workspaces, nothing
 // deleted — existing tests behave exactly as before.
@@ -438,6 +443,8 @@ describe("hub quota dock endpoint", () => {
     queryQuotaMock.mockReset();
     queryOcUsageMock.mockReset();
     queryOcUsageMock.mockResolvedValue({ kind: "not_configured" });
+    queryCpUsageMock.mockReset();
+    queryCpUsageMock.mockResolvedValue({ result: { kind: "not_configured" }, otherCount: 0 });
     resetDockCacheForTest();
   });
 
@@ -463,6 +470,36 @@ describe("hub quota dock endpoint", () => {
     const body = (await res.json()) as { formatted: string | null; fetchedAt: number };
     expect(body.formatted).toBe("45% · 12%");
     expect(body.fetchedAt).toBeGreaterThan(0);
+  });
+
+  it("appends the CLIProxy segment (tightest model) to the dock", async () => {
+    const hub = await startTestHub();
+    queryQuotaMock.mockResolvedValueOnce({
+      kind: "success",
+      level: "pro",
+      items: [{ key: "token_5h", label: "5h", usedPercent: 45, leftPercent: 55 }],
+    });
+    const resetAt = Date.now() + 3_600_000;
+    queryCpUsageMock.mockResolvedValueOnce({
+      result: {
+        kind: "success",
+        fetchedAt: Date.now(),
+        accounts: [
+          {
+            label: "will",
+            provider: "antigravity",
+            models: [{ name: "gemini-2.5-pro", used: 0.634, resetAt }],
+          },
+        ],
+      },
+      otherCount: 1,
+    });
+    const res = await fetch(dockUrl(hub), { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { formatted: string | null };
+    const d = new Date(resetAt);
+    const date = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    expect(body.formatted).toBe(`45% · cp 63.4% ${date}`);
   });
 
   it("serves the cached copy within the TTL", async () => {

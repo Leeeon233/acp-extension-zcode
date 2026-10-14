@@ -8,10 +8,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   composeQuotaDock,
+  formatCpDockSegment,
   formatGoDockSegment,
   formatOcDockSegment,
   formatQuotaDock,
 } from "../src/quota/format.js";
+import type { CpQueryResult } from "../src/quota/cliproxy/types.js";
 import type { OcQueryResult } from "../src/quota/ollama-cloud/types.js";
 import type { GoQueryResult } from "../src/quota/opencode-go/types.js";
 import type { QuotaItem, QuotaResult } from "../src/quota/types.js";
@@ -192,5 +194,50 @@ describe("formatOcDockSegment", () => {
     expect(formatOcDockSegment({ kind: "not_configured" })).toBeNull();
     expect(formatOcDockSegment({ kind: "auth_error" })).toBeNull();
     expect(formatOcDockSegment({ kind: "unavailable" })).toBeNull();
+  });
+});
+
+describe("formatCpDockSegment", () => {
+  const cpSuccess = (
+    models: Array<{ name: string; used: number; resetAt?: number }>,
+    accountCount = 1,
+  ): CpQueryResult => ({
+    kind: "success",
+    fetchedAt: NOW,
+    accounts: Array.from({ length: accountCount }, (_, i) => ({
+      label: `acct-${i}`,
+      provider: "antigravity",
+      models: i === 0 ? models : [{ name: "idle", used: 0.01 }],
+    })),
+  });
+
+  it("renders the single tightest model with its reset date", () => {
+    const result = cpSuccess([
+      { name: "gemini-2.5-pro", used: 0.634, resetAt: NOW + 3_600_000 },
+      { name: "gemini-2.5-flash", used: 0.21 },
+    ]);
+    expect(formatCpDockSegment(result)).toBe(`cp 63.4% ${date(NOW + 3_600_000)}`);
+  });
+
+  it("picks the max across multiple accounts (the actionable number)", () => {
+    const result = cpSuccess([{ name: "pro", used: 0.4 }], 2);
+    expect(formatCpDockSegment(result)).toBe("cp 40%");
+  });
+
+  it("omits the stamp when the tightest model has no reset moment", () => {
+    expect(formatCpDockSegment(cpSuccess([{ name: "pro", used: 0.99 }]))).toBe("cp 99%");
+  });
+
+  it("null when not usable or no Gemini models", () => {
+    expect(formatCpDockSegment(cpSuccess([]))).toBeNull();
+    expect(formatCpDockSegment({ kind: "not_configured" })).toBeNull();
+    expect(formatCpDockSegment({ kind: "auth_error" })).toBeNull();
+    expect(formatCpDockSegment({ kind: "unavailable" })).toBeNull();
+  });
+
+  it("composes with the other dock segments", () => {
+    expect(composeQuotaDock("45%", "go 8% 10-11", "oc 3%", "cp 63% 10-15")).toBe(
+      "45% · go 8% 10-11 · oc 3% · cp 63% 10-15",
+    );
   });
 });
