@@ -18,9 +18,11 @@ const TIMEOUT_MS = 10_000;
 export const USAGE_URL = "https://ollama.com/api/usage";
 
 /**
- * The rolling window we request — the numerator window for the derived
- * monthly percent. Not the billing month itself: the API offers no
- * billing-period range, so the percent is an approximation near the reset.
+ * The rolling window we request. Its `buckets` (day granularity) are the
+ * primary source: the monthly percent sums them back to the billing-period
+ * start (reset-aware). The window's `totals` are the FALLBACK numerator — the
+ * API offers no billing-period range, and 30d is the widest window, so it
+ * covers a monthly period start except for at most the period's first day.
  */
 export const USAGE_RANGE = "30d";
 

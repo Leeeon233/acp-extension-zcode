@@ -49,10 +49,14 @@ export function nextWeeklyReset(t: number): number {
  * Also carries the `Plan` id — the key into {@link PLAN_CREDIT_USD}. Any
  * failure (network, auth, shape) yields empty fields — the caller then
  * renders without the reset stamp / derived percent.
+ *
+ * `periodStartAt` is the START of the CURRENT billing period (the last reset
+ * that already happened) — the anchor for the bucket-summed period spend.
  */
 interface OcAccountInfo {
   plan?: string;
   monthlyResetAt?: number;
+  periodStartAt?: number;
 }
 
 async function lookupAccountInfo(apiKey: string): Promise<OcAccountInfo> {
@@ -72,7 +76,12 @@ async function lookupAccountInfo(apiKey: string): Promise<OcAccountInfo> {
         (period as { valid?: unknown }).valid;
       if (valid !== false && typeof raw === "string") {
         const ms = Date.parse(raw);
-        if (Number.isFinite(ms)) info.monthlyResetAt = ms;
+        if (Number.isFinite(ms)) {
+          info.monthlyResetAt = ms;
+          // The billing period runs up TO the (future) period end; its start
+          // sits one month earlier, clamped to that month's last day.
+          if (ms > Date.now()) info.periodStartAt = subtractOneMonthClamped(ms);
+        }
       }
     }
     if (info.monthlyResetAt === undefined) {
@@ -80,7 +89,10 @@ async function lookupAccountInfo(apiKey: string): Promise<OcAccountInfo> {
       if (typeof createdRaw === "string") {
         const created = Date.parse(createdRaw);
         if (Number.isFinite(created)) {
-          info.monthlyResetAt = nextMonthlyAnniversary(created, Date.now());
+          const now = Date.now();
+          info.monthlyResetAt = nextMonthlyAnniversary(created, now);
+          const start = prevMonthlyAnniversary(created, now);
+          if (Number.isFinite(start)) info.periodStartAt = start;
         }
       }
     }
@@ -131,6 +143,117 @@ export function nextMonthlyAnniversary(createdMs: number, now: number): number {
     }
   }
   return Number.NaN;
+}
+
+/**
+ * Latest monthly anniversary of `createdMs` at or before `now` (NaN when none
+ * exists — e.g. a malformed future-dated creation). The START of the current
+ * billing period; together with {@link nextMonthlyAnniversary} it brackets
+ * [periodStart, nextReset).
+ */
+export function prevMonthlyAnniversary(createdMs: number, now: number): number {
+  const created = new Date(createdMs);
+  const nowDate = new Date(now);
+  if (Number.isNaN(created.getTime()) || Number.isNaN(nowDate.getTime())) return Number.NaN;
+  const day = created.getUTCDate();
+  const h = created.getUTCHours();
+  const min = created.getUTCMinutes();
+  const sec = created.getUTCSeconds();
+  const ms = created.getUTCMilliseconds();
+  let best = Number.NaN;
+  for (let year = nowDate.getUTCFullYear() - 1; year <= nowDate.getUTCFullYear(); year++) {
+    for (let month = 0; month < 12; month++) {
+      // Clamp to the month's last day (UTC months are 0-based).
+      const lastDay = new Date(Date.UTC(year, month + 1, 0)).getUTCDate();
+      const candidate = Date.UTC(year, month, Math.min(day, lastDay), h, min, sec, ms);
+      if (candidate <= now && (Number.isNaN(best) || candidate > best)) best = candidate;
+    }
+  }
+  return best;
+}
+
+/**
+ * One month before `ms`, clamped to the previous month's last day (a Mar-31
+ * period end clamps its start to Feb 28/29). `Date.UTC` normalizes
+ * `month - 1`, so January flows into December of the previous year.
+ */
+export function subtractOneMonthClamped(ms: number): number {
+  const d = new Date(ms);
+  const lastDayOfPrev = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), 0)).getUTCDate();
+  return Date.UTC(
+    d.getUTCFullYear(),
+    d.getUTCMonth() - 1,
+    Math.min(d.getUTCDate(), lastDayOfPrev),
+    d.getUTCHours(),
+    d.getUTCMinutes(),
+    d.getUTCSeconds(),
+    d.getUTCMilliseconds(),
+  );
+}
+
+/** A raw daily bucket from the analytics response (keys observed 2026-10). */
+export interface OcUsageBucket {
+  from?: unknown;
+  until?: unknown;
+  usage_usd?: unknown;
+  request_count?: unknown;
+}
+
+/** Spend summed from the daily buckets over the current billing period. */
+export interface OcPeriodSpend {
+  usageUsd: number;
+  requestCount?: number;
+}
+
+/**
+ * Sum the daily buckets' spend over `[periodStartAt, ∞)` — the honest monthly
+ * numerator: a reset empties the window instead of keeping the rolling-30d
+ * spend (observed 2026-10-14: 81% shown two days past the reset vs 1.4%
+ * actual). The bucket straddling the period start is split proportionally by
+ * its time overlap (day granularity is all the API offers).
+ *
+ * Returns `undefined` — the caller then falls back to the rolling-30d
+ * `totals.usage_usd` — when no `periodStartAt` is known, no bucket parses, or
+ * the buckets do not reach back to the period start (the 30d window opens up
+ * to a day later than a monthly period start, so the tail day of the period
+ * can sit outside the response).
+ */
+export function periodSpend(
+  buckets: OcUsageBucket[],
+  periodStartAt: number | undefined,
+): OcPeriodSpend | undefined {
+  if (periodStartAt === undefined || !Number.isFinite(periodStartAt) || buckets.length === 0) {
+    return undefined;
+  }
+  let usageUsd = 0;
+  let requestCount = 0;
+  let anyUsage = false;
+  let anyRequest = false;
+  let minFrom = Number.POSITIVE_INFINITY;
+  for (const raw of buckets) {
+    const from = typeof raw.from === "string" ? Date.parse(raw.from) : Number.NaN;
+    const until = typeof raw.until === "string" ? Date.parse(raw.until) : Number.NaN;
+    if (!Number.isFinite(from) || !Number.isFinite(until) || until <= from) continue;
+    minFrom = Math.min(minFrom, from);
+    if (until <= periodStartAt) continue; // entirely before the period
+    // Fraction of the bucket inside the period (the reset-day straddler).
+    const frac = from >= periodStartAt ? 1 : (until - periodStartAt) / (until - from);
+    if (validCount(raw.usage_usd)) {
+      usageUsd += (raw.usage_usd as number) * frac;
+      anyUsage = true;
+    }
+    if (validCount(raw.request_count)) {
+      requestCount += (raw.request_count as number) * frac;
+      anyRequest = true;
+    }
+  }
+  // Coverage: the earliest usable bucket must sit at/before the period start,
+  // else the sum silently undercounts the period's first day(s).
+  if (!anyUsage || minFrom > periodStartAt) return undefined;
+  return {
+    usageUsd,
+    ...(anyRequest && { requestCount: Math.round(requestCount) }),
+  };
 }
 
 /**
@@ -190,20 +313,35 @@ export async function queryOcUsage(): Promise<OcQueryResult> {
       const parsed = JSON.parse(resp.text) as {
         totals?: Record<string, unknown>;
         limits?: Record<string, { usage?: unknown } | undefined>;
+        buckets?: unknown;
       };
       const totals = parsed.totals ?? {};
       const usageUsd = validCount(totals.usage_usd) ? totals.usage_usd : undefined;
       if (usageUsd !== undefined) {
-        // Analytics shape: spend over the rolling 30d window. The percent is
-        // derived (spend ÷ plan credit) because the API reports no limit.
+        // Analytics shape: spend over the rolling 30d window. The monthly
+        // percent prefers the bucket-summed CURRENT-PERIOD spend (reset-aware)
+        // and falls back to the rolling total only when the buckets cannot
+        // bracket the period (no /api/me period, no coverage — see
+        // {@link periodSpend}).
         const fetchedAt = Date.now();
-        const { plan, monthlyResetAt } = await lookupAccountInfo(apiKey);
+        const { plan, monthlyResetAt, periodStartAt } = await lookupAccountInfo(apiKey);
         const creditUsd = plan !== undefined ? PLAN_CREDIT_USD[plan.toLowerCase()] : undefined;
+        const buckets: OcUsageBucket[] = Array.isArray(parsed.buckets)
+          ? (parsed.buckets as OcUsageBucket[])
+          : [];
+        const period = periodSpend(buckets, periodStartAt);
+        const monthlyNumerator = period !== undefined ? period.usageUsd : usageUsd;
         result = {
           kind: "success",
-          ...(creditUsd !== undefined && { monthly: Math.min(1, usageUsd / creditUsd) }),
+          ...(creditUsd !== undefined && { monthly: Math.min(1, monthlyNumerator / creditUsd) }),
           ...(monthlyResetAt !== undefined && { monthlyResetAt }),
           usageUsd,
+          ...(period !== undefined &&
+            periodStartAt !== undefined && {
+              periodUsageUsd: period.usageUsd,
+              periodStartAt,
+              ...(period.requestCount !== undefined && { periodRequestCount: period.requestCount }),
+            }),
           ...(plan !== undefined && { plan }),
           ...(creditUsd !== undefined && { creditUsd }),
           ...(validCount(totals.request_count) && { requestCount: totals.request_count }),

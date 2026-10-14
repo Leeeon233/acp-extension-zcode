@@ -78,12 +78,26 @@ export function formatOcSection(result: OcQueryResult, color = false): RenderedS
 }
 
 /**
- * Spend detail line for the analytics API (2026-10+): `usage` spend over the
- * rolling 30d window, with the plan credit as context when known. Indented to
- * sit under the window bars. `null` when the result carries no spend (legacy
- * response shape) — the card then stays exactly as before.
+ * Spend detail line for the analytics API (2026-10+). Prefers the
+ * BILLING-PERIOD spend (`since MM-DD`, matching the Month bar's numerator);
+ * the rolling-30d form only when the period buckets were unavailable. `null`
+ * when the result carries no spend (legacy response shape) — the card then
+ * stays exactly as before.
  */
 function formatOcSpendLine(result: Extract<OcQueryResult, { kind: "success" }>): string | null {
+  if (result.periodUsageUsd !== undefined) {
+    const spend = `$${result.periodUsageUsd.toFixed(2)}`;
+    const of = result.creditUsd !== undefined ? ` of $${result.creditUsd}` : " spent";
+    const req =
+      result.periodRequestCount !== undefined
+        ? ` · ${result.periodRequestCount.toLocaleString("en-US")} req`
+        : "";
+    const since =
+      result.periodStartAt !== undefined
+        ? ` (since ${formatPeriodDate(result.periodStartAt)})`
+        : "";
+    return `      ${spend}${of}${req}${since}`;
+  }
   if (result.usageUsd === undefined) return null;
   const spend = `$${result.usageUsd.toFixed(2)}`;
   const of = result.creditUsd !== undefined ? ` of $${result.creditUsd}` : " spent";
@@ -92,4 +106,12 @@ function formatOcSpendLine(result: Extract<OcQueryResult, { kind: "success" }>):
       ? ` · ${result.requestCount.toLocaleString("en-US")} req`
       : "";
   return `      ${spend}${of}${req} (30d)`;
+}
+
+/** `MM-DD` (local time, same clock as the reset stamp) for the period anchor. */
+function formatPeriodDate(ms: number): string {
+  const d = new Date(ms);
+  const mm = String(d.getMonth() + 1).padStart(2, "0");
+  const dd = String(d.getDate()).padStart(2, "0");
+  return `${mm}-${dd}`;
 }

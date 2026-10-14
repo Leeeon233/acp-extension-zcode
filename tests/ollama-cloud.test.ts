@@ -38,8 +38,12 @@ import {
   nextMonthlyAnniversary,
   nextSessionReset,
   nextWeeklyReset,
+  periodSpend,
+  prevMonthlyAnniversary,
   queryOcUsage,
   SESSION_WINDOW_MS,
+  subtractOneMonthClamped,
+  type OcUsageBucket,
 } from "../src/quota/ollama-cloud/index.js";
 import type { OcQueryResult } from "../src/quota/ollama-cloud/types.js";
 
@@ -61,13 +65,16 @@ function usageBody(session: number | null, weekly: number | null, monthly?: numb
 }
 
 /** Build an analytics (2026-10+) /api/usage response body. */
-function analyticsBody(totals: {
-  usage_usd: number;
-  request_count?: number;
-  input_tokens?: number;
-  cached_input_tokens?: number;
-  output_tokens?: number;
-}): string {
+function analyticsBody(
+  totals: {
+    usage_usd: number;
+    request_count?: number;
+    input_tokens?: number;
+    cached_input_tokens?: number;
+    output_tokens?: number;
+  },
+  buckets: OcUsageBucket[] = [],
+): string {
   return JSON.stringify({
     range: "30d",
     scope: "self",
@@ -81,9 +88,21 @@ function analyticsBody(totals: {
       cached_input_tokens: totals.cached_input_tokens ?? 12_922_504,
       output_tokens: totals.output_tokens ?? 940_919,
     },
-    buckets: [],
+    buckets,
   });
 }
+
+/** One daily bucket covering [from, from+24h) with the given spend/requests. */
+function dayBucket(fromMs: number, usageUsd: number, requestCount = 0): OcUsageBucket {
+  return {
+    from: new Date(fromMs).toISOString(),
+    until: new Date(fromMs + 86_400_000).toISOString(),
+    usage_usd: usageUsd,
+    request_count: requestCount,
+  };
+}
+
+const DAY = 86_400_000;
 
 // --- formatOcSection -------------------------------------------------------
 
@@ -131,6 +150,27 @@ describe("formatOcSection", () => {
     expect(sec.body).toHaveLength(2);
     expect(sec.body[0]).toMatch(/Month\s+[█░]+\s+2\.6%/);
     expect(sec.body[1]).toMatch(/\$1\.57 of \$60 · 246 req \(30d\)/);
+  });
+
+  it("the spend detail prefers the billing-period spend with its since date", () => {
+    const periodStart = Date.UTC(2026, 9, 12, 13, 38);
+    const since = new Date(periodStart);
+    const sinceLabel = `${String(since.getMonth() + 1).padStart(2, "0")}-${String(
+      since.getDate(),
+    ).padStart(2, "0")}`;
+    const sec = formatOcSection({
+      kind: "success",
+      monthly: 0.014,
+      monthlyResetAt: Date.UTC(2026, 10, 12, 13, 38),
+      usageUsd: 48.62,
+      creditUsd: 60,
+      periodUsageUsd: 0.83,
+      periodRequestCount: 6,
+      periodStartAt: periodStart,
+      fetchedAt: 1,
+    });
+    expect(sec.body).toHaveLength(2);
+    expect(sec.body[1]).toBe(`      $0.83 of $60 · 6 req (since ${sinceLabel})`);
   });
 
   it("spend without a known credit reads 'spent' instead of 'of $…'", () => {
@@ -284,6 +324,70 @@ describe("queryOcUsage orchestration", () => {
     );
   });
 
+  it("prevMonthlyAnniversary: latest anniversary at-or-before now (period start)", () => {
+    const Y = (s: string): number => Date.parse(s);
+    // Two days past the Oct reset (the live 2026-10-14 case): the period
+    // started at the Oct-12 anniversary, NOT at the Sep-12 subscription.
+    expect(prevMonthlyAnniversary(Y("2026-09-12T13:38:00Z"), Y("2026-10-14T08:00:00Z"))).toBe(
+      Y("2026-10-12T13:38:00Z"),
+    );
+    // Exactly AT the anniversary moment — still the current period's start.
+    expect(prevMonthlyAnniversary(Y("2026-09-12T13:38:00Z"), Y("2026-10-12T13:38:00Z"))).toBe(
+      Y("2026-10-12T13:38:00Z"),
+    );
+    // One ms past it — the NEXT period has begun.
+    expect(prevMonthlyAnniversary(Y("2026-09-12T13:38:00Z"), Y("2026-10-12T13:38:00.001Z"))).toBe(
+      Y("2026-10-12T13:38:00Z"),
+    );
+    // A fresh subscription (under one month old): the period starts at the
+    // subscription moment itself.
+    expect(prevMonthlyAnniversary(Y("2026-10-01T10:00:00Z"), Y("2026-10-10T10:00:00Z"))).toBe(
+      Y("2026-10-01T10:00:00Z"),
+    );
+    // Jan-31 signup: the Feb anniversary clamps to Feb 28.
+    expect(prevMonthlyAnniversary(Y("2026-01-31T00:00:00Z"), Y("2026-03-05T00:00:00Z"))).toBe(
+      Y("2026-02-28T00:00:00Z"),
+    );
+  });
+
+  it("subtractOneMonthClamped: month arithmetic with day clamping", () => {
+    const Y = (s: string): number => Date.parse(s);
+    expect(subtractOneMonthClamped(Y("2026-10-05T00:00:00Z"))).toBe(Y("2026-09-05T00:00:00Z"));
+    // Mar-31 has no Mar counterpart in Feb — clamps to Feb 28.
+    expect(subtractOneMonthClamped(Y("2026-03-31T00:00:00Z"))).toBe(Y("2026-02-28T00:00:00Z"));
+    // January flows into December of the previous year.
+    expect(subtractOneMonthClamped(Y("2026-01-15T12:00:00Z"))).toBe(Y("2025-12-15T12:00:00Z"));
+  });
+
+  it("periodSpend: sums buckets at/after the period start, splits the straddler", () => {
+    const periodStart = Date.parse("2026-10-12T13:38:00Z");
+    const buckets: OcUsageBucket[] = [
+      dayBucket(Date.parse("2026-10-11T00:00:00Z"), 22.92, 100), // entirely before
+      // The reset-day straddler: 10h22m of 24h inside the period → 0.43ish.
+      dayBucket(Date.parse("2026-10-12T00:00:00Z"), 0.09, 2),
+      dayBucket(Date.parse("2026-10-13T00:00:00Z"), 0.62, 3),
+    ];
+    const spend = periodSpend(buckets, periodStart);
+    expect(spend).toBeDefined();
+    const straddlerFrac = (Date.parse("2026-10-13T00:00:00Z") - periodStart) / (24 * 3_600_000);
+    expect(spend!.usageUsd).toBeCloseTo(0.09 * straddlerFrac + 0.62, 10);
+    expect(spend!.requestCount).toBe(Math.round(2 * straddlerFrac + 3));
+
+    // Buckets not reaching back to the period start — coverage failure.
+    const lateBuckets = [dayBucket(periodStart + DAY, 1)];
+    expect(periodSpend(lateBuckets, periodStart)).toBeUndefined();
+    // No period anchor / no buckets — fallback signal.
+    expect(periodSpend(buckets, undefined)).toBeUndefined();
+    expect(periodSpend([], periodStart)).toBeUndefined();
+    // Malformed buckets are skipped; zero usage in-period is a valid zero.
+    const malformed: OcUsageBucket[] = [
+      { from: "not-a-date", until: "2026-10-13T00:00:00Z", usage_usd: 5 },
+      dayBucket(Date.parse("2026-10-11T00:00:00Z"), 9), // coverage anchor, pre-period
+      dayBucket(Date.parse("2026-10-13T00:00:00Z"), 0, 0),
+    ];
+    expect(periodSpend(malformed, periodStart)).toEqual({ usageUsd: 0, requestCount: 0 });
+  });
+
   describe("analytics API (2026-10+)", () => {
     /** /api/me body for a Pro account (live shape, verified 2026-09-17). */
     const proMe = JSON.stringify({
@@ -337,6 +441,85 @@ describe("queryOcUsage orchestration", () => {
       mockedMe.mockResolvedValue({ status: 200, text: proMe });
       const result = await queryOcUsage();
       expect(result).toMatchObject({ kind: "success", monthly: 1, creditUsd: 60 });
+    });
+
+    it("monthly uses the bucket-summed PERIOD spend, not the rolling 30d total", async () => {
+      // The live 2026-10-14 report: reset passed two days ago, the card still
+      // showed the rolling 81% while the true period spend was 1.4%.
+      process.env.OLLAMA_API_KEY = "sk-test";
+      const created = Date.now() - 25 * DAY; // first period still current
+      mockedMe.mockResolvedValue({
+        status: 200,
+        text: JSON.stringify({ CreatedAt: new Date(created).toISOString(), Plan: "pro" }),
+      });
+      const buckets = [
+        dayBucket(created - 2 * DAY, 5, 50), // before the period — excluded
+        dayBucket(created - DAY, 7, 70), // ends exactly at the period start — excluded
+        dayBucket(created, 2.5, 10), // first in-period day
+        dayBucket(created + DAY, 1.25, 5), // second in-period day
+      ];
+      mockedFetch.mockResolvedValue({
+        status: 200,
+        text: analyticsBody({ usage_usd: 48.62 }, buckets),
+      });
+      const result = await queryOcUsage();
+      expect(result).toMatchObject({
+        kind: "success",
+        periodUsageUsd: 3.75,
+        periodRequestCount: 15,
+        usageUsd: 48.62,
+        monthly: 3.75 / 60,
+      });
+      if (result.kind !== "success") return;
+      expect(result.periodStartAt).toBe(created);
+    });
+
+    it("SubscriptionPeriodEnd accounts anchor the period at end-minus-one-month", async () => {
+      process.env.OLLAMA_API_KEY = "sk-test";
+      const periodEnd = Date.now() + 10 * DAY;
+      const periodStart = subtractOneMonthClamped(periodEnd);
+      mockedMe.mockResolvedValue({
+        status: 200,
+        text: JSON.stringify({
+          Plan: "max",
+          SubscriptionPeriodEnd: { Time: new Date(periodEnd).toISOString(), Valid: true },
+        }),
+      });
+      const buckets = [
+        dayBucket(periodStart - DAY, 9, 90), // coverage anchor, pre-period
+        dayBucket(periodStart, 3, 4),
+        dayBucket(periodStart + DAY, 1, 1),
+      ];
+      mockedFetch.mockResolvedValue({
+        status: 200,
+        text: analyticsBody({ usage_usd: 20 }, buckets),
+      });
+      const result = await queryOcUsage();
+      expect(result).toMatchObject({
+        kind: "success",
+        monthlyResetAt: periodEnd,
+        periodUsageUsd: 4,
+        monthly: 4 / 300,
+      });
+    });
+
+    it("falls back to the rolling 30d percent when buckets do not cover the period start", async () => {
+      process.env.OLLAMA_API_KEY = "sk-test";
+      const created = Date.now() - 25 * DAY;
+      mockedMe.mockResolvedValue({
+        status: 200,
+        text: JSON.stringify({ CreatedAt: new Date(created).toISOString(), Plan: "pro" }),
+      });
+      // The window opens a day AFTER the period start — the first day of the
+      // period is missing, so the bucket sum would undercount.
+      mockedFetch.mockResolvedValue({
+        status: 200,
+        text: analyticsBody({ usage_usd: 48.62 }, [dayBucket(created + DAY, 1)]),
+      });
+      const result = await queryOcUsage();
+      expect(result).toMatchObject({ kind: "success", monthly: 48.62 / 60, usageUsd: 48.62 });
+      if (result.kind !== "success") return;
+      expect(result.periodUsageUsd).toBeUndefined();
     });
 
     it("zero spend is a success (monthly 0%), not unavailable", async () => {

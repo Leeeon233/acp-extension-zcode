@@ -8,9 +8,16 @@
  * (`{range, totals:{usage_usd, request_count, …}, buckets}`) — it now reports
  * SPEND in USD, not usage fractions, and exposes no plan limit. The percent
  * windows on the success variant are therefore DERIVED:
- *   - `monthly` = 30d `usage_usd` ÷ the plan's monthly credit (pricing table
- *     in index.js, keyed by POST /api/me's `Plan`); absent when the plan's
- *     credit is unknown (e.g. the Free tier's starter credit is unlisted).
+ *   - `monthly` = the CURRENT BILLING PERIOD's `usage_usd` (summed from the
+ *     response's daily buckets back to the period start, per-model pricing
+ *     already applied upstream) ÷ the plan's monthly credit (pricing table in
+ *     index.js, keyed by POST /api/me's `Plan`); absent when the plan's credit
+ *     is unknown (e.g. the Free tier's starter credit is unlisted). Falls
+ *     back to the rolling-30d `usage_usd` only when the buckets cannot
+ *     bracket the period (no /api/me period, or the 30d window opens after
+ *     the period start) — a rolling numerator NEVER resets on the billing
+ *     day (observed 2026-10-14: 81% shown two days past the reset vs 1.4%
+ *     actual), so the bucket sum is not an optimization but the fix.
  *   - resets from the /api/me billing-period lookup (SubscriptionPeriodEnd,
  *     else the CreatedAt monthly anniversary).
  * The pre-2026-10 `limits` shape is still parsed when the server returns it,
@@ -32,9 +39,10 @@
 export type OcQueryResult =
   | {
       kind: "success";
-      /** Present windows only. Fractions in [0, 1]. `monthly` is derived from
-       *  30d spend ÷ plan credit (see the module header) — undefined when the
-       *  plan's credit is unknown. `session`/`weekly` only ever come from the
+      /** Present windows only. Fractions in [0, 1]. `monthly` = the current
+       *  billing period's spend ÷ plan credit (bucket-summed, see the module
+       *  header) with a rolling-30d fallback — undefined when the plan's
+       *  credit is unknown. `session`/`weekly` only ever come from the
        *  pre-2026-10 legacy response shape. */
       session?: number;
       weekly?: number;
@@ -47,9 +55,21 @@ export type OcQueryResult =
       sessionResetAt?: number;
       weeklyResetAt?: number;
       monthlyResetAt?: number;
-      /** Spend over the rolling 30d window (USD) — the API's own numerator
-       *  for the derived `monthly` fraction. */
+      /** Spend over the rolling 30d window (USD) — the API's own numerator,
+       *  kept raw for the spend detail even when `monthly` uses the bucket
+       *  sum. */
       usageUsd?: number;
+      /** Spend within the CURRENT billing period (USD), summed from the
+       *  response's daily buckets back to `periodStartAt` (the reset-day
+       *  straddling bucket split proportionally). Present only when the
+       *  buckets bracket the period; `monthly`'s numerator then matches this,
+       *  not `usageUsd`. */
+      periodUsageUsd?: number;
+      /** Request count over the same billing-period window. */
+      periodRequestCount?: number;
+      /** Start of the current billing period (epoch ms) — the bucket-sum
+       *  anchor (last reset that already happened). */
+      periodStartAt?: number;
       /** Plan id from POST /api/me ("pro" / "max" / "team" / …). */
       plan?: string;
       /** The plan's monthly usage credit (USD) — the denominator of the
