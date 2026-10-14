@@ -8,8 +8,9 @@
 
 import type { CpAccountQuota, CpModelQuota } from "./types.js";
 
-/** Gemini accounts' provider id in the credentials listing. */
-export const GEMINI_PROVIDER = "antigravity";
+/** Antigravity accounts' provider id in the credentials listing (CPAMC's own
+ *  quota support is antigravity-only — there is no separate gemini provider). */
+export const ANTIGRAVITY_PROVIDER = "antigravity";
 
 function asRecord(v: unknown): Record<string, unknown> | null {
   return typeof v === "object" && v !== null && !Array.isArray(v)
@@ -90,11 +91,16 @@ export function parseCredentialEntries(text: string): CpCredentialEntry[] {
 /**
  * Parse one relayed `retrieveUserQuotaSummary` body into per-model rows.
  *
- * Shape (CPAMC `builders.ts`/`parsers.ts`): `{models: [{name|model|model_id,
- * buckets: [{remainingFraction|remaining_fraction, resetTime|reset_time,
- * …}]}]}`. Each model carries several buckets (rate/throughput/daily windows)
- * — we surface only the TIGHTEST (lowest remaining) as `used`, the one the
- * user actually hits first.
+ * Two shapes, both read defensively (missing/odd fields degrade to empty,
+ * never throw):
+ * - antigravity (the shape live servers answer, CPAMC `builders.ts`):
+ *   `{groups: [{displayName, buckets: [{window, remainingFraction,
+ *   resetTime, …}]}]}` — each group is a model family ("Gemini Models",
+ *   "Claude and GPT models") with one bucket per window.
+ * - legacy flat `{models: [{name, buckets […]}]}` kept as a fallback.
+ *
+ * Each row carries several buckets (windows); we surface only the TIGHTEST
+ * (lowest remaining) as `used`, the one the user actually hits first.
  */
 export function parseQuotaSummary(bodyText: string): CpModelQuota[] {
   let parsed: unknown;
@@ -104,32 +110,62 @@ export function parseQuotaSummary(bodyText: string): CpModelQuota[] {
     return [];
   }
   const doc = asRecord(parsed);
-  const modelsRaw = doc ? (Array.isArray(doc.models) ? doc.models : null) : null;
-  if (!modelsRaw) return [];
+  if (!doc) return [];
+  if (Array.isArray(doc.groups)) return rowsFromGroups(doc.groups);
+  if (Array.isArray(doc.models)) return rowsFromModels(doc.models);
+  return [];
+}
+
+/** The tightest (max used) valid bucket, or null when none parses. */
+function tightestBucket(bucketsRaw: unknown): { used: number; resetAt?: number } | null {
+  if (!Array.isArray(bucketsRaw)) return null;
+  let tightest: { used: number; resetAt?: number } | null = null;
+  for (const bRaw of bucketsRaw) {
+    const b = asRecord(bRaw);
+    if (!b) continue;
+    const remaining = num(b.remainingFraction ?? b.remaining_fraction);
+    if (remaining === undefined || remaining < 0 || remaining > 1) continue;
+    const used = 1 - remaining;
+    if (!tightest || used > tightest.used) {
+      const resetRaw = str(b.resetTime ?? b.reset_time);
+      const resetAt = resetRaw !== undefined ? Date.parse(resetRaw) : Number.NaN;
+      tightest = {
+        used,
+        ...(Number.isFinite(resetAt) && { resetAt }),
+      };
+    }
+  }
+  return tightest;
+}
+
+/** Antigravity shape: one row per group, named by its display name. */
+function rowsFromGroups(groupsRaw: unknown[]): CpModelQuota[] {
+  const models: CpModelQuota[] = [];
+  for (const [index, gRaw] of groupsRaw.entries()) {
+    const g = asRecord(gRaw);
+    if (!g) continue;
+    const name = str(g.displayName ?? g.display_name) ?? `Quota Group ${index + 1}`;
+    const tightest = tightestBucket(g.buckets);
+    if (tightest) {
+      models.push({
+        name,
+        used: tightest.used,
+        ...("resetAt" in tightest && { resetAt: tightest.resetAt }),
+      });
+    }
+  }
+  return models.sort((a, b) => b.used - a.used);
+}
+
+/** Legacy flat shape: one row per model entry. */
+function rowsFromModels(modelsRaw: unknown[]): CpModelQuota[] {
   const models: CpModelQuota[] = [];
   for (const mRaw of modelsRaw) {
     const m = asRecord(mRaw);
     if (!m) continue;
     const name = str(m.name ?? m.model ?? m.model_id ?? m.modelId);
     if (!name) continue;
-    let tightest: { used: number; resetAt?: number } | null = null;
-    if (Array.isArray(m.buckets)) {
-      for (const bRaw of m.buckets) {
-        const b = asRecord(bRaw);
-        if (!b) continue;
-        const remaining = num(b.remainingFraction ?? b.remaining_fraction);
-        if (remaining === undefined || remaining < 0 || remaining > 1) continue;
-        const used = 1 - remaining;
-        if (!tightest || used > tightest.used) {
-          const resetRaw = str(b.resetTime ?? b.reset_time);
-          const resetAt = resetRaw !== undefined ? Date.parse(resetRaw) : Number.NaN;
-          tightest = {
-            used,
-            ...(Number.isFinite(resetAt) && { resetAt }),
-          };
-        }
-      }
-    }
+    const tightest = tightestBucket(m.buckets);
     if (tightest) {
       models.push({
         name,

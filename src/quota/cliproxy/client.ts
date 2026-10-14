@@ -12,13 +12,24 @@
  * fast into `unavailable`, not hang the combined view.
  */
 
+import { relayUpstreamStatus } from "./parse.js";
 import type { CpResponse } from "./types.js";
 
 const TIMEOUT_MS = 10_000;
 
 /** Both route spellings, tried in order; the winner is cached per process. */
 const CREDENTIALS_ROUTES = ["/v8/management/credentials", "/v0/management/auth-files"];
-const API_CALL_ROUTES = ["/v8/management/api-call", "/v0/management/api-call"];
+// The v8 relay lives under `/requests/` (official docs/management-api-v8.md);
+// a top-level `/v8/management/api-call` does not exist and answers 404.
+const API_CALL_ROUTES = ["/v8/management/requests/api-call", "/v0/management/api-call"];
+
+/**
+ * Antigravity accounts' client identity (CPAMC `constants.ts`
+ * ANTIGRAVITY_USER_AGENT). The quota endpoint gates on it: without the
+ * antigravity CLI UA, Google answers 403 "You do not have a valid license of
+ * this product" even for a perfectly healthy account (verified live 2026-10).
+ */
+const ANTIGRAVITY_USER_AGENT = "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)";
 
 /**
  * Upstream quota endpoints CPAMC itself tries, in order
@@ -110,8 +121,15 @@ export async function fetchCredentials(
  * by the proxy with that credential's OAuth token — the key never sees the
  * token, and we never see it either (it stays server-side).
  *
+ * The upstream URL ladder walks on the UPSTREAM status carried inside the
+ * relay envelope (CPAMC's semantics): the relay itself answers HTTP 200 with
+ * the upstream result embedded, so a 403/404 upstream means this URL variant
+ * is not the one this account's client is recognized on — the next variant
+ * may still answer. Only an upstream 2xx satisfies the ladder.
+ *
  * @returns the relay response (its `body` is the upstream JSON as a STRING),
- *          or null when every URL candidate failed fast (network/timeout).
+ *          or null when every URL candidate failed (relay/network error, or
+ *          no variant produced an upstream 2xx).
  */
 export async function fetchQuotaSummary(
   base: string,
@@ -121,28 +139,38 @@ export async function fetchQuotaSummary(
   fetchImpl: typeof globalThis.fetch = globalThis.fetch,
 ): Promise<CpResponse | null> {
   for (const url of QUOTA_SUMMARY_URLS) {
-    const { route, resp } = await fetchRouted(
-      base,
-      key,
-      API_CALL_ROUTES,
-      apiCallRoute,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          auth_index: authIndex,
+    let resp: CpResponse | null = null;
+    try {
+      const routed = await fetchRouted(
+        base,
+        key,
+        API_CALL_ROUTES,
+        apiCallRoute,
+        {
           method: "POST",
-          url,
-          header: { Authorization: "Bearer $TOKEN$", "Content-Type": "application/json" },
-          data: JSON.stringify(projectId !== undefined ? { project: projectId } : {}),
-        }),
-      },
-      fetchImpl,
-    );
-    if (route) apiCallRoute = route;
-    // The relay answers 200 with the upstream status inside; a non-200 here
-    // is the relay/proxy itself failing — try the next upstream URL variant.
-    if (resp.status === 200) return resp;
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            auth_index: authIndex,
+            method: "POST",
+            url,
+            header: {
+              Authorization: "Bearer $TOKEN$",
+              "Content-Type": "application/json",
+              "User-Agent": ANTIGRAVITY_USER_AGENT,
+            },
+            data: JSON.stringify(projectId !== undefined ? { project: projectId } : {}),
+          }),
+        },
+        fetchImpl,
+      );
+      if (routed.route) apiCallRoute = routed.route;
+      resp = routed.resp;
+    } catch {
+      resp = null; // network/timeout on this variant — try the next
+    }
+    if (resp?.status !== 200) continue;
+    const upstream = relayUpstreamStatus(resp.text);
+    if (upstream >= 200 && upstream < 300) return resp;
   }
   return null;
 }

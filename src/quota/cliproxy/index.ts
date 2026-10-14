@@ -14,7 +14,7 @@ import { log } from "../../utils.js";
 import { fetchCredentials, fetchQuotaSummary } from "./client.js";
 import { loadCpConfig } from "./config.js";
 import {
-  GEMINI_PROVIDER,
+  ANTIGRAVITY_PROVIDER,
   parseCredentialEntries,
   parseQuotaSummary,
   relayUpstreamBody,
@@ -64,7 +64,7 @@ async function queryOneAccount(
     if (body === undefined) return null;
     const models = parseQuotaSummary(body);
     if (models.length === 0) return null;
-    return { label: entry.label, provider: GEMINI_PROVIDER, models };
+    return { label: entry.label, provider: ANTIGRAVITY_PROVIDER, models };
   } catch (e) {
     log(`cliproxy: account ${entry.authIndex} quota relay failed (${String(e)})`);
     return null;
@@ -103,7 +103,7 @@ export async function queryCpUsage(): Promise<CpQueryOutcome> {
       outcome = { result: { kind: "unavailable" }, otherCount: 0 };
     } else {
       const entries = parseCredentialEntries(resp.text);
-      const gemini = entries.filter((e) => e.provider === GEMINI_PROVIDER);
+      const gemini = entries.filter((e) => e.provider === ANTIGRAVITY_PROVIDER);
       const accounts = (
         await Promise.all(gemini.map((e) => queryOneAccount(cfg.url, cfg.key, e)))
       ).filter((a): a is CpAccountQuota => a !== null);
@@ -129,5 +129,5 @@ export async function queryCpUsage(): Promise<CpQueryOutcome> {
 
 export { formatCpSection } from "./format.js";
 export { loadCpConfig, ENV_KEY, ENV_URL } from "./config.js";
-export { GEMINI_PROVIDER, parseCredentialEntries, parseQuotaSummary } from "./parse.js";
+export { ANTIGRAVITY_PROVIDER, parseCredentialEntries, parseQuotaSummary } from "./parse.js";
 export type { CpAccountQuota, CpModelQuota, CpQueryResult } from "./types.js";

@@ -129,39 +129,13 @@ describe("cliproxy client", () => {
     expect(f.calls).toHaveLength(3);
   });
 
-  it("api-call walks the upstream URL variants until the relay accepts", async () => {
-    const first = `${BASE}/v8/management/api-call`;
-    const f = fakeFetch({
-      [first]: {
-        status: 200,
-        body: relay({}, 200),
-      },
-    });
-    // Make the FIRST upstream URL fail at the relay level (upstream 500)
-    // by having the server answer 500 to requests naming it.
-    const f2 = fakeFetch({
-      [first]: { status: 200, body: JSON.stringify({ status_code: 500, body: "{}" }) },
-      [`${BASE}/v0/management/api-call`]: { status: 200, body: relay({}, 200) },
-    });
-    const ok = await real().fetchQuotaSummary(
-      BASE,
-      KEY,
-      "0",
-      "proj",
-      f.impl as unknown as typeof fetch,
-    );
-    expect(ok?.status).toBe(200);
-    const relayed = await real().fetchQuotaSummary(
-      BASE,
-      KEY,
-      "0",
-      "proj",
-      f2.impl as unknown as typeof fetch,
-    );
-    expect(relayed).not.toBeNull();
-    // The relayed request names the first upstream URL and carries $TOKEN$.
-    const sent = f2.calls.find((c) => c.body !== undefined)!;
-    const payload = JSON.parse(sent.body!) as {
+  it("api-call relays with the antigravity client UA and accepts an upstream 2xx", async () => {
+    const route = `${BASE}/v8/management/requests/api-call`;
+    const f = fakeFetch({ [route]: { status: 200, body: relay({ groups: [] }, 200) } });
+    const out = await real().fetchQuotaSummary(BASE, KEY, "0", "proj", f.impl as unknown as typeof fetch);
+    expect(out?.status).toBe(200);
+    expect(f.calls).toHaveLength(1); // first URL variant satisfied — ladder stops
+    const payload = JSON.parse(f.calls[0]!.body!) as {
       auth_index: string;
       url: string;
       header: Record<string, string>;
@@ -170,7 +144,43 @@ describe("cliproxy client", () => {
     expect(payload.auth_index).toBe("0");
     expect(payload.url).toBe(QUOTA_SUMMARY_URLS[0]);
     expect(payload.header.Authorization).toBe("Bearer $TOKEN$");
+    // Without this UA Google answers 403 "no valid license" (verified live).
+    expect(payload.header["User-Agent"]).toMatch(/^antigravity\/cli\//);
     expect(JSON.parse(payload.data)).toEqual({ project: "proj" });
+  });
+
+  it("api-call walks the upstream URL ladder on a non-2xx UPSTREAM status", async () => {
+    // The relay answers HTTP 200 with the upstream status INSIDE the envelope —
+    // a 403 upstream must move the ladder to the next URL variant, not return.
+    const route = `${BASE}/v8/management/requests/api-call`;
+    const byUpstream = new Map<string, string>([
+      [QUOTA_SUMMARY_URLS[0], relay({}, 403)],
+      [QUOTA_SUMMARY_URLS[1], relay({}, 404)],
+      [QUOTA_SUMMARY_URLS[2], relay({ groups: [] }, 200)],
+    ]);
+    const calls: string[] = [];
+    const impl = async (url: string, init?: RequestInit) => {
+      if (url !== route) return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+      const payload = JSON.parse(String(init?.body)) as { url: string };
+      calls.push(payload.url);
+      return new Response(byUpstream.get(payload.url) ?? relay({}, 500), { status: 200 });
+    };
+    const out = await real().fetchQuotaSummary(BASE, KEY, "0", undefined, impl as unknown as typeof fetch);
+    expect(out).not.toBeNull();
+    expect(relayUpstreamStatus(out!.text)).toBe(200);
+    expect(calls).toEqual([...QUOTA_SUMMARY_URLS]);
+  });
+
+  it("api-call falls back to the v0 route spelling when v8 404s", async () => {
+    const v8 = `${BASE}/v8/management/requests/api-call`;
+    const v0 = `${BASE}/v0/management/api-call`;
+    const f = fakeFetch({ [v0]: { status: 200, body: relay({}, 200) } });
+    const out = await real().fetchQuotaSummary(BASE, KEY, "0", undefined, f.impl as unknown as typeof fetch);
+    expect(out?.status).toBe(200);
+    expect(f.calls.map((c) => c.url)).toEqual([v8, v0]);
+    // Winner cached: the next URL variant goes straight to v0.
+    await real().fetchQuotaSummary(BASE, KEY, "0", undefined, f.impl as unknown as typeof fetch);
+    expect(f.calls.map((c) => c.url)).toEqual([v8, v0, v0]);
   });
 
   it("api-call returns null when every variant fails", async () => {
@@ -215,6 +225,45 @@ describe("cliproxy parse", () => {
     // Nested envelope (some builds wrap the array).
     expect(parseCredentialEntries(JSON.stringify({ auth_files: [] }))).toEqual([]);
     expect(parseCredentialEntries("not json")).toEqual([]);
+  });
+
+  it("quota summary: antigravity groups shape (live-server form)", () => {
+    // Verbatim shape observed against a real CLIProxy + antigravity account
+    // (2026-10): groups are model families, buckets are windows (5h/weekly).
+    const groups = [
+      {
+        displayName: "Gemini Models",
+        description: "Models within this group: Gemini Flash, Gemini Pro",
+        buckets: [
+          {
+            window: "weekly",
+            remainingFraction: 0.7360983,
+            resetTime: "2026-10-18T03:52:19Z",
+            displayName: "Weekly Limit Remaining",
+          },
+          { window: "5h", remainingFraction: 0.9602678, resetTime: "2026-10-14T12:46:51Z" },
+        ],
+      },
+      {
+        display_name: "Claude and GPT models",
+        buckets: [{ window: "weekly", remaining_fraction: 1 }],
+      },
+      { displayName: "no valid buckets", buckets: [{ remainingFraction: 2 }, "junk"] },
+      "junk",
+    ];
+    const out = parseQuotaSummary(JSON.stringify({ groups, description: "…" }));
+    expect(out).toEqual([
+      {
+        name: "Gemini Models",
+        used: 1 - 0.7360983,
+        resetAt: Date.parse("2026-10-18T03:52:19Z"),
+      },
+      { name: "Claude and GPT models", used: 0 },
+    ]);
+    // A group with no display name still renders (positional fallback).
+    expect(
+      parseQuotaSummary(JSON.stringify({ groups: [{ buckets: [{ remainingFraction: 0.5 }] }] })),
+    ).toEqual([{ name: "Quota Group 1", used: 0.5 }]);
   });
 
   it("quota summary: tightest bucket wins, snake_case accepted, sorted used-desc", () => {
