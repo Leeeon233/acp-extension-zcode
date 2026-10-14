@@ -1,12 +1,13 @@
 /**
  * Quota threshold push warnings (§5.7): edge-triggered tiers (60/80/90/95/98/100)
  * per watched window, drop-below-60 re-arm, persisted state surviving process
- * restarts (module reset = a reborn hub/bridge reading the same file), and
- * the notify switch muting the push without freezing the state.
+ * restarts (disk is re-read every check, serialized by the shared file lock),
+ * the notify switch muting the push without freezing the state, and the
+ * cross-process single-push guarantee (concurrent checks of one crossing).
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 
 const h = vi.hoisted(() => ({
@@ -70,6 +71,7 @@ beforeEach(() => {
   pushes.length = 0;
   resetQuotaThresholdsForTest();
   rmSync(stateFile, { force: true });
+  rmSync(`${stateFile}.lock`, { recursive: true, force: true });
   setPushSenderForTests({
     sendText: async (c) => {
       pushes.push(c);
@@ -135,7 +137,7 @@ describe("checkQuotaThresholds", () => {
     await checkQuotaThresholds(result(item("token_5h", 81)));
     expect(pushes).toHaveLength(1);
 
-    // A reborn hub/bridge: fresh in-memory mirror, same disk state.
+    // A reborn hub/bridge: disk state is the only state, re-read per check.
     resetQuotaThresholdsForTest();
     await checkQuotaThresholds(result(item("token_5h", 83)));
     expect(pushes).toHaveLength(1); // still tier-80 — no duplicate
@@ -143,6 +145,28 @@ describe("checkQuotaThresholds", () => {
     await checkQuotaThresholds(result(item("token_5h", 92)));
     expect(pushes).toHaveLength(2);
     expect(pushes[1]).toContain("5h quota 92% used");
+  });
+
+  it("two concurrent checks of one crossing push once (hub + bridge race)", async () => {
+    // Live shape of the 2026-10-14 report: hub and a bridge funneled the same
+    // fresh fetch ~80ms apart. The lock serializes read→advance→persist, so
+    // the second checker re-reads the advanced tier and stays silent.
+    await Promise.all([
+      checkQuotaThresholds(result(item("token_5h", 61))),
+      checkQuotaThresholds(result(item("token_5h", 61))),
+    ]);
+    expect(pushes).toHaveLength(1);
+  });
+
+  it("a foreign process's persisted tier suppresses this check (disk is the truth)", async () => {
+    // A sibling bridge already persisted tier 80 while this process had no
+    // state of its own — the stale-mirror bug re-pushed the crossing.
+    writeFileSync(stateFile, JSON.stringify({ items: { token_5h: 80 } }));
+    await checkQuotaThresholds(result(item("token_5h", 85))); // tier 80 ≤ 80 — silent
+    expect(pushes).toHaveLength(0);
+    await checkQuotaThresholds(result(item("token_5h", 91))); // tier 90 — fires
+    expect(pushes).toHaveLength(1);
+    expect(pushes[0]).toContain("5h quota 91% used");
   });
 
   it("notify.quota=false mutes the push but the tier state still advances", async () => {
