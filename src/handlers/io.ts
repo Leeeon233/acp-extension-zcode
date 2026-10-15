@@ -361,19 +361,32 @@ export const TURN_STATE_METHODS = ["$/zcode/turnState", "_zcode/turnState"] as c
  * client that tracks only turns reads every busy window, not just model turns.
  * `cx` targets one connection; without it the notification fans out to every
  * attached client. Failures are per-alias and logged, never thrown.
+ *
+ * The END transition (running:false) may carry the turn's ACP usage block
+ * (`usage`, plus `turnMs` wall time): PromptResponse.usage reaches only the
+ * client that SENT the prompt, so an attach-only client (zcode-acp-remote
+ * watching a turn driven from the TUI or the editor) would never see cache /
+ * speed readouts without this. Additive fields — clients that read only
+ * `running` are unaffected.
  */
 export async function emitSessionTurnState(
   server: ZcodeAcpServer,
   acpSid: string,
   running: boolean,
   cx?: acp.AgentContext,
+  extras?: { usage?: acp.Usage; turnMs?: number },
 ): Promise<void> {
   const targetCx = cx ?? server.clients.broadcast();
+  const params: Record<string, unknown> = { sessionId: acpSid, running };
+  if (!running && extras?.usage) params.usage = extras.usage;
+  if (!running && typeof extras?.turnMs === "number") params.turnMs = extras.turnMs;
   const results = await Promise.allSettled(
     server
       .sessionAliases(acpSid)
       .flatMap((sid) =>
-        TURN_STATE_METHODS.map((method) => targetCx.notify(method, { sessionId: sid, running })),
+        TURN_STATE_METHODS.map((method) =>
+          targetCx.notify(method, { ...params, sessionId: sid }),
+        ),
       ),
   );
   for (const r of results) {

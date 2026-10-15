@@ -1659,8 +1659,13 @@ export async function runOneTurn(
   // Out-of-band running indicator: emitted per attached alias (see
   // server.sessionAliases) so a client holding this conversation under a
   // different ACP id opens its live turn too. Best-effort: a dead client must
-  // not fail the turn.
-  const emitTurnState = (running: boolean) => emitSessionTurnState(server, acpSid, running, cx);
+  // not fail the turn. The END transition carries the turn's usage + wall
+  // time (see emitSessionTurnState) so attach-only clients can paint their
+  // cache/speed readouts for turns driven from elsewhere.
+  const emitTurnState = (running: boolean, extras?: { usage?: acp.Usage; turnMs?: number }) =>
+    emitSessionTurnState(server, acpSid, running, cx, extras);
+  const turnStartedAt = Date.now();
+  let lastUsage: acp.Usage | undefined;
 
   let listener = new EventStreamListener(backend, zcodeSid);
   let monitor = new TurnMonitor(backend, zcodeSid, () => server.nextId());
@@ -2022,6 +2027,7 @@ export async function runOneTurn(
         // compaction too.
         autoCompactDue =
           opts.autoCompact !== false && result.stopReason === "end_turn" && !turn.stallRecovered;
+        lastUsage = result.usage ?? undefined;
 
         return result;
       } catch (e) {
@@ -2133,9 +2139,16 @@ export async function runOneTurn(
     // catch up immediately instead of waiting for the 60s interval.
     void forceRefreshQuota();
     // Report "running" only while no other turn for the session took over
-    // (preempt): the preempting turn's own running:true must survive.
+    // (preempt): the preempting turn's own running:true must survive. The
+    // usage extras ride along only when the turn reported usage — a bare
+    // end keeps the exact pre-extras payload shape.
     const stillBusy = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
-    await emitTurnState(stillBusy);
+    await emitTurnState(
+      stillBusy,
+      lastUsage
+        ? { usage: lastUsage, turnMs: Date.now() - turnStartedAt }
+        : undefined,
+    );
     // Start the armed auto-compact ONLY now, after deregistration and the
     // running:false turnState: from here on a cancel or follow-up prompt finds
     // no turn to preempt (the compaction is untouchable housekeeping), and a
