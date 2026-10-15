@@ -488,7 +488,9 @@ describe("hub quota dock endpoint", () => {
           {
             label: "will",
             provider: "antigravity",
-            models: [{ name: "gemini-2.5-pro", used: 0.634, resetAt }],
+            models: [
+              { name: "Gemini Models", windows: [{ window: "week", used: 0.634, resetAt }] },
+            ],
           },
         ],
       },

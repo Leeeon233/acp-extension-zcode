@@ -6,7 +6,7 @@
  * its OUTPUT spelling is not contractual, so both variants are read.
  */
 
-import type { CpAccountQuota, CpModelQuota } from "./types.js";
+import type { CpModelQuota, CpWindow, CpWindowQuota } from "./types.js";
 
 /** Antigravity accounts' provider id in the credentials listing (CPAMC's own
  *  quota support is antigravity-only — there is no separate gemini provider). */
@@ -89,18 +89,16 @@ export function parseCredentialEntries(text: string): CpCredentialEntry[] {
 }
 
 /**
- * Parse one relayed `retrieveUserQuotaSummary` body into per-model rows.
+ * Parse one relayed `retrieveUserQuotaSummary` body into per-family windowed
+ * rows.
  *
- * Two shapes, both read defensively (missing/odd fields degrade to empty,
- * never throw):
- * - antigravity (the shape live servers answer, CPAMC `builders.ts`):
- *   `{groups: [{displayName, buckets: [{window, remainingFraction,
- *   resetTime, …}]}]}` — each group is a model family ("Gemini Models",
- *   "Claude and GPT models") with one bucket per window.
- * - legacy flat `{models: [{name, buckets […]}]}` kept as a fallback.
- *
- * Each row carries several buckets (windows); we surface only the TIGHTEST
- * (lowest remaining) as `used`, the one the user actually hits first.
+ * Shape (live-verified 2026-10, CPAMC `builders.ts`): `{groups: [{displayName,
+ * buckets: [{window, remainingFraction, resetTime, …}]}]}` — each group is a
+ * model family ("Gemini Models", "Claude and GPT models") with one bucket per
+ * window. Bucket `window` spellings normalize to `5h` / `week` (CPAMC's
+ * accepted spellings); buckets with an unknown window or an out-of-range
+ * fraction are dropped. Multiple buckets sharing a window keep the TIGHTEST.
+ * Missing/odd fields degrade to empty, never throw.
  */
 export function parseQuotaSummary(bodyText: string): CpModelQuota[] {
   let parsed: unknown;
@@ -110,72 +108,55 @@ export function parseQuotaSummary(bodyText: string): CpModelQuota[] {
     return [];
   }
   const doc = asRecord(parsed);
-  if (!doc) return [];
-  if (Array.isArray(doc.groups)) return rowsFromGroups(doc.groups);
-  if (Array.isArray(doc.models)) return rowsFromModels(doc.models);
-  return [];
-}
-
-/** The tightest (max used) valid bucket, or null when none parses. */
-function tightestBucket(bucketsRaw: unknown): { used: number; resetAt?: number } | null {
-  if (!Array.isArray(bucketsRaw)) return null;
-  let tightest: { used: number; resetAt?: number } | null = null;
-  for (const bRaw of bucketsRaw) {
-    const b = asRecord(bRaw);
-    if (!b) continue;
-    const remaining = num(b.remainingFraction ?? b.remaining_fraction);
-    if (remaining === undefined || remaining < 0 || remaining > 1) continue;
-    const used = 1 - remaining;
-    if (!tightest || used > tightest.used) {
-      const resetRaw = str(b.resetTime ?? b.reset_time);
-      const resetAt = resetRaw !== undefined ? Date.parse(resetRaw) : Number.NaN;
-      tightest = {
-        used,
-        ...(Number.isFinite(resetAt) && { resetAt }),
-      };
-    }
-  }
-  return tightest;
-}
-
-/** Antigravity shape: one row per group, named by its display name. */
-function rowsFromGroups(groupsRaw: unknown[]): CpModelQuota[] {
+  if (!doc || !Array.isArray(doc.groups)) return [];
   const models: CpModelQuota[] = [];
-  for (const [index, gRaw] of groupsRaw.entries()) {
+  for (const [index, gRaw] of doc.groups.entries()) {
     const g = asRecord(gRaw);
     if (!g) continue;
     const name = str(g.displayName ?? g.display_name) ?? `Quota Group ${index + 1}`;
-    const tightest = tightestBucket(g.buckets);
-    if (tightest) {
-      models.push({
-        name,
-        used: tightest.used,
-        ...("resetAt" in tightest && { resetAt: tightest.resetAt }),
-      });
+    // window → tightest bucket seen for it
+    const tightest = new Map<CpWindow, { used: number; resetAt?: number }>();
+    if (Array.isArray(g.buckets)) {
+      for (const bRaw of g.buckets) {
+        const b = asRecord(bRaw);
+        if (!b) continue;
+        const window = windowOf(b.window);
+        if (window === null) continue;
+        const remaining = num(b.remainingFraction ?? b.remaining_fraction);
+        if (remaining === undefined || remaining < 0 || remaining > 1) continue;
+        const used = 1 - remaining;
+        const prev = tightest.get(window);
+        if (prev && prev.used >= used) continue;
+        const resetRaw = str(b.resetTime ?? b.reset_time);
+        const resetAt = resetRaw !== undefined ? Date.parse(resetRaw) : Number.NaN;
+        tightest.set(window, {
+          used,
+          ...(Number.isFinite(resetAt) && { resetAt }),
+        });
+      }
     }
+    if (tightest.size === 0) continue;
+    models.push({ name, windows: orderWindows(tightest) });
   }
-  return models.sort((a, b) => b.used - a.used);
+  return models;
 }
 
-/** Legacy flat shape: one row per model entry. */
-function rowsFromModels(modelsRaw: unknown[]): CpModelQuota[] {
-  const models: CpModelQuota[] = [];
-  for (const mRaw of modelsRaw) {
-    const m = asRecord(mRaw);
-    if (!m) continue;
-    const name = str(m.name ?? m.model ?? m.model_id ?? m.modelId);
-    if (!name) continue;
-    const tightest = tightestBucket(m.buckets);
-    if (tightest) {
-      models.push({
-        name,
-        used: tightest.used,
-        ...("resetAt" in tightest && { resetAt: tightest.resetAt }),
-      });
-    }
+/** Bucket window spellings → canonical window (mirrors CPAMC's
+ *  `antigravityPeriodHours` accepted spellings; anything else is dropped). */
+function windowOf(raw: unknown): CpWindow | null {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (v === "5h" || v === "five-hour" || v === "five_hour") return "5h";
+  if (v === "weekly" || v === "week") return "week";
+  return null;
+}
+
+function orderWindows(tightest: Map<CpWindow, { used: number; resetAt?: number }>): CpWindowQuota[] {
+  const out: CpWindowQuota[] = [];
+  for (const window of ["5h", "week"] as const) {
+    const hit = tightest.get(window);
+    if (hit) out.push({ window, ...hit });
   }
-  // Tightest models first — the constraint the user hits next leads the card.
-  return models.sort((a, b) => b.used - a.used);
+  return out;
 }
 
 /** Convenience: the relay envelope's upstream status (200 unless malformed). */
@@ -198,4 +179,4 @@ export function relayUpstreamBody(text: string): string | undefined {
   }
 }
 
-export type { CpAccountQuota, CpModelQuota };
+export type { CpModelQuota, CpWindow, CpWindowQuota };

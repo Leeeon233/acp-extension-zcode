@@ -258,7 +258,7 @@ describe("accountUsageStats", () => {
     expect(out.ollama.usage).toEqual({ plan: "free", usageUsd: 0.44, window: "30d" });
   });
 
-  it("maps CLIProxy Gemini accounts to per-model percents", async () => {
+  it("maps CLIProxy accounts per-window plus the pool-wide combined rows", async () => {
     queryCombinedMock.mockResolvedValue({
       glm: { kind: "unavailable" },
       go: { kind: "not_configured" },
@@ -271,8 +271,23 @@ describe("accountUsageStats", () => {
             label: "will",
             provider: "antigravity",
             models: [
-              { name: "gemini-2.5-pro", used: 0.634, resetAt: NOW + 3_600_000 },
-              { name: "gemini-2.5-flash", used: 0.21 },
+              {
+                name: "Gemini Models",
+                windows: [
+                  { window: "5h", used: 0.21 },
+                  { window: "week", used: 0.634, resetAt: NOW + 3_600_000 },
+                ],
+              },
+            ],
+          },
+          {
+            label: "bob",
+            provider: "antigravity",
+            models: [
+              {
+                name: "Gemini Models",
+                windows: [{ window: "week", used: 0.066, resetAt: NOW + 2 * 3_600_000 }],
+              },
             ],
           },
         ],
@@ -286,10 +301,30 @@ describe("accountUsageStats", () => {
       {
         label: "will",
         models: [
-          { name: "gemini-2.5-pro", usedPercent: 63.4, resetsAt: NOW + 3_600_000 },
-          { name: "gemini-2.5-flash", usedPercent: 21 },
+          {
+            name: "Gemini Models",
+            windows: [
+              { window: "5h", usedPercent: 21 },
+              { window: "week", usedPercent: 63.4, resetsAt: NOW + 3_600_000 },
+            ],
+          },
         ],
       },
+      {
+        label: "bob",
+        models: [
+          {
+            name: "Gemini Models",
+            windows: [{ window: "week", usedPercent: 0.066 * 100, resetsAt: NOW + 2 * 3_600_000 }],
+          },
+        ],
+      },
+    ]);
+    // Pool-wide: week (0.634+0.066)/2 = 35% with the earliest reset; 5h 21%
+    // reported by one subscription only (pool = that subscription's usage).
+    expect(out.cliproxy.combined).toEqual([
+      { window: "week", usedPercent: 35, resetsAt: NOW + 3_600_000 },
+      { window: "5h", usedPercent: 21 },
     ]);
     expect(out.cliproxy.otherAccounts).toBe(2);
   });

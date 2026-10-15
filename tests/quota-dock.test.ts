@@ -199,7 +199,7 @@ describe("formatOcDockSegment", () => {
 
 describe("formatCpDockSegment", () => {
   const cpSuccess = (
-    models: Array<{ name: string; used: number; resetAt?: number }>,
+    windows: Array<{ window: "5h" | "week"; used: number; resetAt?: number }>,
     accountCount = 1,
   ): CpQueryResult => ({
     kind: "success",
@@ -207,29 +207,45 @@ describe("formatCpDockSegment", () => {
     accounts: Array.from({ length: accountCount }, (_, i) => ({
       label: `acct-${i}`,
       provider: "antigravity",
-      models: i === 0 ? models : [{ name: "idle", used: 0.01 }],
+      models: [
+        {
+          name: "Gemini Models",
+          windows: i === 0 ? windows : [{ window: "week" as const, used: 0.01 }],
+        },
+      ],
     })),
   });
 
-  it("renders the single tightest model with its reset date", () => {
+  it("renders the binding window's pool aggregate with its earliest reset date", () => {
     const result = cpSuccess([
-      { name: "gemini-2.5-pro", used: 0.634, resetAt: NOW + 3_600_000 },
-      { name: "gemini-2.5-flash", used: 0.21 },
+      { window: "5h", used: 0.21 },
+      { window: "week", used: 0.634, resetAt: NOW + 3_600_000 },
     ]);
     expect(formatCpDockSegment(result)).toBe(`cp 63.4% ${date(NOW + 3_600_000)}`);
   });
 
-  it("picks the max across multiple accounts (the actionable number)", () => {
-    const result = cpSuccess([{ name: "pro", used: 0.4 }], 2);
-    expect(formatCpDockSegment(result)).toBe("cp 40%");
+  it("aggregates across accounts: total used over total capacity, earliest reset", () => {
+    // Two subscriptions at 40% and 1% → pool 20.5%; the earliest same-window
+    // reset wins the stamp even when it belongs to the OTHER account.
+    const result = cpSuccess([{ window: "week", used: 0.4, resetAt: NOW + 10 * 3_600_000 }], 2);
+    result.accounts[1]!.models[0]!.windows = [
+      { window: "week", used: 0.01, resetAt: NOW + 3_600_000 },
+    ];
+    expect(formatCpDockSegment(result)).toBe(`cp 20.5% ${date(NOW + 3_600_000)}`);
   });
 
-  it("omits the stamp when the tightest model has no reset moment", () => {
-    expect(formatCpDockSegment(cpSuccess([{ name: "pro", used: 0.99 }]))).toBe("cp 99%");
+  it("omits the stamp when the binding window has no reset moment", () => {
+    expect(formatCpDockSegment(cpSuccess([{ window: "week", used: 0.99 }]))).toBe("cp 99%");
   });
 
   it("null when not usable or no Gemini models", () => {
-    expect(formatCpDockSegment(cpSuccess([]))).toBeNull();
+    expect(
+      formatCpDockSegment({
+        kind: "success",
+        fetchedAt: NOW,
+        accounts: [{ label: "a", provider: "antigravity", models: [{ name: "g", windows: [] }] }],
+      }),
+    ).toBeNull();
     expect(formatCpDockSegment({ kind: "not_configured" })).toBeNull();
     expect(formatCpDockSegment({ kind: "auth_error" })).toBeNull();
     expect(formatCpDockSegment({ kind: "unavailable" })).toBeNull();

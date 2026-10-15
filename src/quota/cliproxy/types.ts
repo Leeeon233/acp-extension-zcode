@@ -30,14 +30,24 @@
  * `unavailable`, never a crash.
  */
 
-/** One model's quota row: the tightest bucket of that model's set. */
-export interface CpModelQuota {
-  /** Model display name (e.g. "gemini-3-pro"). */
-  name: string;
-  /** Used fraction [0, 1] — 1 minus the model's LOWEST remainingFraction. */
+/** Canonical quota window — bucket spellings normalize to these at parse time. */
+export type CpWindow = "5h" | "week";
+
+/** One window of one model family. */
+export interface CpWindowQuota {
+  window: CpWindow;
+  /** Used fraction [0, 1] — 1 minus the bucket's remainingFraction. */
   used: number;
-  /** Reset moment of that tightest bucket (epoch ms), when reported. */
+  /** Reset moment of that window's tightest bucket (epoch ms), when reported. */
   resetAt?: number;
+}
+
+/** One model family's quota rows — one per reported window. */
+export interface CpModelQuota {
+  /** Family display name (e.g. "Gemini Models"). */
+  name: string;
+  /** Per-window rows, `5h` before `week`. */
+  windows: CpWindowQuota[];
 }
 
 /** One upstream account's quota block. */

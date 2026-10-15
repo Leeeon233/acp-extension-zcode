@@ -130,4 +130,4 @@ export async function queryCpUsage(): Promise<CpQueryOutcome> {
 export { formatCpSection } from "./format.js";
 export { loadCpConfig, ENV_KEY, ENV_URL } from "./config.js";
 export { ANTIGRAVITY_PROVIDER, parseCredentialEntries, parseQuotaSummary } from "./parse.js";
-export type { CpAccountQuota, CpModelQuota, CpQueryResult } from "./types.js";
+export type { CpAccountQuota, CpModelQuota, CpQueryResult, CpWindow, CpWindowQuota } from "./types.js";

@@ -1,12 +1,13 @@
 /**
- * CLIProxyAPI quota rendering — one row per (account, model), tightest model
- * first, in the same bar style as the other sections so the combined card
- * reads as one piece. Only Gemini (`antigravity`) accounts render rows today;
- * other providers the proxy routes are summarised in a single trailing count
- * line (their passive quota fields follow a different, header-observed shape
- * and can join later without changing this layout).
+ * CLIProxyAPI quota rendering — pool-wide rows: every Gemini subscription's
+ * usage aggregated per model family and window (`5h` / `Week`), each row
+ * stamped with that window's EARLIEST reset across accounts (when capacity
+ * starts coming back). Same bar style as the other sections so the combined
+ * card reads as one piece. Non-Gemini providers the proxy routes are
+ * summarised in a single trailing count line.
  */
 
+import { aggregateCpFamilies } from "./aggregate.js";
 import { pickOverlay, renderColorBar } from "../color.js";
 import { formatResetTime, renderBar } from "../format.js";
 import { roundTenth } from "../rounding.js";
@@ -17,6 +18,10 @@ function formatAge(ms: number): string {
   const minutes = Math.floor(ms / 60_000);
   if (minutes >= 60) return `${Math.floor(minutes / 60)}h${minutes % 60 || ""}`;
   return `${minutes}m`;
+}
+
+function windowLabel(window: "5h" | "week"): string {
+  return window === "5h" ? "5h" : "Week";
 }
 
 export function formatCpSection(
@@ -45,17 +50,20 @@ export function formatCpSection(
     return { header, body: ["no Gemini accounts on this proxy"] };
   }
   const body: string[] = [];
-  for (const account of result.accounts) {
-    for (const model of account.models) {
-      const pct = roundTenth(model.used * 100);
-      const reset = formatResetTime(model.resetAt);
+  for (const family of aggregateCpFamilies(result.accounts)) {
+    const label = family.name.slice(0, 22);
+    for (const [index, w] of family.windows.entries()) {
+      const pct = roundTenth(w.used * 100);
+      // Continuation rows (2nd window, 2nd family…) indent under the label.
+      const name = index === 0 ? label.padEnd(22) : " ".repeat(22);
+      const window = windowLabel(w.window).padEnd(5);
+      const reset = formatResetTime(w.resetAt);
       const trailing = reset ? ` · ${reset}` : "";
-      const label = `${account.label} ${model.name}`.slice(0, 26);
       if (color) {
         const bar = renderColorBar(pct, { overlay: pickOverlay({ usedPercent: pct }) });
-        body.push(`${label.padEnd(27)} ${bar}${trailing}`);
+        body.push(`${name}${window}${bar}${trailing}`);
       } else {
-        body.push(`${label.padEnd(27)} ${renderBar(pct)}  ${String(pct).padStart(2)}%${trailing}`);
+        body.push(`${name}${window}${renderBar(pct)}  ${String(pct).padStart(2)}%${trailing}`);
       }
     }
   }

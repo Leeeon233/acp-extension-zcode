@@ -227,7 +227,7 @@ describe("cliproxy parse", () => {
     expect(parseCredentialEntries("not json")).toEqual([]);
   });
 
-  it("quota summary: antigravity groups shape (live-server form)", () => {
+  it("quota summary: antigravity groups shape, windowed (live-server form)", () => {
     // Verbatim shape observed against a real CLIProxy + antigravity account
     // (2026-10): groups are model families, buckets are windows (5h/weekly).
     const groups = [
@@ -255,38 +255,53 @@ describe("cliproxy parse", () => {
     expect(out).toEqual([
       {
         name: "Gemini Models",
-        used: 1 - 0.7360983,
-        resetAt: Date.parse("2026-10-18T03:52:19Z"),
+        windows: [
+          { window: "5h", used: 1 - 0.9602678, resetAt: Date.parse("2026-10-14T12:46:51Z") },
+          { window: "week", used: 1 - 0.7360983, resetAt: Date.parse("2026-10-18T03:52:19Z") },
+        ],
       },
-      { name: "Claude and GPT models", used: 0 },
+      { name: "Claude and GPT models", windows: [{ window: "week", used: 0 }] },
     ]);
-    // A group with no display name still renders (positional fallback).
+    // A bucket without a window is dropped even in an unnamed group; a named
+    // window in an unnamed group still parses with the positional fallback.
     expect(
       parseQuotaSummary(JSON.stringify({ groups: [{ buckets: [{ remainingFraction: 0.5 }] }] })),
-    ).toEqual([{ name: "Quota Group 1", used: 0.5 }]);
+    ).toEqual([]);
+    expect(
+      parseQuotaSummary(
+        JSON.stringify({ groups: [{ buckets: [{ window: "5h", remainingFraction: 0.5 }] }] }),
+      ),
+    ).toEqual([{ name: "Quota Group 1", windows: [{ window: "5h", used: 0.5 }] }]);
   });
 
-  it("quota summary: tightest bucket wins, snake_case accepted, sorted used-desc", () => {
-    const models = [
+  it("quota summary: window spellings normalize; tightest bucket per window wins", () => {
+    const groups = [
       {
-        name: "gemini-3-pro",
+        displayName: "g1",
         buckets: [
-          { remainingFraction: 0.8 },
-          { remaining_fraction: 0.25, reset_time: "2026-10-15T06:00:00Z" },
-          { remainingFraction: 1.7 }, // out of range — ignored
+          { window: "Five_Hour", remainingFraction: 0.8 },
+          { window: "five-hour", remaining_fraction: 0.25, reset_time: "2026-10-15T06:00:00Z" },
+          { window: "week", remainingFraction: 0.9 },
+          { window: "5h", remainingFraction: 1.7 }, // out of range — ignored
+          { remainingFraction: 0.1 }, // no window — dropped
+          { window: "monthly", remainingFraction: 0.1 }, // unknown window — dropped
           "junk",
         ],
       },
-      { model: "gemini-3-flash", buckets: [{ remainingFraction: 0.5 }] },
-      { name: "empty" }, // no buckets — dropped
     ];
-    const out = parseQuotaSummary(JSON.stringify({ models }));
-    expect(out).toEqual([
-      { name: "gemini-3-pro", used: 0.75, resetAt: Date.parse("2026-10-15T06:00:00Z") },
-      { name: "gemini-3-flash", used: 0.5 },
+    expect(parseQuotaSummary(JSON.stringify({ groups }))).toEqual([
+      {
+        name: "g1",
+        windows: [
+          { window: "5h", used: 0.75, resetAt: Date.parse("2026-10-15T06:00:00Z") },
+          { window: "week", used: 1 - 0.9 },
+        ],
+      },
     ]);
     expect(parseQuotaSummary("nope")).toEqual([]);
     expect(parseQuotaSummary(JSON.stringify({}))).toEqual([]);
+    // Legacy non-groups payloads parse to nothing.
+    expect(parseQuotaSummary(JSON.stringify({ models: [] }))).toEqual([]);
   });
 
   it("relay envelope helpers", () => {
@@ -374,7 +389,7 @@ describe("queryCpUsage orchestration", () => {
     });
     mockedRelay.mockResolvedValue(
       relayResp({
-        models: [{ name: "gemini-3-pro", buckets: [{ remainingFraction: 0.25 }] }],
+        groups: [{ displayName: "Gemini Models", buckets: [{ window: "5h", remainingFraction: 0.25 }] }],
       }),
     );
     const { result, otherCount } = await queryCpUsage();
@@ -383,7 +398,10 @@ describe("queryCpUsage orchestration", () => {
     if (result.kind !== "success") return;
     expect(result.accounts).toHaveLength(1);
     expect(result.accounts[0]).toMatchObject({ label: "alice", provider: "antigravity" });
-    expect(result.accounts[0]!.models[0]).toMatchObject({ name: "gemini-3-pro", used: 0.75 });
+    expect(result.accounts[0]!.models[0]).toMatchObject({
+      name: "Gemini Models",
+      windows: [{ window: "5h", used: 0.75 }],
+    });
     // One relay per Gemini account, with the resolved auth index.
     expect(mockedRelay).toHaveBeenCalledTimes(1);
     expect(mockedRelay.mock.calls[0]![2]).toBe("0");
@@ -398,7 +416,9 @@ describe("queryCpUsage orchestration", () => {
       ]),
     });
     mockedRelay.mockResolvedValueOnce(
-      relayResp({ models: [{ name: "m", buckets: [{ remainingFraction: 0.5 }] }] }),
+      relayResp({
+        groups: [{ displayName: "m", buckets: [{ window: "week", remainingFraction: 0.5 }] }],
+      }),
     );
     mockedRelay.mockResolvedValueOnce(null); // second account's ladder exhausted
     const { result } = await queryCpUsage();
@@ -415,7 +435,7 @@ describe("queryCpUsage orchestration", () => {
       status: 200,
       text: JSON.stringify([{ auth_index: "0", provider: "antigravity" }]),
     });
-    mockedRelay.mockResolvedValue(relayResp({ models: [] })); // no model buckets
+    mockedRelay.mockResolvedValue(relayResp({ groups: [] })); // no model buckets
     const { result } = await queryCpUsage();
     expect(result.kind).toBe("unavailable"); // the only Gemini account yielded nothing
   });
@@ -424,7 +444,11 @@ describe("queryCpUsage orchestration", () => {
 // --- format ------------------------------------------------------------------
 
 describe("formatCpSection", () => {
-  it("renders one row per (account, model) with the reset stamp", () => {
+  it("renders pool-wide family × window rows with the earliest reset stamp", () => {
+    // Two subscriptions: used fractions SUM into the pool (total used over
+    // total capacity = average); each window stamps the EARLIEST reset across
+    // accounts (alice's, not bob's).
+    const aliceWeek = Date.parse("2026-10-18T03:52:19Z");
     const sec = formatCpSection(
       {
         kind: "success",
@@ -433,8 +457,26 @@ describe("formatCpSection", () => {
             label: "alice",
             provider: "antigravity",
             models: [
-              { name: "gemini-3-pro", used: 0.75, resetAt: Date.parse("2026-10-15T06:00:00Z") },
-              { name: "gemini-3-flash", used: 0.2 },
+              {
+                name: "Gemini Models",
+                windows: [
+                  { window: "5h", used: 0.1 },
+                  { window: "week", used: 0.5, resetAt: aliceWeek },
+                ],
+              },
+            ],
+          },
+          {
+            label: "bob",
+            provider: "antigravity",
+            models: [
+              {
+                name: "Gemini Models",
+                windows: [
+                  { window: "5h", used: 0.3 },
+                  { window: "week", used: 0.1, resetAt: aliceWeek + 86_400_000 },
+                ],
+              },
             ],
           },
         ],
@@ -445,8 +487,18 @@ describe("formatCpSection", () => {
       () => 60_000,
     );
     expect(sec.header).toBe("CLIProxy"); // fresh (60s old at the injected clock)
-    expect(sec.body[0]).toMatch(/alice gemini-3-pro\s+[█░]+\s+75% · \d{2}-\d{2} \d{2}:\d{2}/);
-    expect(sec.body[1]).toMatch(/alice gemini-3-flash\s+[█░]+\s+20%/);
+    // Week row first (tightest window: (0.5+0.1)/2 = 30%), then 5h (20%).
+    const week = new Date(aliceWeek);
+    const stamp = `${String(week.getMonth() + 1).padStart(2, "0")}-${String(
+      week.getDate(),
+    ).padStart(2, "0")} ${String(week.getHours()).padStart(2, "0")}:${String(
+      week.getMinutes(),
+    ).padStart(2, "0")}`;
+    expect(sec.body[0]).toMatch(
+      new RegExp(`Gemini Models\\s+Week\\s+[█░]+\\s+30% · ${stamp.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}$`),
+    );
+    // 5h has no reset reported by either account — no stamp.
+    expect(sec.body[1]).toMatch(/^\s{22}5h\s+[█░]+\s+20%$/);
     expect(sec.body[2]).toBe("      + 2 non-Gemini accounts");
   });
 

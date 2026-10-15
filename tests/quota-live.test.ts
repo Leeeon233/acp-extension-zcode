@@ -228,7 +228,7 @@ describe("hub-first lookup", () => {
     }
   });
 
-  it("direct fallback composes the CLIProxy segment (tightest model)", async () => {
+  it("direct fallback composes the CLIProxy segment (pool aggregate)", async () => {
     remoteConfigMock.mockReturnValue(null); // local-only: direct path
     queryQuotaMock.mockResolvedValue(SUCCESS);
     const resetAt = 1_800_000_000_000 + 3_600_000;
@@ -240,7 +240,9 @@ describe("hub-first lookup", () => {
           {
             label: "will",
             provider: "antigravity",
-            models: [{ name: "gemini-2.5-pro", used: 0.634, resetAt }],
+            models: [
+              { name: "Gemini Models", windows: [{ window: "week", used: 0.634, resetAt }] },
+            ],
           },
         ],
       },
