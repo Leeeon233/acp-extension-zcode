@@ -18,7 +18,9 @@ import process from "node:process";
 // (status, text) without depending on undici's Response.url.
 vi.mock("../src/quota/opencode-go/client.js", () => ({
   fetchGoStatus: vi.fn(),
+  fetchZenUsage: vi.fn(),
   goStatusUrl: () => "https://opencode.ai/console/api/go/status",
+  zenUsageUrl: () => "https://opencode.ai/zen/go/v1/usage",
 }));
 
 // Control the own-config side of credential resolution (quota.opencodeGo*
@@ -65,17 +67,25 @@ vi.mock("node:fs", async () => {
 });
 
 import { formatDuration, formatGoSection } from "../src/quota/opencode-go/format.js";
-import { looksLikeGoStatus, parseGoStatus } from "../src/quota/opencode-go/parse.js";
+import {
+  looksLikeGoStatus,
+  looksLikeZenUsage,
+  parseGoStatus,
+  parseZenUsage,
+} from "../src/quota/opencode-go/parse.js";
 import type { GoQueryResult } from "../src/quota/opencode-go/types.js";
 import { clearCache, setClock } from "../src/quota/opencode-go/cache.js";
-import { fetchGoStatus } from "../src/quota/opencode-go/client.js";
+import { fetchGoStatus, fetchZenUsage } from "../src/quota/opencode-go/client.js";
 import { CONFIG_PATH, readConfigFile } from "../src/quota/opencode-go/config.js";
 import { queryGoUsage } from "../src/quota/opencode-go/index.js";
 
-// `fetchGoStatus` is mocked (see vi.mock above) for orchestration tests. The
-// real HTTP-client header test lives in tests/opencode-go-client.test.ts.
+// `fetchGoStatus`/`fetchZenUsage` are mocked (see vi.mock above) for
+// orchestration tests. The real HTTP-client header test lives in
+// tests/opencode-go-client.test.ts.
 const mockedFetch = vi.mocked(fetchGoStatus);
 void mockedFetch;
+const mockedZen = vi.mocked(fetchZenUsage);
+void mockedZen;
 
 // --- parser --------------------------------------------------------------
 
@@ -269,6 +279,76 @@ describe("formatGoSection", () => {
   });
 });
 
+// --- parseZenUsage (public /zen/go/v1/usage API) --------------------------
+
+/** One window of the public usage payload (integer percent + absolute reset). */
+function zenWindow(percent: number, resetsAt: string): Record<string, unknown> {
+  return { status: "ok", percent, resetsAt };
+}
+
+/** Build a public-usage payload body around a usage object. */
+function zenJson(usage: Record<string, unknown>): string {
+  return JSON.stringify({ usage });
+}
+
+describe("parseZenUsage", () => {
+  it("passes percents through and computes countdowns from resetsAt", () => {
+    const parsed = parseZenUsage(
+      zenJson({
+        rolling: zenWindow(19, "2026-09-19T07:00:00.000Z"),
+        weekly: zenWindow(0, "2026-09-21T04:00:00.000Z"),
+        monthly: zenWindow(7, "2026-10-03T02:03:01.000Z"),
+      }),
+      NOW,
+    );
+    expect(parsed.rolling).toEqual({ usagePercent: 19, resetInSec: 3 * 3600 });
+    expect(parsed.weekly).toEqual({ usagePercent: 0, resetInSec: 2 * 86400 });
+    expect(parsed.monthly?.usagePercent).toBe(7);
+    expect(parsed.parserOutdated).toBe(false);
+  });
+
+  it("passes fractional percents through untouched (finer upstream granularity)", () => {
+    const parsed = parseZenUsage(
+      zenJson({ rolling: zenWindow(72.6, "2026-09-19T05:00:00.000Z") }),
+      NOW,
+    );
+    expect(parsed.rolling?.usagePercent).toBe(72.6);
+  });
+
+  it("drops a window with a missing/invalid percent instead of pinning zero", () => {
+    const parsed = parseZenUsage(
+      zenJson({
+        rolling: zenWindow(10, "2026-09-19T07:00:00.000Z"),
+        monthly: { status: "ok", resetsAt: "2026-10-03T02:03:01.000Z" },
+      }),
+      NOW,
+    );
+    expect(parsed.rolling).not.toBeNull();
+    expect(parsed.monthly).toBeNull();
+    expect(parsed.parserOutdated).toBe(false);
+  });
+
+  it("clamps percents above 100", () => {
+    const parsed = parseZenUsage(
+      zenJson({ rolling: zenWindow(250, "2026-09-19T07:00:00.000Z") }),
+      NOW,
+    );
+    expect(parsed.rolling?.usagePercent).toBe(100);
+  });
+
+  it("flags parser rot when the shape matches but no window parses", () => {
+    const parsed = parseZenUsage(zenJson({ rolling: { status: "weird" } }), NOW);
+    expect(parsed.parserOutdated).toBe(true);
+  });
+
+  it("returns null windows for a foreign payload or non-JSON text", () => {
+    expect(parseZenUsage(statusJson({}), NOW).rolling).toBeNull();
+    expect(parseZenUsage("<html>login</html>", NOW).monthly).toBeNull();
+    expect(looksLikeZenUsage(JSON.parse(zenJson({})))).toBe(true);
+    expect(looksLikeZenUsage(JSON.parse(statusJson({})))).toBe(false);
+  });
+});
+
 // --- queryGoUsage orchestration ------------------------------------------
 
 describe("queryGoUsage orchestration", () => {
@@ -276,6 +356,7 @@ describe("queryGoUsage orchestration", () => {
     clearCache();
     setClock(() => 5000);
     mockedFetch.mockReset();
+    mockedZen.mockReset();
     mockFiles.clear();
     loadUserConfigMock.mockReset();
     loadUserConfigMock.mockReturnValue({});
@@ -286,6 +367,7 @@ describe("queryGoUsage orchestration", () => {
     delete process.env.OPENCODE_GO_WORKSPACE_ID;
     delete process.env.OPENCODE_GO_AUTH_COOKIE;
     delete process.env.OPENCODE_GO_SESSION_TOKEN;
+    delete process.env.OPENCODE_GO_API_KEY;
     mockFiles.clear();
   });
 
@@ -382,6 +464,60 @@ describe("queryGoUsage orchestration", () => {
       text: statusJson({ fiveHour: meter("abc", "0"), week: meter("x", "y") }),
     });
     expect((await queryGoUsage()).kind).toBe("unavailable");
+  });
+
+  it("queries the usage API directly with an API key and no cookie triple", async () => {
+    process.env.OPENCODE_GO_API_KEY = "oc_sk_test_key_12345";
+    mockedZen.mockResolvedValue({
+      status: 200,
+      text: zenJson({
+        rolling: zenWindow(19, "2026-09-19T07:00:00.000Z"),
+        weekly: zenWindow(0, "2026-09-21T04:00:00.000Z"),
+        monthly: zenWindow(7, "2026-10-03T02:03:01.000Z"),
+      }),
+    });
+    const result = await queryGoUsage();
+    expect(mockedFetch).not.toHaveBeenCalled(); // key-only — console path skipped
+    expect(mockedZen).toHaveBeenCalledTimes(1);
+    expect(mockedZen).toHaveBeenCalledWith("oc_sk_test_key_12345");
+    expect(result.kind).toBe("success");
+    if (result.kind !== "success") return;
+    expect(result.rolling.usagePercent).toBe(19);
+    expect(result.monthly?.usagePercent).toBe(7);
+  });
+
+  it("falls back to the API key when the console cookies are rejected", async () => {
+    process.env.OPENCODE_GO_WORKSPACE_ID = "wrk_abc";
+    process.env.OPENCODE_GO_AUTH_COOKIE = "Fe26.2**expired";
+    process.env.OPENCODE_GO_SESSION_TOKEN = "st_expired";
+    process.env.OPENCODE_GO_API_KEY = "oc_sk_test_key_12345";
+    mockedFetch.mockResolvedValue({ status: 401, text: "" });
+    mockedZen.mockResolvedValue({
+      status: 200,
+      text: zenJson({ rolling: zenWindow(3, "2026-09-19T07:00:00.000Z") }),
+    });
+    const result = await queryGoUsage();
+    expect(mockedFetch).toHaveBeenCalledTimes(1); // cookies tried FIRST
+    expect(mockedZen).toHaveBeenCalledTimes(1); // …then the fallback
+    expect(result.kind).toBe("success");
+  });
+
+  it("classifies zen 401 as auth_error (revoked key)", async () => {
+    process.env.OPENCODE_GO_API_KEY = "oc_sk_test_key_12345";
+    mockedZen.mockResolvedValue({ status: 401, text: "" });
+    expect((await queryGoUsage()).kind).toBe("auth_error");
+  });
+
+  it("degrades to unavailable on zen HTTP 503", async () => {
+    process.env.OPENCODE_GO_API_KEY = "oc_sk_test_key_12345";
+    mockedZen.mockResolvedValue({ status: 503, text: "" });
+    expect((await queryGoUsage()).kind).toBe("unavailable");
+  });
+
+  it("ignores an API key shorter than the plausible minimum", async () => {
+    process.env.OPENCODE_GO_API_KEY = "oc_sk_short";
+    expect((await queryGoUsage()).kind).toBe("not_configured");
+    expect(mockedZen).not.toHaveBeenCalled();
   });
 
   it("serves a cached result within the TTL window", async () => {
@@ -483,6 +619,7 @@ describe("queryGoUsage credential merging", () => {
     delete process.env.OPENCODE_GO_WORKSPACE_ID;
     delete process.env.OPENCODE_GO_AUTH_COOKIE;
     delete process.env.OPENCODE_GO_SESSION_TOKEN;
+    delete process.env.OPENCODE_GO_API_KEY;
     mockFiles.clear();
   });
 
@@ -570,6 +707,7 @@ describe("own-config credential precedence", () => {
     delete process.env.OPENCODE_GO_WORKSPACE_ID;
     delete process.env.OPENCODE_GO_AUTH_COOKIE;
     delete process.env.OPENCODE_GO_SESSION_TOKEN;
+    delete process.env.OPENCODE_GO_API_KEY;
     mockFiles.clear();
   });
 

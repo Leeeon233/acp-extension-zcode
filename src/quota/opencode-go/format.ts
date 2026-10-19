@@ -73,7 +73,7 @@ export function formatGoSection(
       result.kind === "not_configured"
         ? "not configured (set quota.opencodeGo* or OPENCODE_GO_* — see zcode-acp quota --help)"
         : result.kind === "auth_error"
-          ? "auth expired — refresh your opencode.ai cookie + session token"
+          ? "auth expired — refresh your opencode.ai cookie + session token, or set quota.opencodeGoApiKey"
           : "unavailable";
     return { header, body: [msg] };
   }

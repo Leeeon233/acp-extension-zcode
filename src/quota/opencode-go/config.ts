@@ -4,18 +4,22 @@
  *
  * Full precedence (highest first), resolved in ../index.ts:
  *   1. `quota.opencodeGoWorkspaceId` / `opencodeGoAuthCookie` /
- *      `opencodeGoSessionToken` in `~/.config/zcode-acp/config.json` (our own
- *      config).
+ *      `opencodeGoSessionToken` / `opencodeGoApiKey` in
+ *      `~/.config/zcode-acp/config.json` (our own config).
  *   2. `OPENCODE_GO_WORKSPACE_ID` / `OPENCODE_GO_AUTH_COOKIE` /
- *      `OPENCODE_GO_SESSION_TOKEN` env vars (best for CI / scripts /
- *      temporary overrides).
+ *      `OPENCODE_GO_SESSION_TOKEN` / `OPENCODE_GO_API_KEY` env vars (best for
+ *      CI / scripts / temporary overrides).
  *   3. `~/.pi/agent/opencode-go.json` —
  *      `{ workspaceId, authCookie, sessionToken }` (the convention used by
  *      the @beyona/pi-zai-usage Pi extension, kept so users who already
- *      configured it there get reuse for free).
+ *      configured it there get reuse for free). No API-key field here — the
+ *      key postdates that convention.
  *
- * All three fields must resolve to a valid triple — a missing/invalid one
- * yields `not_configured`.
+ * The cookie triple and the API key are two SOURCES for the same data: the
+ * triple drives the console status API (0.1-percent precision), the key the
+ * public usage API (integer percents, cookie-free). A missing/invalid
+ * credential on its own does not yield `not_configured` when the other
+ * source resolves — see ../index.ts.
  */
 
 import { readFileSync } from "node:fs";
@@ -28,6 +32,7 @@ import { log } from "../../utils.js";
 export const ENV_WORKSPACE_ID = "OPENCODE_GO_WORKSPACE_ID";
 export const ENV_AUTH_COOKIE = "OPENCODE_GO_AUTH_COOKIE";
 export const ENV_SESSION_TOKEN = "OPENCODE_GO_SESSION_TOKEN";
+export const ENV_API_KEY = "OPENCODE_GO_API_KEY";
 
 /** Config file path (matches the @beyona/pi-zai-usage convention). */
 export const CONFIG_PATH = path.join(

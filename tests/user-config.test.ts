@@ -96,6 +96,7 @@ describe("loadUserConfig", () => {
           ollamaApiKey: " sk-123 ",
           opencodeGoWorkspaceId: " wrk_x ",
           opencodeGoAuthCookie: " Fe26.2**y ",
+          opencodeGoApiKey: " oc_sk_test_key_12345 ",
         },
       }),
     );
@@ -104,6 +105,7 @@ describe("loadUserConfig", () => {
         ollamaApiKey: "sk-123",
         opencodeGoWorkspaceId: "wrk_x",
         opencodeGoAuthCookie: "Fe26.2**y",
+        opencodeGoApiKey: "oc_sk_test_key_12345",
       },
     });
   });

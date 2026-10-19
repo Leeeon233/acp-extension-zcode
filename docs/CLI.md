@@ -96,42 +96,45 @@ node dist/cli.js quota -w
 
 ## Opencode Go setup
 
-Opencode Go has no JSON API for subscription usage — the CLI scrapes the
-authenticated dashboard at `opencode.ai/workspace/<id>/go`, so it needs your
-browser `auth` cookie. Credentials are read from three sources, **merged
-field-by-field, highest precedence first**:
+Two credential sources drive the Go usage card — **picked automatically,
+cookies preferred** (they report usage in 0.1-percent steps; the API key
+reports integer percents but never expires and needs no browser):
 
-- **Our config file** (`~/.config/zcode-acp/config.json`, `quota` section —
-  the preferred home):
+- **API key** (recommended, cookie-free): at
+  [opencode.ai/console](https://opencode.ai/console) → **Keys** → Add Service
+  Account → Add API Key (query permissions suffice), then either:
+  - config file (`~/.config/zcode-acp/config.json`, `quota` section):
+    ```json
+    { "quota": { "opencodeGoApiKey": "oc_sk_your_key" } }
+    ```
+  - or environment variable:
+    ```bash
+    export OPENCODE_GO_API_KEY="oc_sk_your_key"
+    ```
+- **Console cookies** (higher precision, expires with the browser session):
+  `opencode.ai` console login → browser DevTools (F12) → Application →
+  Cookies → copy the `auth` cookie value and the `__Host-console_session`
+  value, plus the `wrk_…` workspace id from the console URL, into any of the
+  three merged sources (highest precedence first):
   ```json
   { "quota": {
       "opencodeGoWorkspaceId": "wrk_your_workspace_id",
-      "opencodeGoAuthCookie": "Fe26.2**your_cookie_value"
-  } }
+      "opencodeGoAuthCookie": "Fe26.2**your_cookie_value",
+      "opencodeGoSessionToken": "st_your_session_token" } }
   ```
-- **Environment variables** (override the legacy file below):
   ```bash
   export OPENCODE_GO_WORKSPACE_ID="wrk_your_workspace_id"
   export OPENCODE_GO_AUTH_COOKIE="Fe26.2**your_cookie_value"
+  export OPENCODE_GO_SESSION_TOKEN="st_your_session_token"
   ```
-- **Legacy config file**: `~/.pi/agent/opencode-go.json` — same convention as
-  the `@beyona/pi-zai-usage` Pi extension, kept so existing setups keep
-  working unchanged.
-  ```json
-  { "workspaceId": "wrk_your_workspace_id", "authCookie": "Fe26.2**your_cookie_value" }
-  ```
+  The legacy `~/.pi/agent/opencode-go.json` file
+  (`{ workspaceId, authCookie, sessionToken }`, the `@beyona/pi-zai-usage`
+  convention) still works as the lowest-precedence source.
 
-How to get the values:
-
-1. **Workspace ID** — open `https://opencode.ai`, navigate to your Go
-   workspace, and copy the `wrk_…` id from the URL
-   (`https://opencode.ai/workspace/<wrk_…>/go`).
-2. **Auth cookie** — open browser DevTools (F12) → Application → Cookies →
-   `opencode.ai` → copy the value of the cookie named `auth` (it starts with
-   `Fe26.2**`).
-
-Without credentials, the default multi-provider mode silently shows GLM only
-(no error). Running `zcode-acp quota go` without credentials prints a setup hint.
+When both are configured and the cookies expire (the console API answers
+400/401/403), the card seamlessly falls back to the API key. Without any
+credentials, the default multi-provider mode silently shows GLM only (no
+error); `zcode-acp quota go` without credentials prints a setup hint.
 
 ## Ollama Cloud setup
 

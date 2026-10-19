@@ -23,7 +23,9 @@ vi.mock("../src/backend/credentials.js", () => ({
 // deterministic (status, text) pair without touching the network.
 vi.mock("../src/quota/opencode-go/client.js", () => ({
   fetchGoStatus: vi.fn(),
+  fetchZenUsage: vi.fn(),
   goStatusUrl: () => "https://opencode.ai/console/api/go/status",
+  zenUsageUrl: () => "https://opencode.ai/zen/go/v1/usage",
 }));
 
 // Stub readConfigFile to return nothing — combined tests drive credentials via

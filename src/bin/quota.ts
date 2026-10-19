@@ -92,14 +92,19 @@ Providers:
 GLM credentials: read from ~/.zcode/v2/config.json (created by the ZCode app).
 Non-GLM credentials resolve per field, highest precedence first:
   1. ~/.config/zcode-acp/config.json "quota" section, e.g.
-     {"quota":{"ollamaApiKey":"…","cliproxyUrl":"https://host:port","cliproxyManagementKey":"…","opencodeGoWorkspaceId":"wrk_…","opencodeGoAuthCookie":"Fe26.2**…","opencodeGoSessionToken":"st_…"}}
+     {"quota":{"ollamaApiKey":"…","cliproxyUrl":"https://host:port","cliproxyManagementKey":"…","opencodeGoWorkspaceId":"wrk_…","opencodeGoAuthCookie":"Fe26.2**…","opencodeGoSessionToken":"st_…","opencodeGoApiKey":"oc_sk_…"}}
   2. Environment variables (one-off overrides)
   3. ~/.pi/agent/opencode-go.json (legacy Pi-extension reuse, Opencode Go only)
-Opencode Go (log in at https://opencode.ai/console first, then DevTools →
-Application → Cookies → opencode.ai):
-  OPENCODE_GO_WORKSPACE_ID    e.g. wrk_abc123 (from the opencode.ai workspace URL)
-  OPENCODE_GO_AUTH_COOKIE     the "auth" cookie value (starts with Fe26.2**)
-  OPENCODE_GO_SESSION_TOKEN   the "__Host-console_session" cookie value (st_…)
+Opencode Go — two sources, picked automatically (cookies preferred for their
+0.1-percent precision; the API key is the cookie-free fallback):
+  a) Console cookies (log in at https://opencode.ai/console first, then
+     DevTools → Application → Cookies → opencode.ai):
+       OPENCODE_GO_WORKSPACE_ID    e.g. wrk_abc123 (from the workspace URL)
+       OPENCODE_GO_AUTH_COOKIE     the "auth" cookie value (starts with Fe26.2**)
+       OPENCODE_GO_SESSION_TOKEN   the "__Host-console_session" cookie value (st_…)
+  b) API key (opencode.ai/console → Keys → Add Service Account; query
+     permissions suffice — integer-percent precision):
+       OPENCODE_GO_API_KEY         the service-account key (starts with oc_sk_)
 Ollama Cloud:
   OLLAMA_API_KEY              an Ollama Cloud API key (cloud.ollama.ai → API keys)
 CLIProxyAPI (HTTPS mandatory — the management key relays account credentials):
