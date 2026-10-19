@@ -7,9 +7,18 @@ Two switches arm the sandbox (macOS only), whichever comes first:
 
 - globally: `ZCODE_ACP_SANDBOX=1`, or
 - per project: `"enabled": true` in `<workspace>/.zcode/acp/sandbox.json`.
-  The bridge auto-creates that file with `"enabled": false` the first time
-  you open the workspace — flip the flag to opt this project in, no global
-  env needed. Flipping it mid-run takes effect on the next prompt (the
+  That file is only auto-created (with `"enabled": false`) while the
+  sandbox's GLOBAL switch is on (`ZCODE_ACP_SANDBOX=1` or `sandbox.enabled`
+  in the user config) — while the global switch is off, the bridge writes
+  nothing into the workspace, so headless per-task runs leave no `.zcode/`
+  behind. To opt a project in from a clean workspace, create the file
+  yourself:
+
+  ```json
+  { "enabled": true, "allow": [], "deny": [], "strictGit": false }
+  ```
+
+  Flipping the flag mid-run takes effect on the next prompt (the
   backend restarts sandboxed); flipping back takes effect the next time the
   backend restarts on its own.
 

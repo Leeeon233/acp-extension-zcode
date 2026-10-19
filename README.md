@@ -218,11 +218,12 @@ field (see [User config file](#user-config-file)); the file value wins.
 ## Sandbox
 
 Optional macOS Seatbelt confinement for everything the agent writes: dual
-switch (`ZCODE_ACP_SANDBOX=1` globally, or `"enabled": true` in the
-auto-created `<workspace>/.zcode/acp/sandbox.json` per project), allow/reject
-popups for out-of-whitelist writes persisted visibly in that config, and
-automatic backend restart + task continuation after an allow. Full manual:
-[docs/SANDBOX.md](docs/SANDBOX.md).
+switch (`ZCODE_ACP_SANDBOX=1` globally, or `"enabled": true` in
+`<workspace>/.zcode/acp/sandbox.json` per project — auto-created only while
+the sandbox's global switch is on; otherwise the bridge writes nothing into
+the workspace), allow/reject popups for out-of-whitelist writes persisted
+visibly in that config, and automatic backend restart + task continuation
+after an allow. Full manual: [docs/SANDBOX.md](docs/SANDBOX.md).
 
 ## Remote Access
 
