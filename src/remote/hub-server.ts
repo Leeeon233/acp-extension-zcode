@@ -1124,6 +1124,49 @@ async function diskCodeIsNewer(
 }
 
 /**
+ * clientInfo name the desktop client (the zcode-acp-remote Desktop Workbench)
+ * sends at `initialize` — the Desktop Presence identity (amendment to
+ * ADR-0016). The bridge-side twin of this identification is
+ * `ClientRegistry.nameConnection` (broadcast.ts); the hub cannot reuse it
+ * because bridges sit downstream of the hub's incubation decision.
+ */
+export const DESKTOP_CLIENT_NAME = "zcode-acp-remote-desktop";
+
+/**
+ * Desktop Presence wire peek (amendment to ADR-0016): the hub is a frame-level
+ * proxy (ADR-0002) with no ACP layer of its own, so a hub client's identity is
+ * visible only on the wire. The first client→bridge frame of an ACP connection
+ * is always `initialize` (the SDK enforces it and rejects later duplicates), so
+ * the connection's clientInfo name can be read straight off that frame.
+ * Returns: the name ("" when the initialize carries no clientInfo — the mobile
+ * App), `null` when the frame decodes and parses but is NOT an initialize
+ * (none is coming — the bridge's SDK shuts such connections down), `undefined`
+ * when the frame cannot be decoded or parsed (keep watching). Never throws.
+ */
+export function initializeClientName(data: RawData): string | null | undefined {
+  let text: string;
+  if (typeof data === "string") text = data;
+  else if (Array.isArray(data)) text = Buffer.concat(data.map((c) => Buffer.from(c))).toString();
+  else if (data instanceof ArrayBuffer) text = Buffer.from(data).toString();
+  else if (ArrayBuffer.isView(data))
+    text = Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString();
+  else return undefined;
+  let msg: unknown;
+  try {
+    msg = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  // ACP v2 may wrap the initialize in a single-entry JSON-RPC batch.
+  const first = Array.isArray(msg) ? msg[0] : msg;
+  if (typeof first !== "object" || first === null) return undefined;
+  const { method, params } = first as { method?: unknown; params?: unknown };
+  if (method !== "initialize") return null;
+  const info = (params as { clientInfo?: { name?: unknown } } | undefined)?.clientInfo;
+  return typeof info?.name === "string" ? info.name : "";
+}
+
+/**
  * Start the hub. Resolves once listening; rejects on bind failure (including
  * EADDRINUSE when another hub already owns the port).
  */
@@ -1169,6 +1212,15 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
 
   const instances = new Map<string, InstanceEntry>();
   const proxyPairs = new Set<{ client: WebSocket; bridge: WebSocket }>();
+  /**
+   * Desktop Presence (amendment to ADR-0016): proxy pairs whose client
+   * initialized under DESKTOP_CLIENT_NAME. Membership is per connection —
+   * added at the pair's initialize (see startProxy), dropped by its teardown —
+   * so presence ends when the desktop app disconnects (close, crash, sleep
+   * past the keepalive) and visible-terminal incubation resumes for later
+   * creates. Sessions that already have a window are never touched.
+   */
+  const desktopPairs = new Set<{ client: WebSocket; bridge: WebSocket }>();
   const timers: Array<ReturnType<typeof setInterval>> = [];
 
   /**
@@ -1308,12 +1360,29 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       // never churns when the bridge takes over the script's initial printf.
       env.ZCODE_ACP_TAB_TITLE = sessionTabTitle(tabTitle, workspacePath);
     }
+    // Desktop Presence (amendment to ADR-0016): while a desktop client is
+    // connected, session-create takes the headless serve form — the desktop
+    // app is the presenting surface, so a terminal window would re-render the
+    // same stream for nobody. Equivalent to the exhausted-terminal-list
+    // fallback: the launch list is empty, so openNextTerminal yields to the
+    // detached serve spawn at once. Checked once, here, at session-creation
+    // time (a desktop client dropping mid-flight never opens a window
+    // retroactively). Resume keeps its window (ADR-0017) and the listing was
+    // already headless; `ZCODE_ACP_HUB_TERMINAL=0` stays the static variant.
+    const desktopPresent = kind === "tui" && desktopPairs.size > 0;
+    if (desktopPresent) {
+      // warn (not log): the daemon's stderr is null in production, so the
+      // diary is the only place this state change is observable.
+      warn(
+        `hub: desktop client connected — incubating ${workspacePath} headless (Desktop Presence)`,
+      );
+    }
     // Terminal preference list (ADR-0016 amendment): visible-terminal kinds
     // walk it — a failed launch moves down at once, a window that never
     // registers moves down at its timeout — and only the exhausted list
     // falls back to the detached headless spawn. "serve" never pops a window.
     const launches =
-      kind === "serve"
+      kind === "serve" || desktopPresent
         ? []
         : (terminalLaunches ?? resolveTerminalLaunches(remoteTerminalPrefs(env)));
     let li = 0;
@@ -2589,8 +2658,29 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     pongResponsive.add(bridge);
     client.on("pong", () => pongResponsive.add(client));
     bridge.on("pong", () => pongResponsive.add(bridge));
+    // Desktop Presence (amendment to ADR-0016): watch the client's frames
+    // until the connection's `initialize` shows up (always the FIRST frame —
+    // see initializeClientName) and record whether this pair is the desktop
+    // client. Removed at the first decodable frame either way; teardown drops
+    // the pair, so presence ends with the connection.
+    const watchClientIdentity = (data: RawData, isBinary: boolean): void => {
+      if (isBinary) return; // ACP frames are text; the SDK drops binary ones
+      const name = initializeClientName(data);
+      if (name === undefined) return;
+      client.removeListener("message", watchClientIdentity);
+      if (name === DESKTOP_CLIENT_NAME) {
+        desktopPairs.add(pair);
+        // warn (not log): debug-only stderr is invisible under the detached
+        // daemon — the diary line is how presence is confirmed in production.
+        warn(
+          "hub: desktop client connected — new remote sessions incubate headless (Desktop Presence)",
+        );
+      }
+    };
+    client.on("message", watchClientIdentity);
     const teardown = (): void => {
       if (!proxyPairs.delete(pair)) return;
+      desktopPairs.delete(pair);
       client.close();
       bridge.close();
     };
@@ -2701,7 +2791,9 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       // port 0 binds an ephemeral port — report the actual one (used by tests).
       const addr = server.address();
       const bound = typeof addr === "object" && addr !== null ? addr.port : port;
-      log(`hub: listening on ${host}:${bound} (instances: 0)`);
+      // warn (not log): the daemon's stderr is null in production — the
+      // diary line is the only record of when/where a hub came up.
+      warn(`hub: listening on ${host}:${bound} (instances: 0)`);
       resolve({ port: bound, close });
     });
   });

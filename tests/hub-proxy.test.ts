@@ -30,11 +30,13 @@ vi.mock("../src/tasks-index.js", () => ({
 }));
 
 import {
+  DESKTOP_CLIENT_NAME,
   resolveTerminalLaunch,
   sanitizeTabTitle,
   startHub,
   terminalTuiScript,
   ghosttyTabAppleScript,
+  initializeClientName,
   type HubHandle,
 } from "../src/remote/hub-server.js";
 import { BOOT_RESUME_TRIGGER } from "../src/handlers/session.js";
@@ -1182,6 +1184,279 @@ describe("hub terminal-TUI session create (session binding + slow-window fallbac
     const res = await pending;
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ id: "warp-window", reused: false });
+  });
+});
+
+describe("hub Desktop Presence (ADR-0016 amendment)", () => {
+  const PROJECT = "/Users/dev/Develop/demo";
+  const auth = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
+  const post = (hub: HubHandle, body: Record<string, unknown>): Promise<Response> =>
+    fetch(`http://127.0.0.1:${hub.port}/api/instances`, {
+      method: "POST",
+      headers: auth,
+      body: JSON.stringify(body),
+    });
+
+  let fakeChild: EventEmitter & { pid: number; exitCode: number | null; signalCode: string | null };
+  let spawnCalls: Array<{
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    kind: "tui" | "serve";
+    launch?: unknown;
+  }>;
+
+  beforeEach(() => {
+    listKnownWorkspacesMock.mockReset();
+    listKnownWorkspacesMock.mockResolvedValue([
+      { workspacePath: PROJECT, sessions: 3, lastActive: 1234 },
+    ]);
+    fakeChild = new EventEmitter() as typeof fakeChild;
+    fakeChild.pid = 4242;
+    fakeChild.exitCode = null;
+    fakeChild.signalCode = null;
+    spawnCalls = [];
+  });
+
+  function spawnServeSpy() {
+    return (opts: {
+      cwd: string;
+      env: NodeJS.ProcessEnv;
+      kind: "tui" | "serve";
+      launch?: unknown;
+    }) => {
+      spawnCalls.push(opts);
+      return fakeChild as unknown as import("node:child_process").ChildProcess;
+    };
+  }
+
+  async function registerServeBridge(hub: HubHandle, id: string, nonce?: string): Promise<void> {
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        registerBody({
+          id,
+          workspace: PROJECT,
+          origin: "serve",
+          port: BASE_PORT + 50,
+          pid: 4242,
+          ...(nonce ? { nonce } : {}),
+        }),
+      ),
+    });
+    expect(res.ok).toBe(true);
+  }
+
+  /** Echo bridge as the attach target — the hub dials it on every WS upgrade. */
+  function startEchoBridge(): Promise<{ server: WebSocketServer; port: number }> {
+    return new Promise((resolve) => {
+      const server = new WebSocketServer({ port: 0, host: "127.0.0.1" }, () => {
+        const addr = server.address();
+        resolve({ server, port: typeof addr === "object" && addr ? addr.port : 0 });
+      });
+      server.on("connection", (ws) => {
+        ws.on("message", (data) => ws.send(data));
+      });
+    });
+  }
+
+  /**
+   * Attach a hub WS client and run its `initialize` — the frame the presence
+   * watcher peeks at. Resolves once the initialize made the full round trip
+   * (the echo bridge returns it), which guarantees the hub has seen it.
+   */
+  async function connectClient(hub: HubHandle, clientInfo?: { name: string }): Promise<WebSocket> {
+    const client = track(
+      new WebSocket(`ws://127.0.0.1:${hub.port}/acp?instance=inst-1&token=${TOKEN}`),
+      (ws) =>
+        new Promise<void>((resolve) => {
+          if (ws.readyState === WebSocket.CLOSED) {
+            resolve();
+            return;
+          }
+          ws.close();
+          ws.once("close", () => resolve());
+        }),
+    );
+    await withTimeout(
+      new Promise<void>((resolve, reject) => {
+        client.once("open", () => resolve());
+        client.once("error", (e) => reject(e));
+      }),
+      3000,
+      "ws open",
+    );
+    const echoed = withTimeout(
+      new Promise<void>((resolve) => client.once("message", () => resolve())),
+      3000,
+      "initialize echo",
+    );
+    client.send(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: 1,
+          clientCapabilities: {},
+          ...(clientInfo ? { clientInfo } : {}),
+        },
+      }),
+    );
+    await echoed;
+    return client;
+  }
+
+  it("incubates session-create headlessly while a desktop client is connected", async () => {
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const echo = track(
+      await startEchoBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: echo.port })),
+    });
+    await connectClient(hub, { name: DESKTOP_CLIENT_NAME });
+
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    // Desktop Presence: no terminal attempt at all — the FIRST spawn is the
+    // detached headless serve form (the exhausted-preference-list fallback
+    // shape, same as ZCODE_ACP_HUB_TERMINAL=0).
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    expect(spawnCalls[0]!.launch).toBeUndefined();
+    // The create session bind rides the env unchanged: the attaching client
+    // and the headless bridge still share the hub-pre-generated session id.
+    expect(spawnCalls[0]!.env.ZCODE_ACP_BOOT_CREATE_SESSION).toBe("1");
+    expect(spawnCalls[0]!.env.ZCODE_ACP_RESUME_SESSION).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+    await registerServeBridge(hub, "serve-headless", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "serve-headless", reused: false });
+  });
+
+  it("keeps the visible TUI for clients that are not the desktop app", async () => {
+    // The mobile App sends no clientInfo and other named clients (editors,
+    // martty) are not the desktop workbench — both keep ADR-0016's window.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const echo = track(
+      await startEchoBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: echo.port })),
+    });
+    await connectClient(hub); // no clientInfo — the mobile App
+    await connectClient(hub, { name: "Paseo iOS" });
+
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("tui");
+    await registerServeBridge(hub, "window", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "window", reused: false });
+  });
+
+  it("restores the visible TUI once the desktop client disconnects", async () => {
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const echo = track(
+      await startEchoBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: echo.port })),
+    });
+    const desktop = await connectClient(hub, { name: DESKTOP_CLIENT_NAME });
+
+    // Create under presence: headless.
+    const first = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    await registerServeBridge(hub, "h1", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await first).status).toBe(200);
+
+    // The desktop app goes away — presence ends with the connection.
+    await new Promise<void>((resolve) => {
+      desktop.close();
+      desktop.once("close", () => resolve());
+    });
+    await new Promise((r) => setTimeout(r, 100)); // hub-side teardown
+
+    const second = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(2);
+    expect(spawnCalls[1]!.kind).toBe("tui");
+    await registerServeBridge(hub, "w2", spawnCalls[1]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await second).status).toBe(200);
+  });
+
+  it("resume keeps its visible TUI under presence (ADR-0017 untouched)", async () => {
+    // Presence gates NEW sessions only: a resume's window is ADR-0017's own
+    // feature and stays visible while the desktop client is connected.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const echo = track(
+      await startEchoBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: echo.port })),
+    });
+    await connectClient(hub, { name: DESKTOP_CLIENT_NAME });
+
+    const pending = post(hub, { workspacePath: PROJECT, sessionId: "sess_closed" });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("tui");
+    expect(spawnCalls[0]!.env.ZCODE_ACP_RESUME_SESSION).toBe("sess_closed");
+    await registerServeBridge(hub, "resume-tui", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "resume-tui", reused: false });
+  });
+
+  it("initializeClientName reads the identity off the wire frame", () => {
+    const frame = (params: Record<string, unknown>) =>
+      Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params }));
+    expect(initializeClientName(frame({ clientInfo: { name: DESKTOP_CLIENT_NAME } }))).toBe(
+      DESKTOP_CLIENT_NAME,
+    );
+    // ACP v2 single-entry batch.
+    expect(
+      initializeClientName(
+        Buffer.from(
+          `[${JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { clientInfo: { name: "Zed" } },
+          })}]`,
+        ),
+      ),
+    ).toBe("Zed");
+    // No clientInfo (the mobile App) reads as "" — initialize seen, unnamed.
+    expect(initializeClientName(frame({}))).toBe("");
+    // A decodable non-initialize frame: no identity is coming.
+    expect(
+      initializeClientName(
+        Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "session/prompt" })),
+      ),
+    ).toBeNull();
+    // Undecodable frames keep the watcher waiting.
+    expect(initializeClientName(Buffer.from("not json"))).toBeUndefined();
   });
 });
 
