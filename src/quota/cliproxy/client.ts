@@ -25,11 +25,17 @@ const API_CALL_ROUTES = ["/v8/management/requests/api-call", "/v0/management/api
 
 /**
  * Antigravity accounts' client identity (CPAMC `constants.ts`
- * ANTIGRAVITY_USER_AGENT). The quota endpoint gates on it: without the
- * antigravity CLI UA, Google answers 403 "You do not have a valid license of
- * this product" even for a perfectly healthy account (verified live 2026-10).
+ * ANTIGRAVITY_USER_AGENT). The quota endpoint gates on it twice: no
+ * antigravity UA at all → 403 "You do not have a valid license of this
+ * product"; the `antigravity/cli/1.0.13` UA → a PARTIAL snapshot that drops
+ * the Gemini Models group on the daily-* hosts (observed live 2026-10-20:
+ * the card reported only the Claude/GPT pool while the user's real usage sat
+ * in the invisible Gemini family). The hub UA gets the full two-group
+ * payload. Keep aligned with CPAMC (ANTIGRAVITY_HUB_VERSION) and CLIProxyAPI's
+ * internal/misc/antigravity_version.go — Cloud Code rejects clients below
+ * 2.23.0 for newer models.
  */
-const ANTIGRAVITY_USER_AGENT = "antigravity/cli/1.0.13 (aidev_client; os_type=darwin; arch=arm64)";
+const ANTIGRAVITY_USER_AGENT = "antigravity/hub/2.23.0 darwin/arm64";
 
 /**
  * Upstream quota endpoints CPAMC itself tries, in order

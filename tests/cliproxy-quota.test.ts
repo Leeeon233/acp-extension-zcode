@@ -144,8 +144,10 @@ describe("cliproxy client", () => {
     expect(payload.auth_index).toBe("0");
     expect(payload.url).toBe(QUOTA_SUMMARY_URLS[0]);
     expect(payload.header.Authorization).toBe("Bearer $TOKEN$");
-    // Without this UA Google answers 403 "no valid license" (verified live).
-    expect(payload.header["User-Agent"]).toMatch(/^antigravity\/cli\//);
+    // Without an antigravity UA Google answers 403 "no valid license", and the
+    // legacy antigravity/cli UA gets a PARTIAL snapshot (Gemini group dropped —
+    // observed live 2026-10-20); the hub UA is the full-payload identity.
+    expect(payload.header["User-Agent"]).toBe("antigravity/hub/2.23.0 darwin/arm64");
     expect(JSON.parse(payload.data)).toEqual({ project: "proj" });
   });
 
