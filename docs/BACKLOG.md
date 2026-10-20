@@ -142,6 +142,24 @@ only the ordinary selection; execution bundles stay in-memory) — internal v4
 queue mechanics, the v4 stop path is untouched. Model-selection persistence
 semantics unchanged (`ensureSessionPersisted` / `restorePersistedModelSelection`;
 `turn-model.ts` adds Highspeed/off-peak capture, not persistence).
+**3.16.2 follow-up sync (2026-10-20, commit `3c5b2276` — re-audited, no
+bridge action)**: 263 files, web/desktop tests + architecture snapshots
+dominate. Protocol schema ZERO diff; the only Gotchas-file change is 10
+lines in `server-operations.ts` generalizing the listSessions parent-chain
+ownership check from `subagent_child` to the auxiliary-session-kind set
+(`isAuxiliarySessionKind` / `isReadonlyAgentSessionKind`) — same family as
+the 3.16.1 listSessions rewrite, still irrelevant to the bridge (it never
+sends `sessionIds` explicit queries). CLI stays `0.17.0`.
+Postscript (2026-10-20): the machine's desktop moved 3.14.5 → 3.15.3 without a
+per-version audit (no source-sync commits exist for 3.15.2/3.15.3 — the
+sync bot snapshots, so their changes are folded into the 3.16.1 cumulative
+diff already audited above). Bundle dated the 3.15.3 install by marker
+strings: every 3.16-era protocol token (`toolSearchMode`, `refreshRegistry`,
+`additionalDirectories`, `alwaysLoad`, `historyFirst`) is ABSENT from its
+`zcode.cjs` while the 3.15-era tokens (`guarded` mode, `dynamicWorkflowMode`)
+and the pre-3.16 `includeArchived` are present — the running backend's
+protocol surface is exactly the 3.15.1-audited one, and the bridge has been
+running it without incident.
 
 **3.14.0 audit (2026-09-20, app-server 0.16.9 — live-probed end to end)**: the
 dynamic-workflow family (ten model tools led by `CreateWorkflow`) is OFF by
