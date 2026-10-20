@@ -9,11 +9,12 @@
 import { randomUUID } from "node:crypto";
 import { createServer, type Server } from "node:http";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   createSessionCloseHandler,
   serveTerminateDecision,
+  setForceSettleMsForTests,
   tuiTeardownPids,
 } from "../src/remote/session-close-endpoint.js";
 import { collectStatus } from "../src/remote/status-endpoint.js";
@@ -27,6 +28,7 @@ function trackStop(stop: () => Promise<void> | void): void {
 }
 
 afterEach(async () => {
+  setForceSettleMsForTests(3_000);
   while (cleanups.length) {
     const stop = cleanups.pop()!;
     await stop();
@@ -141,6 +143,76 @@ describe("session close endpoint", () => {
     expect(res.status).toBe(409);
     // Still advertised — the close was refused.
     expect(collectStatus(server).sessions.map((s) => s.sessionId)).toContain(acpSid);
+  });
+
+  it("force close cancels the in-flight turn (stop pair) and closes anyway", async () => {
+    // The explicit terminate gesture (desktop "End session"): ESC semantics
+    // without a client connection, then the runtime eviction finishes any
+    // generation that ignored the stop.
+    const server = new ZcodeAcpServer();
+    const { acpSid, zcodeSid } = seedSession(server, { title: "busy" });
+    const sent: Array<{ method: string; params: unknown }> = [];
+    server.backend = {
+      isDead: false,
+      send: (method: string, params: unknown) => sent.push({ method, params }),
+    } as unknown as typeof server.backend;
+    const turn = { zcodeSid, cancelled: false };
+    server.pendingTurns.set(7, turn);
+    // Room for the async stop pair to land inside the settle window.
+    setForceSettleMsForTests(200);
+    const base = await bootClose(server);
+
+    const res = await fetch(`${base}/sessions/${acpSid}/close`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ force: true }),
+    });
+    expect(res.status).toBe(200);
+    expect(turn.cancelled).toBe(true);
+    expect(turn.stopSent).toBe(true);
+    expect(sent.map((s) => s.method)).toEqual(["session/stop", "v4/command", "session/close"]);
+    expect(collectStatus(server).sessions.map((s) => s.sessionId)).not.toContain(acpSid);
+  });
+
+  it("force close stops waiting once the cancelled turn settles", async () => {
+    const server = new ZcodeAcpServer();
+    const { acpSid, zcodeSid } = seedSession(server, { title: "settling" });
+    const sent: Array<{ method: string }> = [];
+    server.backend = {
+      isDead: false,
+      send: (method: string) => sent.push({ method }),
+    } as unknown as typeof server.backend;
+    const turn = { zcodeSid, cancelled: false };
+    server.pendingTurns.set(7, turn);
+    setForceSettleMsForTests(5_000);
+    const base = await bootClose(server);
+
+    // The turn loop's finally drops the pendingTurns entry while the close
+    // is in its settle window — the close must proceed without burning the
+    // full bound.
+    const resPromise = fetch(`${base}/sessions/${acpSid}/close`, {
+      method: "POST",
+      body: JSON.stringify({ force: true }),
+    });
+    await vi.waitFor(() => expect(turn.cancelled).toBe(true));
+    server.pendingTurns.delete(7);
+    const startedAt = Date.now();
+    const res = await resPromise;
+    expect(res.status).toBe(200);
+    expect(Date.now() - startedAt).toBeLessThan(2_500);
+    expect(sent.map((s) => s.method)).toContain("session/close");
+  });
+
+  it("answers 400 for a malformed close body", async () => {
+    const server = new ZcodeAcpServer();
+    const { acpSid } = seedSession(server);
+    const base = await bootClose(server);
+
+    const res = await fetch(`${base}/sessions/${acpSid}/close`, {
+      method: "POST",
+      body: "not json",
+    });
+    expect(res.status).toBe(400);
   });
 
   it("answers 404 for an unknown session and 405 for non-POST", async () => {

@@ -1190,12 +1190,19 @@ describe("hub terminal-TUI session create (session binding + slow-window fallbac
 describe("hub Desktop Presence (ADR-0016 amendment)", () => {
   const PROJECT = "/Users/dev/Develop/demo";
   const auth = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
-  const post = (hub: HubHandle, body: Record<string, unknown>): Promise<Response> =>
+  const post = (
+    hub: HubHandle,
+    body: Record<string, unknown>,
+    headers: Record<string, string> = {},
+  ): Promise<Response> =>
     fetch(`http://127.0.0.1:${hub.port}/api/instances`, {
       method: "POST",
-      headers: auth,
+      headers: { ...auth, ...headers },
       body: JSON.stringify(body),
     });
+  /** A POST stamped the way every desktop-client hub call is (header identity). */
+  const postDesktop = (hub: HubHandle, body: Record<string, unknown>): Promise<Response> =>
+    post(hub, body, { "x-zcode-client": DESKTOP_CLIENT_NAME });
 
   let fakeChild: EventEmitter & { pid: number; exitCode: number | null; signalCode: string | null };
   let spawnCalls: Array<{
@@ -1402,9 +1409,11 @@ describe("hub Desktop Presence (ADR-0016 amendment)", () => {
     expect((await second).status).toBe(200);
   });
 
-  it("resume keeps its visible TUI under presence (ADR-0017 untouched)", async () => {
-    // Presence gates NEW sessions only: a resume's window is ADR-0017's own
-    // feature and stays visible while the desktop client is connected.
+  it("resume incubates headless while a desktop client is connected (ADR-0010)", async () => {
+    // ADR-0010's Desktop Presence gates every NEW incubation — a resume of a
+    // closed session included: the desktop app loads the session itself
+    // after attach, so a terminal window would re-render the stream for
+    // nobody. Mobile-originated resumes keep the ADR-0017 window (next test).
     const hub = await startTestHub({ spawnServe: spawnServeSpy() });
     const echo = track(
       await startEchoBridge(),
@@ -1420,12 +1429,74 @@ describe("hub Desktop Presence (ADR-0016 amendment)", () => {
     const pending = post(hub, { workspacePath: PROJECT, sessionId: "sess_closed" });
     await new Promise((r) => setTimeout(r, 400)); // one poll tick
     expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    expect(spawnCalls[0]!.launch).toBeUndefined();
+    // The resume id still rides the env (a serve bridge ignores it; the
+    // attaching desktop's session/load is what resumes the conversation).
+    expect(spawnCalls[0]!.env.ZCODE_ACP_RESUME_SESSION).toBe("sess_closed");
+    await registerServeBridge(hub, "resume-headless", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "resume-headless", reused: false });
+  });
+
+  it("a resume without any desktop signal keeps its visible TUI (ADR-0017)", async () => {
+    // No desktop connection, no desktop header — the mobile resume's window
+    // is ADR-0017's own surface and stays.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const echo = track(
+      await startEchoBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: echo.port })),
+    });
+    await connectClient(hub); // the mobile App — no clientInfo
+
+    const pending = post(hub, { workspacePath: PROJECT, sessionId: "sess_closed" });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
     expect(spawnCalls[0]!.kind).toBe("tui");
     expect(spawnCalls[0]!.env.ZCODE_ACP_RESUME_SESSION).toBe("sess_closed");
     await registerServeBridge(hub, "resume-tui", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
     const res = await pending;
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ id: "resume-tui", reused: false });
+  });
+
+  it("the request identity header alone incubates create headless (cold hub)", async () => {
+    // The cold-start gap: a fresh hub has instances 0 — nothing to proxy, so
+    // connection presence cannot exist yet and the FIRST create used to open
+    // a terminal. The desktop client stamps every hub HTTP call with its
+    // clientInfo name; the request itself is presence.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const pending = postDesktop(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    expect(spawnCalls[0]!.launch).toBeUndefined();
+    // The create-session bind env rides along unchanged (a serve bridge
+    // ignores it; the attaching client's session/new is what mints the id).
+    expect(spawnCalls[0]!.env.ZCODE_ACP_BOOT_CREATE_SESSION).toBe("1");
+    await registerServeBridge(hub, "cold-headless", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "cold-headless", reused: false });
+  });
+
+  it("the request identity header makes a cold resume headless too", async () => {
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const pending = postDesktop(hub, { workspacePath: PROJECT, sessionId: "sess_closed" });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    expect(spawnCalls[0]!.env.ZCODE_ACP_RESUME_SESSION).toBe("sess_closed");
+    await registerServeBridge(hub, "cold-resume", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "cold-resume", reused: false });
   });
 
   it("initializeClientName reads the identity off the wire frame", () => {

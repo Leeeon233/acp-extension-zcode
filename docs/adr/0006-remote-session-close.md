@@ -26,6 +26,20 @@ in-use signal, a pending turn, is rejected outright (409). A bridge-restart
 auto-resume alone does not resurrect a closed session — `registerSession`
 writes a summary with `hasActivity` unset.
 
+Amendment (2026-10-20) — force close. The 409 guard protects conversations
+from a mere list refresh, but it also blocks the client that MEANT to
+terminate: a desktop user pressing "End session" on a running conversation
+got the refusal and no path to act on it (observed live: the session kept
+generating until the user walked to the hosting CLI window and stopped it
+there). A close body `{"force":true}` now opts an explicit gesture through:
+the bridge applies ESC semantics without a client connection (flag the
+session's in-flight turns cancelled, fire the stop pair), waits a bounded
+~3s for them to settle so the stop's terminal event persists partial output,
+then proceeds with the eviction regardless — the `session/close` runtime
+eviction already documented as the drain gate's kill escalation finishes any
+generation that ignored the stop. Plain close keeps the refuse-when-running
+contract; nothing changes for clients that send no body.
+
 The hub stays a router (ADR-0002): the POST is forwarded by instance id and
 session id only; the running guard and retirement semantics live in the
 bridge. One implementation note for future write proxies: aborting the

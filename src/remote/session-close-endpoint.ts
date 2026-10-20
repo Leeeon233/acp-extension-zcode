@@ -22,6 +22,7 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import process from "node:process";
 
+import { cancelSessionTurns } from "../handlers/session.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { log } from "../utils.js";
 import { stopPollersForSession } from "../workflow/poller.js";
@@ -43,6 +44,39 @@ function sendJson(res: ServerResponse, code: number, body: Record<string, unknow
 
 /** Grace before the bridge exits itself when the TUI group signal missed. */
 const SELF_EXIT_MS = 1_500;
+
+/**
+ * Force close: how long to wait for the cancelled turn(s) to settle before
+ * evicting the resident runtime anyway (the eviction kills any generation
+ * that ignored the stop pair). Test hook override via the setter below.
+ */
+export let forceSettleMs = 3_000;
+
+/** Test hook: shrink the force-close settle bound so tests don't sleep. */
+export function setForceSettleMsForTests(ms: number): void {
+  forceSettleMs = ms;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const MAX_CLOSE_BODY_BYTES = 256;
+
+/**
+ * Read the optional close body without trusting Content-Type (the hub's
+ * forward-and-relay proxy pipes bytes through without forwarding headers).
+ * Empty body → undefined; anything malformed throws for the 400 path.
+ */
+async function readCloseBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_CLOSE_BODY_BYTES) throw new Error("body too large");
+    chunks.push(chunk as Buffer);
+  }
+  if (chunks.length === 0) return undefined;
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
 
 export interface ServeTerminateDecision {
   /** Terminate this bridge once the close response has flushed. */
@@ -149,8 +183,17 @@ async function handleClose(
   res: ServerResponse,
   sessionId: string,
 ): Promise<void> {
-  // Consume any request body so the client's connection drains cleanly.
-  req.resume();
+  // Optional JSON body: {force: true} stops an in-flight turn before closing
+  // (an explicit terminate gesture — the desktop's End session). Absent body
+  // keeps the plain ADR-0006 contract.
+  let body: unknown;
+  try {
+    body = await readCloseBody(req);
+  } catch {
+    sendText(res, 400, "invalid body");
+    return;
+  }
+  const force = (body as { force?: unknown } | undefined)?.force === true;
 
   // An empty REMOTE-created placeholder (no turn yet) has no summary but IS
   // advertised by discovery — it must be closable too, or it blocks the
@@ -160,9 +203,26 @@ async function handleClose(
     return;
   }
   const zcodeSid = server.resolveSid(sessionId);
-  if (zcodeSid && [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid)) {
-    sendText(res, 409, "session is running — cancel the turn first");
+  const running =
+    zcodeSid !== undefined &&
+    [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
+  if (running && !force) {
+    sendText(res, 409, 'session is running — cancel the turn first (or send {"force":true})');
     return;
+  }
+  if (running && zcodeSid !== undefined) {
+    // Force close (ADR-0006 amendment): ESC semantics without a client
+    // connection — flag the turns cancelled, fire the stop pair, then give
+    // them a bounded window to settle (the stop's terminal event persists
+    // partial output cleanly) before the runtime eviction below proceeds
+    // regardless. The eviction kills any generation that ignored the stop.
+    cancelSessionTurns(server, zcodeSid);
+    log(`remote: force close cancelling in-flight turn(s) for ${zcodeSid}`);
+    const deadline = Date.now() + forceSettleMs;
+    while (Date.now() < deadline) {
+      if (![...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid)) break;
+      await sleep(50);
+    }
   }
   server.sessionSummaries.delete(sessionId);
   server.remoteCreatedSessions.delete(sessionId);

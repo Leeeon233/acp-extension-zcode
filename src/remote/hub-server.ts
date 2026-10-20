@@ -1167,6 +1167,22 @@ export function initializeClientName(data: RawData): string | null | undefined {
 }
 
 /**
+ * Desktop Presence request identity (amendment to ADR-0016): the desktop
+ * client stamps every hub HTTP call with its clientInfo name. Connection
+ * presence (`desktopPairs`) needs a proxied ACP connection to a bridge, so a
+ * cold hub (instances: 0, nothing to connect to) would open a terminal for
+ * the very FIRST session create — the request itself is the one presence
+ * signal that always exists.
+ */
+const DESKTOP_CLIENT_HEADER = "x-zcode-client";
+
+function requestIsDesktopClient(req: IncomingMessage): boolean {
+  const value = req.headers[DESKTOP_CLIENT_HEADER];
+  if (typeof value === "string") return value === DESKTOP_CLIENT_NAME;
+  return Array.isArray(value) && value.includes(DESKTOP_CLIENT_NAME);
+}
+
+/**
  * Start the hub. Resolves once listening; rejects on bind failure (including
  * EADDRINUSE when another hub already owns the port).
  */
@@ -1269,6 +1285,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     kind: "tui" | "serve" | "resume",
     sessionId?: string,
     tabTitle?: string,
+    desktopCreate = false,
   ): Promise<{ id: string; reused: boolean }> => {
     // Async spawn failures (ENOENT — the dir vanished between the whitelist
     // check and the spawn) arrive as an 'error' event with exitCode still
@@ -1361,20 +1378,26 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       env.ZCODE_ACP_TAB_TITLE = sessionTabTitle(tabTitle, workspacePath);
     }
     // Desktop Presence (amendment to ADR-0016): while a desktop client is
-    // connected, session-create takes the headless serve form — the desktop
-    // app is the presenting surface, so a terminal window would re-render the
-    // same stream for nobody. Equivalent to the exhausted-terminal-list
-    // fallback: the launch list is empty, so openNextTerminal yields to the
-    // detached serve spawn at once. Checked once, here, at session-creation
-    // time (a desktop client dropping mid-flight never opens a window
-    // retroactively). Resume keeps its window (ADR-0017) and the listing was
-    // already headless; `ZCODE_ACP_HUB_TERMINAL=0` stays the static variant.
-    const desktopPresent = kind === "tui" && desktopPairs.size > 0;
+    // connected — OR the request itself is the desktop client (header
+    // identity; a cold hub has no proxied connection yet) — session-create
+    // AND resume incubate in the headless serve form: the desktop app is the
+    // presenting surface, so a terminal window would re-render the same
+    // stream for nobody (a resume's window was ADR-0017's mobile surface; a
+    // desktop-originated resume loads the session itself after attach).
+    // Equivalent to the exhausted-terminal-list fallback: the launch list is
+    // empty, so openNextTerminal yields to the detached serve spawn at once.
+    // Checked once, here, at session-creation time (a desktop client dropping
+    // mid-flight never opens a window retroactively). The listing was already
+    // headless; `ZCODE_ACP_HUB_TERMINAL=0` stays the static variant.
+    const desktopPresent =
+      (kind === "tui" || kind === "resume") && (desktopPairs.size > 0 || desktopCreate);
     if (desktopPresent) {
       // warn (not log): the daemon's stderr is null in production, so the
       // diary is the only place this state change is observable.
       warn(
-        `hub: desktop client connected — incubating ${workspacePath} headless (Desktop Presence)`,
+        `hub: desktop client connected — incubating ${workspacePath} headless (Desktop Presence${
+          desktopCreate ? ", request identity" : ""
+        })`,
       );
     }
     // Terminal preference list (ADR-0016 amendment): visible-terminal kinds
@@ -1570,6 +1593,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     kind: "tui" | "serve" | "resume",
     sessionId?: string,
     tabTitle?: string,
+    desktopCreate = false,
   ): Promise<{ id: string; reused: boolean }> => {
     const mapKey =
       kind === "resume" ? `${workspacePath}\u0000resume\u0000${sessionId ?? ""}` : workspacePath;
@@ -1578,7 +1602,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       log(`hub: joining the incubating serve bridge for ${workspacePath}`);
       return inflight.promise;
     }
-    const promise = incubateServe(workspacePath, kind, sessionId, tabTitle);
+    const promise = incubateServe(workspacePath, kind, sessionId, tabTitle, desktopCreate);
     serveIncubations.set(mapKey, { kind, promise });
     // Drop the entry once settled (identity-checked — a newer incubation may
     // already have replaced it). The catch keeps the DERIVED promise handled;
@@ -2198,12 +2222,20 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           tabTitle = sanitizeTabTitle((row as { title?: unknown } | undefined)?.title);
         }
         // Resume never reuses the live serve bridge: the window IS the
-        // feature, and the answer must be the NEW instance so the attaching
-        // client and the terminal share one bridge (and one backend process)
-        // for the session. A bogus id still opens the window — the TUI
-        // shows the load failure and falls back to a fresh session, the same
-        // honesty as a window that dies early (ADR-0016 §4).
-        const incubation = joinIncubation(workspacePath, "resume", resumeSid, tabTitle);
+        // feature for MOBILE-originated resumes (the attaching client and the
+        // terminal share one bridge and one backend process for the session;
+        // ADR-0017) — but a desktop-originated resume incubates headless (the
+        // desktop loads the session itself after attach; Desktop Presence
+        // request identity). A bogus id still gets its honest spawn — the
+        // surface shows the load failure and falls back to a fresh session,
+        // the same honesty as a window that dies early (ADR-0016 §4).
+        const incubation = joinIncubation(
+          workspacePath,
+          "resume",
+          resumeSid,
+          tabTitle,
+          requestIsDesktopClient(req),
+        );
         try {
           const out = await incubation;
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -2215,15 +2247,24 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         return;
       }
       // Session-create ALWAYS incubates a VISIBLE terminal TUI (ADR-0016 as
-      // amended): the App flow lists the project's history first, which
+      // amended) — UNLESS Desktop Presence applies (a connected desktop
+      // client, or this request carrying the desktop identity header — the
+      // cold-start gap: a fresh hub has no proxied connection to key
+      // presence on). The App flow lists the project's history first, which
       // incubates a headless serve bridge — reusing that instance (the
       // original behaviour) meant a window could NEVER open once the project
       // was browsed, and every create ran invisibly in the background. The
-      // answer is the NEW window's instance; concurrent identical POSTs join
+      // answer is the NEW spawn's instance; concurrent identical POSTs join
       // one incubation, and the detached headless serve spawn remains the
       // fallback (no GUI / gated off / open failure). Clients that want a
       // headless attach use the listing's instance id instead of this POST.
-      const incubation = joinIncubation(workspacePath, "tui");
+      const incubation = joinIncubation(
+        workspacePath,
+        "tui",
+        undefined,
+        undefined,
+        requestIsDesktopClient(req),
+      );
       try {
         const out = await incubation;
         res.writeHead(200, { "Content-Type": "application/json" });

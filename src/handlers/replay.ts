@@ -629,6 +629,13 @@ export async function replayMessages(
             status: (st.status as acp.ToolCallStatus) ?? "completed",
             ...(content.length > 0 ? { content } : {}),
             ...(histToolName ? { _meta: { claudeCode: { toolName: histToolName } } } : {}),
+            // Key the card to its own history message so clients group it
+            // with that message's text — their id-less-card fallback now
+            // mints a separate card message (right for live sub-agent cards,
+            // wrong for stored per-message tool parts). The SDK's ToolCall
+            // type predates the field (upstream ACP added messageId to
+            // tool_call); the spread keeps the rest of the literal checked.
+            ...({ messageId: mid } as { messageId: string }),
           }),
         });
       }

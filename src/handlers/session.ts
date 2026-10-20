@@ -2145,9 +2145,7 @@ export async function runOneTurn(
     const stillBusy = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
     await emitTurnState(
       stillBusy,
-      lastUsage
-        ? { usage: lastUsage, turnMs: Date.now() - turnStartedAt }
-        : undefined,
+      lastUsage ? { usage: lastUsage, turnMs: Date.now() - turnStartedAt } : undefined,
     );
     // Start the armed auto-compact ONLY now, after deregistration and the
     // running:false turnState: from here on a cancel or follow-up prompt finds
@@ -2551,12 +2549,26 @@ export async function cancel(
   noteUserActivity(server);
   const zcodeSid = server.resolveSid(params.sessionId);
   if (!zcodeSid) return;
-  // Cancel ALL matching turns for this session (not just the first). While a
-  // prior turn is still finalising, pendingTurns holds both it and any newer
-  // prompt waiting on the backend's prompt lock; breaking on the first match
-  // could leave the live one running. Each turn guards its own stopSent, so
-  // multiple matching turns may each fire the stop pair once — the backend
-  // treats both as idempotent, so the duplicate is harmless.
+  cancelSessionTurns(server, zcodeSid);
+  log(`session/cancel → ${zcodeSid}`);
+}
+
+/**
+ * Flag every in-flight turn of one session cancelled and fire the stop pair.
+ * Cancel ALL matching turns (not just the first): while a prior turn is still
+ * finalising, pendingTurns holds both it and any newer prompt waiting on the
+ * backend's prompt lock; breaking on the first match could leave the live one
+ * running. Each turn guards its own stopSent, so multiple matching turns may
+ * each fire the stop pair once — the backend treats both as idempotent.
+ *
+ * When nothing matched, a goal loop on the session gets a pause request
+ * instead: ESC during a goal loop's quiet windows (compact()'s internal wait,
+ * the judge/announce awaits) has no pendingTurns entry to flag. Best-effort;
+ * never breaks the caller for non-goal sessions. Returns whether any turn
+ * matched. Exported for the remote force-close path, which needs ESC
+ * semantics without a client connection.
+ */
+export function cancelSessionTurns(server: ZcodeAcpServer, zcodeSid: string): boolean {
   let matched = false;
   for (const [, turn] of server.pendingTurns) {
     if (turn.zcodeSid === zcodeSid) {
@@ -2571,10 +2583,6 @@ export async function cancel(
       server.lastCancelledAt.set(zcodeSid, Date.now());
     }
   }
-  // ESC during a goal loop's quiet windows (compact()'s internal wait, the
-  // judge/announce awaits) has no pendingTurns entry to flag — park the pause
-  // on the driver instead; it takes effect at the next round boundary.
-  // Best-effort: never break cancel for non-goal sessions.
   if (!matched) {
     try {
       server.goalLoops?.get(zcodeSid)?.requestPause();
@@ -2582,7 +2590,7 @@ export async function cancel(
       log(`goal-loop pause request failed: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
-  log(`session/cancel → ${zcodeSid}`);
+  return matched;
 }
 
 /**
