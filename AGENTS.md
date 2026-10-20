@@ -19,10 +19,12 @@ methods and streams events back as ACP `session/update` notifications.
 ## ZCode upstream source (open-sourced 2026-09)
 
 ZCode went open source (Apache-2.0): a local checkout lives at
-`~/Develop/NoBackup/ZCode` (remote `github.com/zai-org/ZCode`; synced to
-desktop 3.14.3 = app-server/`apps/zcode-cli` 0.16.9 — same version the bridge
-runs today; the 3.14.3 release was workflow-internal only, see
-docs/BACKLOG.md). The agent runtime is under `apps/zcode-cli/packages/core/`;
+`~/Develop/NoBackup/ZCode` (remote `github.com/zai-org/ZCode`; checkout synced
+to source root 3.16.1 = app-server/`apps/zcode-cli` 0.17.0, commit `0a1fc56d`,
+audited 2026-10-19 with no bridge impact — see docs/BACKLOG.md; the bridge
+runs desktop 3.15.3, which still bundles the 0.16.9 CLI: every Gotchas
+behavior note below is 0.16.9-sourced and stays live until the desktop
+updates to 3.16.x). The agent runtime is under `apps/zcode-cli/packages/core/`;
 `packages/zcode-server-cli` is only a thin CLI shell. **Read the source BEFORE
 probing or reverse-engineering the bundled CLI** — every "verified against
 app-server" note in Gotchas below predates it and now has an authoritative
@@ -797,7 +799,7 @@ payload}` for years and the translator read `payload["turnId"]`, which on
     user decision with persistence semantics (reject_always writes the deny
     list); the timeout's continuation says "denied for the rest of this
     automated run — write inside granted directories", never "forever".
-  Well-known system temp trees (/tmp → /private/tmp,
+    Well-known system temp trees (/tmp → /private/tmp,
     /var/tmp, /private/var/folders) are DEFAULT-ALLOWED — tools hardcode /tmp
     and $TMPDIR names only the per-user /var/folders leaf; don't "tighten"
     them back into popup storms (verify-sandbox.sh fixtures moved to HOME for

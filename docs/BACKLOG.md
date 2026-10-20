@@ -109,6 +109,40 @@ New in 3.15.1, bridge-relevant:
      v3 payloads gained only OPTIONAL fields (`turn.started.executionStartedAt`,
      permission `approvalMode`, `session/read` `contentProfile`).
 
+**3.16.1 sync (2026-10-19, commit `0a1fc56d` — checkout synced, protocol
+surface audited, no bridge action)**: first CLI bump since 3.14 — app-server
+`0.16.9` → `0.17.0` (source root 3.15.1 → 3.16.1; 4,502 files, mostly desktop
+E2E/UI). The desktop on this machine is 3.15.3 (still bundles the 0.16.9-era
+`zcode.cjs`) — nothing changes for a running bridge today; this note covers the
+next desktop update. Protocol drift is small and additive except ONE param
+removal: `session/list` dropped `includeArchived` and now filters `deleted`
+rows itself (plus parent-chain ownership proofs for explicit `sessionIds`
+queries — `listSessions` rewrite). The bridge never sends `includeArchived`
+and applies its own tasks-index tombstone filter, so both are no-ops here.
+Additive surface: `additionalDirectories` (optional) on `session/create` +
+`session/resume`; `toolSearchMode` (default `"off"`) + `additionalDirectories`
+on the `session/requestRuntimePreferences` RESULT schema — the bridge's
+three-field auto-reply (`src/backend/client.ts`) still validates: the schema
+stays `.strict()`, every sent key is known, new fields carry defaults; new
+`provider/refreshRegistry` method (worker rebuilds its in-process registry
+from the Environment's config store — a host-side companion to
+`provider/updateAccountConfig`, which is unchanged); MCP server `alwaysLoad`;
+runtime capability `historyFirst`. Verified zero-diff on every Gotchas-cited
+behavior file: the provider bootstrap quartet (`provider-runtime-env.ts`,
+`runtime-paths.ts`, `zcode-builtin-provider-config-source.ts`,
+`registry-service.ts`), `model-catalog-port.ts` (the `values.at(-1)`
+default-level rule), `session-mode-port.ts`, `execution-state.ts`, the
+setModel/resume schemas, and the runtime-headers path. `server-operations.ts`
+moved 238 lines but no hunk touches the stop/compact/send-busy turn loop
+(`sendPrompt`'s `activeAbortController`, compact's `state.updated` swallow,
+the `-32010` window) — hunks are listSessions, createWithProjection,
+activateSessionForResume, background-turn allowlist, runtime-prefs resolution.
+`session-flow.ts` (+31/−9) is Highspeed selection queueing (queue items keep
+only the ordinary selection; execution bundles stay in-memory) — internal v4
+queue mechanics, the v4 stop path is untouched. Model-selection persistence
+semantics unchanged (`ensureSessionPersisted` / `restorePersistedModelSelection`;
+`turn-model.ts` adds Highspeed/off-peak capture, not persistence).
+
 **3.14.0 audit (2026-09-20, app-server 0.16.9 — live-probed end to end)**: the
 dynamic-workflow family (ten model tools led by `CreateWorkflow`) is OFF by
 default headless and enabled per PROCESS via
