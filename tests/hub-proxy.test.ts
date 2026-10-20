@@ -214,6 +214,48 @@ describe("hub WS proxy", () => {
       expect(client.readyState).not.toBe(WebSocket.OPEN);
     }
   });
+
+  it("a corpse instance: dial failure answers 502 and prunes the registration", async () => {
+    // Regression (observed 2026-10-20): a serve bridge self-exits ~1.5s
+    // after its last session closes, but the registration lives until the
+    // heartbeat TTL — every attach in that window dialed the corpse, and
+    // Bun's WebSocket reported the failed connect through a second dispatch
+    // path that landed as an unhandled 'error' (uncaught exception in the
+    // diary). The dial must fail cleanly (502, no throw) AND prune so the
+    // client's next attempt reads "unknown instance" and re-incubates
+    // instead of retrying the corpse for the whole TTL.
+    const hub = await startTestHub();
+    // A definitely-closed port: bind ephemeral, then release.
+    const probe = createServer();
+    const closedPort = await new Promise<number>((resolve) => {
+      probe.listen(0, "127.0.0.1", () => {
+        const addr = probe.address();
+        const port = typeof addr === "object" && addr ? addr.port : 0;
+        probe.close(() => resolve(port));
+      });
+    });
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: closedPort })),
+    });
+    const before = (await (await listInstances(hub)).json()) as Array<{ id: string }>;
+    expect(before.map((i) => i.id)).toContain("inst-1");
+
+    const client = new WebSocket(`ws://127.0.0.1:${hub.port}/acp?instance=inst-1&token=${TOKEN}`);
+    const failed = new Promise<void>((resolve, reject) => {
+      client.once("error", (e: Error) => {
+        // ws surfaces the written 502 as an unexpected server response.
+        if (!e.message.includes("502")) reject(new Error(`expected 502, got: ${e.message}`));
+        else resolve();
+      });
+    });
+    await withTimeout(failed, 3000, "corpse dial 502");
+
+    // The registration is gone — the next attempt reads "unknown instance".
+    const after = (await (await listInstances(hub)).json()) as Array<{ id: string }>;
+    expect(after.map((i) => i.id)).not.toContain("inst-1");
+  });
 });
 
 describe("hub remote session-create (ADR-0014)", () => {

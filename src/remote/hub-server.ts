@@ -1737,14 +1737,32 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     };
     socket.once("close", onClientGone);
     socket.once("error", onClientGone);
-    bridge.once("open", () => {
-      if (clientGone) return; // terminated above; "open" can no longer fire
+    // Dial-phase guard: exactly one of open/fail settles the upgrade. The
+    // error path must stay attached AFTER the first emission (Bun's
+    // WebSocket reports one failed connect through two dispatch paths —
+    // once via the listener, once as an unhandled 'error' — observed live
+    // 2026-10-20: a corpse dial logged the warn AND threw an uncaught
+    // ErrorEvent), and must never fire into an upgraded socket.
+    let settled = false;
+    bridge.on("open", () => {
+      if (settled || clientGone) return; // terminated above; "open" is moot
+      settled = true;
       socket.removeListener("close", onClientGone);
       socket.removeListener("error", onClientGone);
       wss.handleUpgrade(req, socket, head, (client) => startProxy(client, bridge));
     });
-    bridge.once("error", (e) => {
+    bridge.on("error", (e: Error) => {
+      if (settled) return;
+      settled = true;
       warn(`hub: dial bridge :${entry.port} failed: ${e.message}`);
+      // ECONNREFUSED on loopback means nothing is bound — the bridge process
+      // is gone (a busy-but-alive bridge's OS backlog still accepts). Prune
+      // now so the next client attempt reads "unknown instance" and falls
+      // back to re-incubation, instead of dialing a corpse until the
+      // heartbeat TTL expires. A wrong prune self-heals on the bridge's next
+      // heartbeat.
+      instances.delete(entry.id);
+      idleSince = null; // re-arm the idle clock on membership change
       rejectUpgrade(socket, 502, "Bridge Unreachable");
     });
   });
