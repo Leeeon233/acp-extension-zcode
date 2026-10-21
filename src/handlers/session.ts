@@ -1656,14 +1656,20 @@ export async function runOneTurn(
   // below (respawn swaps the process they are bound to).
   let backend = opts.backend;
   const attachments = opts.attachments ?? [];
-  // Out-of-band running indicator: emitted per attached alias (see
+  // Out-of-band running indicator, BROADCAST to every attached client (no
+  // cx): the prompting connection is a registry member too, so it still
+  // receives the transition exactly once. Attach-only clients depend on the
+  // END transition to clear their running state and flush queued follow-ups
+  // — a cx-targeted emit never reached them, so force-sending from an
+  // attached client cancelled the foreign turn but never sent the queued
+  // message (observed 2026-10-21). Emitted per attached alias (see
   // server.sessionAliases) so a client holding this conversation under a
   // different ACP id opens its live turn too. Best-effort: a dead client must
   // not fail the turn. The END transition carries the turn's usage + wall
   // time (see emitSessionTurnState) so attach-only clients can paint their
   // cache/speed readouts for turns driven from elsewhere.
   const emitTurnState = (running: boolean, extras?: { usage?: acp.Usage; turnMs?: number }) =>
-    emitSessionTurnState(server, acpSid, running, cx, extras);
+    emitSessionTurnState(server, acpSid, running, undefined, extras);
   const turnStartedAt = Date.now();
   let lastUsage: acp.Usage | undefined;
 
@@ -2422,11 +2428,15 @@ async function runPrompt(
   }
   // Out-of-band running indicator: clients that did not send this prompt
   // (re-attached mobile, second editor) learn the turn started here — the
-  // session/load replayMeta only snapshots attach time. Emitted per attached
-  // alias (see server.sessionAliases) so a client holding this conversation
-  // under a different ACP id opens its live turn too. Best-effort: a dead
-  // client must not fail the turn.
-  await emitSessionTurnState(server, params.sessionId, true, cx);
+  // session/load replayMeta only snapshots attach time. Broadcast (no cx):
+  // a cx-targeted emit reached only the prompter, so an attached client's
+  // is_running stuck true for foreign turns and its queued follow-ups never
+  // flushed (force-send from the desktop app dead-ended exactly there,
+  // observed 2026-10-21). Emitted per attached alias (see
+  // server.sessionAliases) so a client holding this conversation under a
+  // different ACP id opens its live turn too. Best-effort: a dead client
+  // must not fail the turn.
+  await emitSessionTurnState(server, params.sessionId, true);
 
   // Settled-event push (§5.2): one notification per user turn. Client presence
   // is deliberately irrelevant — the turn ending IS the "come back" signal.

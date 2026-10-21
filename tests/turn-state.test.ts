@@ -32,8 +32,11 @@ vi.mock("../src/tasks-index.js", () => ({
 
 type TurnStatePayload = { sessionId: string; running: boolean };
 
-/** cx that records every turnState notification payload, per method name. */
-function collectCx(): {
+/** cx that records every turnState notification payload, per method name.
+ * Registering it on the server mirrors production (every connection lives in
+ * the ClientRegistry) — the lifecycle transitions broadcast to the registry,
+ * not to the prompt() argument. */
+function collectCx(server?: ZcodeAcpServer): {
   cx: acp.AgentContext;
   /** Deprecated `$/zcode/turnState` payloads. */
   turnStates: TurnStatePayload[];
@@ -52,6 +55,7 @@ function collectCx(): {
     },
     request: async () => ({}),
   } as unknown as acp.AgentContext;
+  if (server) server.clients.add(cx);
   return { cx, turnStates, turnStatesV2 };
 }
 
@@ -243,7 +247,7 @@ describe("$/zcode/turnState emission", () => {
         { type: "turn.completed", payload: { resultType: "success" } },
       ]),
     );
-    const { cx, turnStates } = collectCx();
+    const { cx, turnStates } = collectCx(server);
 
     const result = await prompt(server, promptParams(), cx, 1);
 
@@ -265,12 +269,35 @@ describe("$/zcode/turnState emission", () => {
         { type: "turn.completed", payload: { resultType: "success" } },
       ]),
     );
-    const { cx, turnStates, turnStatesV2 } = collectCx();
+    const { cx, turnStates, turnStatesV2 } = collectCx(server);
 
     await prompt(server, promptParams(), cx, 9);
 
     expect(turnStatesV2).toEqual(turnStates);
     expect(turnStatesV2).toEqual([
+      { sessionId: "sess_ts", running: true },
+      { sessionId: "sess_ts", running: false },
+    ]);
+  });
+
+  it("delivers the lifecycle to attach-only clients that never prompted", async () => {
+    // Regression (2026-10-21): the transitions were cx-targeted, so a second
+    // client attached to the session (desktop watching a mobile-driven turn)
+    // never saw running:false — its is_running stuck true and a force-sent
+    // queued prompt never flushed. The lifecycle must reach every registered
+    // client, not just the prompting connection.
+    const server = setup(
+      scriptedBackend(() => [
+        { type: "turn.started" },
+        { type: "turn.completed", payload: { resultType: "success" } },
+      ]),
+    );
+    const { cx } = collectCx(server);
+    const watcher = collectCx(server);
+
+    await prompt(server, promptParams(), cx, 11);
+
+    expect(watcher.turnStates).toEqual([
       { sessionId: "sess_ts", running: true },
       { sessionId: "sess_ts", running: false },
     ]);
@@ -285,7 +312,7 @@ describe("$/zcode/turnState emission", () => {
         ? { error: { code: -32000, message: "boom" } }
         : { result: {} };
     const server = setup(backend);
-    const { cx, turnStates } = collectCx();
+    const { cx, turnStates } = collectCx(server);
 
     await expect(prompt(server, promptParams(), cx, 2)).rejects.toThrow();
 
@@ -339,7 +366,7 @@ describe("$/zcode/turnState emission", () => {
         },
       ]),
     );
-    const { cx, turnStates } = collectCx();
+    const { cx, turnStates } = collectCx(server);
 
     const error = await prompt(server, promptParams(), cx, 3).then(
       () => null,
@@ -388,7 +415,7 @@ describe("$/zcode/turnState emission", () => {
         ];
       }),
     );
-    const { cx, turnStates } = collectCx();
+    const { cx, turnStates } = collectCx(server);
 
     const p1 = prompt(server, promptParams(), cx, 101);
     // Wait until turn 1 has been accepted and parked in its event loop (its

@@ -360,7 +360,13 @@ export const TURN_STATE_METHODS = ["$/zcode/turnState", "_zcode/turnState"] as c
  * running:true at start and settles it only if this run raised it) — so a
  * client that tracks only turns reads every busy window, not just model turns.
  * `cx` targets one connection; without it the notification fans out to every
- * attached client. Failures are per-alias and logged, never thrown.
+ * attached client. The turn LIFECYCLE transitions (runOneTurn's start/end)
+ * must broadcast — attach-only clients clear their running state and flush
+ * queued follow-ups off the END transition, which a cx-targeted emit never
+ * delivered (force-send from an attached client dead-ended, 2026-10-21);
+ * early-return paths keep `cx` so one client's rejected prompt cannot clear
+ * another client's genuinely running turn. Failures are per-alias and logged,
+ * never thrown.
  *
  * The END transition (running:false) may carry the turn's ACP usage block
  * (`usage`, plus `turnMs` wall time): PromptResponse.usage reaches only the
@@ -384,9 +390,7 @@ export async function emitSessionTurnState(
     server
       .sessionAliases(acpSid)
       .flatMap((sid) =>
-        TURN_STATE_METHODS.map((method) =>
-          targetCx.notify(method, { ...params, sessionId: sid }),
-        ),
+        TURN_STATE_METHODS.map((method) => targetCx.notify(method, { ...params, sessionId: sid })),
       ),
   );
   for (const r of results) {
