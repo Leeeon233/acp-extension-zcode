@@ -1541,6 +1541,120 @@ describe("hub Desktop Presence (ADR-0016 amendment)", () => {
     expect(await res.json()).toEqual({ id: "cold-resume", reused: false });
   });
 
+  /** The desktop app's discovery poll: GET /api/instances stamped with its identity. */
+  const desktopPoll = (hub: HubHandle, token = TOKEN): Promise<Response> =>
+    fetch(`http://127.0.0.1:${hub.port}/api/instances`, {
+      headers: { Authorization: `Bearer ${token}`, "x-zcode-client": DESKTOP_CLIENT_NAME },
+    });
+
+  it("a recent desktop poll keeps a phone create headless with no desktop connection at all", async () => {
+    // The idle-desktop gap: a serve bridge self-exits with its last session
+    // and connection presence ends with that proxied pair — but the running
+    // app still polls every 15s with its identity header. A create from the
+    // phone inside the TTL must not open a window next to the app.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    expect((await desktopPoll(hub)).status).toBe(200);
+
+    const pending = post(hub, { workspacePath: PROJECT }); // the phone: no header, no pair
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    expect(spawnCalls[0]!.launch).toBeUndefined();
+    await registerServeBridge(hub, "recent-headless", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "recent-headless", reused: false });
+  });
+
+  it("recent-request presence lapses after the TTL (the app quit)", async () => {
+    const hub = await startTestHub({ spawnServe: spawnServeSpy(), desktopPresenceTtlMs: 150 });
+    expect((await desktopPoll(hub)).status).toBe(200);
+    await new Promise((r) => setTimeout(r, 300)); // past the TTL — no poll came
+
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("tui");
+    await registerServeBridge(hub, "w-lapsed", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await pending).status).toBe(200);
+  });
+
+  it("an unauthorized stamped call is not presence", async () => {
+    // The header is a UX hint, the token is the boundary: a bare header on
+    // the network must not be able to suppress the user's windows.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    expect((await desktopPoll(hub, "wrong-token")).status).toBe(401);
+
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("tui");
+    await registerServeBridge(hub, "w-unauth", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await pending).status).toBe(200);
+  });
+
+  it("under presence a create reuses the workspace's live serve bridge instead of spawning", async () => {
+    // No window is coming, so one bridge (one backend process) per project
+    // hosts every session — the pre-ADR-0016 reuse, right again here. The
+    // client attaches with noAttach and session/new-s there.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    await registerServeBridge(hub, "live-serve");
+    const res = await postDesktop(hub, { workspacePath: PROJECT });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "live-serve", reused: true });
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("under presence a phone resume reuses the live serve bridge too (no window, no spawn)", async () => {
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    await registerServeBridge(hub, "live-serve");
+    expect((await desktopPoll(hub)).status).toBe(200); // the idle desktop app
+    const res = await post(hub, { workspacePath: PROJECT, sessionId: "sess_closed" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "live-serve", reused: true });
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("under presence a resume lands on the bridge already holding the session live", async () => {
+    // Two bridges must never load one conversation: the holder wins over the
+    // workspace's (older) serve bridge, whatever the holder's origin.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    await registerServeBridge(hub, "serve-older");
+    const holder = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        registerBody({
+          id: "editor-holder",
+          workspace: PROJECT,
+          port: BASE_PORT + 60,
+          pid: 4343,
+          sessions: [{ sessionId: "sess_live", title: "live", updatedAt: 5 }],
+        }),
+      ),
+    });
+    expect(holder.ok).toBe(true);
+    const res = await postDesktop(hub, { workspacePath: PROJECT, sessionId: "sess_live" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "editor-holder", reused: true });
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("without any desktop signal a live serve bridge never pre-empts the window", async () => {
+    // The ADR-0016 contract, untouched: the phone alone still gets its TUI
+    // even though the listing's headless bridge is live.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    await registerServeBridge(hub, "listing-serve");
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("tui");
+    await registerServeBridge(hub, "window", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "window", reused: false });
+  });
+
   it("initializeClientName reads the identity off the wire frame", () => {
     const frame = (params: Record<string, unknown>) =>
       Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params }));

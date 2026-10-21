@@ -135,7 +135,13 @@ open_file). Hyper stays unsupported (no programmatic command execution,
 vercel/hyper#3677).
 Create NEVER reuses a live serve-origin instance (ADR-0016 as amended) —
 every create incubates its own window, and identical concurrent requests
-join the same in-flight spawn. A
+join the same in-flight spawn. Desktop Presence (app ADR-0010) inverts this
+while the ZCode ACP desktop app is present — a proxied connection initialized
+as `zcode-acp-remote-desktop`, an HTTP call stamped `x-zcode-client`, or such
+a call within the last 45s (the app's 15s discovery poll): no window opens
+for any client, create and resume answer with the workspace's live
+serve-origin instance (`reused: true`), and only a workspace without one
+spawns, headless. A
 terminal-TUI instance lives while its window lives; the headless fallback
 exits ~10 minutes after the last client detaches and the last turn
 finishes. Session roots are pinned to the project cwd in both surfaces

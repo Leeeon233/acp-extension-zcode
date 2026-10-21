@@ -215,6 +215,21 @@ POST {hub}/api/instances  body {"workspacePath":"/Users/me/proj"}
   spawn instead of racing a duplicate. A client that wants a HEADLESS attach
   should not POST at all — attach to the instance id the history listing
   already returns.
+- **Desktop Presence** (ADR-0016 amendment; app ADR-0010): while the ZCode
+  ACP desktop app is present, no window opens for anyone — create AND resume,
+  from the app, the phone, or the web alike — because the desktop app is the
+  presenting surface. The hub sees presence three ways: a proxied ACP
+  connection whose `initialize` carries `clientInfo.name:
+"zcode-acp-remote-desktop"`; an HTTP call stamped `x-zcode-client:
+zcode-acp-remote-desktop` (every desktop hub call is); or such a stamped
+  call within the last 45s — the app polls `GET /api/instances` every 15s
+  for its whole lifetime, so an idle app with no open tab (and therefore no
+  proxied connection) still counts. Under presence the reuse rule flips
+  back: a create or resume answers with the workspace's live serve-origin
+  instance (`reused: true`, nothing spawned) — a resume with the instance
+  already holding that session live, whatever its origin — and only a
+  workspace without one spawns, headless. Attach and `session/new` /
+  `session/load` exactly as after a headless fallback.
 - Lifetime depends on the surface: a terminal-TUI instance lives while its
   window lives (the owner closing it retires the bridge — re-create on
   demand); the headless fallback exists for remote interest only and exits
@@ -332,7 +347,9 @@ POST {hub}/api/instances  body {"workspacePath":"/Users/me/proj",
   CLI (Martty never sets a terminal title itself, so the name sticks).
   Resuming the same session
   twice pops two windows; only identical concurrent requests share one
-  incubation.
+  incubation. Desktop Presence changes both rules — no window opens, and the
+  live bridge that already holds (or can host) the session answers instead
+  (see the Desktop Presence bullet under session-create).
 - `sessionId` here is the backend store id (`sess_…`), which `session/load`
   accepts as-is (pass-through resume). The same conversation may also appear
   in discovery under a different (ACP) id — treat discovery as the
