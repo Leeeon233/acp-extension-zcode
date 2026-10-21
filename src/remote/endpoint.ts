@@ -52,6 +52,23 @@ interface AdvertisedSession {
 const HEARTBEAT_MS = 10_000;
 
 /**
+ * How long a heartbeat may wait for the discovery refresh before it registers
+ * with the previous list. A healthy `collectSessions` takes ~100-300ms; the
+ * cap only bites on a stalled one, where waiting further would push the
+ * register past the hub's 30s TTL. The in-flight refresh keeps running and
+ * its result rides the next heartbeat.
+ */
+const REFRESH_WAIT_MS = 1_500;
+
+/** Resolve after `ms`, without pinning the event loop (the heartbeat is unref'd). */
+function sleepUnref(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref();
+  });
+}
+
+/**
  * This process's boot instant, in epoch ms.
  *
  * Captured once at module load and read through `uptime()` rather than sampled
@@ -389,19 +406,51 @@ export async function startRemoteEndpoint(
   // Last-good session list: an unexpected collectSessions failure must not
   // blank the discovery payload, so we keep advertising the previous one.
   let lastSessions: AdvertisedSession[] = [];
-
-  const registerOnce = async (): Promise<void> => {
-    if (stopped) return;
-    // Project-scoped session list before every heartbeat (session/list merge,
-    // ~100-300ms). Skipped while token-rejected: the payload would be refused
-    // anyway, so keep advertising lastSessions until a hub accepts us again.
-    // Never throws; wrapped anyway so a surprise failure can't fall into the
-    // hub-spawn catch below (which would misread it as "hub unreachable").
-    if (!authRejected) {
+  // Single-flight guard for the discovery refresh. The heartbeat MUST NOT wait
+  // on it: collectSessions awaits a backend `session/list` (10s cap), and a
+  // busy backend holds that RPC for the whole wait — the register POST then
+  // slips past the hub's 30s TTL, the instance is pruned, and every WS
+  // upgrade for it answers "unknown instance" until a register lands again
+  // (observed 2026-10-21: a serve bridge stuck 2.5+ min mid-turn). The
+  // heartbeat races a bounded wait against the in-flight refresh and sends
+  // the previous list when it loses; discovery staleness is harmless (the hub
+  // re-reads live state through /api/instances?probe=1 and session/load).
+  let refreshing: Promise<void> | null = null;
+  let refreshedOnce = false;
+  const refreshSessions = (): Promise<void> => {
+    if (refreshing) return refreshing;
+    refreshing = (async () => {
       try {
         lastSessions = await collectSessions(server);
       } catch {
         /* keep lastSessions */
+      } finally {
+        refreshedOnce = true;
+        refreshing = null;
+      }
+    })();
+    return refreshing;
+  };
+
+  const registerOnce = async (): Promise<void> => {
+    if (stopped) return;
+    // Discovery refresh, decoupled from the register itself. Skipped while
+    // token-rejected: the payload would be refused anyway, so keep advertising
+    // lastSessions until a hub accepts us again.
+    //
+    // Only the FIRST registration (nothing advertised yet) waits, and only for
+    // a bounded moment; every later heartbeat registers at once with the
+    // previous list while the refresh runs in the background — its result
+    // rides the next heartbeat. A backend-busy collectSessions (it awaits a
+    // `session/list` with a 10s cap) must never delay a heartbeat past the
+    // hub's 30s TTL: that prunes the instance, and every WS upgrade for it
+    // answers "unknown instance" until a register lands again (observed
+    // 2026-10-21: a serve bridge stuck 2.5+ min mid-turn).
+    if (!authRejected) {
+      if (refreshedOnce) {
+        void refreshSessions();
+      } else {
+        await Promise.race([refreshSessions(), sleepUnref(REFRESH_WAIT_MS)]);
       }
     }
     try {

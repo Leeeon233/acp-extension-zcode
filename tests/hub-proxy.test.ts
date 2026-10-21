@@ -200,19 +200,48 @@ describe("hub WS proxy", () => {
 
   it("refuses WS upgrades with a bad token or unknown instance", async () => {
     const hub = await startTestHub();
-    const cases = [
-      `ws://127.0.0.1:${hub.port}/acp?instance=inst-1&token=wrong`,
-      `ws://127.0.0.1:${hub.port}/acp?instance=unknown&token=${TOKEN}`,
-    ];
-    for (const url of cases) {
-      const client = new WebSocket(url);
-      const closed = new Promise<void>((resolve) => {
-        client.once("error", () => resolve());
-        client.once("close", () => resolve());
-      });
-      await withTimeout(closed, 3000, "ws reject");
-      expect(client.readyState).not.toBe(WebSocket.OPEN);
+    // A registered instance, so the unknown-instance rejection has something
+    // to list under "known:" — that list is what tells an operator whether the
+    // client held a stale id or the bridge itself was pruned.
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody()),
+    });
+    // The rejection log must NAME the instance: diagnosing a live outage
+    // (2026-10-21) meant guessing which instance a client was attached to,
+    // because both rejections logged without an id.
+    const stderr: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const cases = [
+        `ws://127.0.0.1:${hub.port}/acp?instance=inst-1&token=wrong`,
+        `ws://127.0.0.1:${hub.port}/acp?instance=unknown&token=${TOKEN}`,
+      ];
+      for (const url of cases) {
+        const client = new WebSocket(url);
+        const closed = new Promise<void>((resolve) => {
+          client.once("error", () => resolve());
+          client.once("close", () => resolve());
+        });
+        await withTimeout(closed, 3000, "ws reject");
+        expect(client.readyState).not.toBe(WebSocket.OPEN);
+      }
+    } finally {
+      process.stderr.write = write;
     }
+    const log = stderr.join("");
+    // Unauthorized: names the requested instance.
+    expect(log).toContain("unauthorized WS upgrade rejected");
+    expect(log).toContain("instance=inst-1");
+    // Unknown instance: names the requested id AND what IS registered.
+    expect(log).toContain("unknown instance rejected");
+    expect(log).toContain("id=unknown");
+    expect(log).toMatch(/known: .*inst-1/);
   });
 
   it("a corpse instance: dial failure answers 502 and prunes the registration", async () => {

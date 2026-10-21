@@ -1758,13 +1758,24 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       return;
     }
     if (!authorized(req, url, token)) {
-      warn("hub: unauthorized WS upgrade rejected");
+      warn(
+        `hub: unauthorized WS upgrade rejected (instance=${url.searchParams.get("instance") ?? "<none>"})`,
+      );
       rejectUpgrade(socket, 401, "Unauthorized");
       return;
     }
-    const entry = instances.get(url.searchParams.get("instance") ?? "");
+    const requestedId = url.searchParams.get("instance") ?? "";
+    const entry = instances.get(requestedId);
     if (!entry) {
-      warn("hub: WS upgrade for unknown instance rejected");
+      // Name the id and what IS registered: a client attaching to a pruned
+      // instance (heartbeat slipped past the TTL) and a client holding a stale
+      // id look identical otherwise, and the hub log was the only evidence
+      // available for either (2026-10-21: a 2.5-minute outage had to be
+      // diagnosed without knowing which instance was rejected).
+      warn(
+        `hub: WS upgrade for unknown instance rejected (id=${requestedId || "<none>"}; ` +
+          `known: ${[...instances.keys()].join(", ") || "<none>"})`,
+      );
       rejectUpgrade(socket, 404, "Unknown Instance");
       return;
     }

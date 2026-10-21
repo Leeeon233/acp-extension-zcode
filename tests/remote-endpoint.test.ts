@@ -383,6 +383,71 @@ describe("hub version handshake (bridge side)", () => {
   });
 });
 
+describe("heartbeat independence from discovery refresh", () => {
+  it("keeps registering on schedule while the backend stalls session/list", async () => {
+    // Regression (2026-10-21): registerOnce awaited collectSessions first, and
+    // collectSessions awaits a backend `session/list` with a 10s cap. A busy
+    // backend held that RPC for the whole wait, so the register POST slipped
+    // past the hub's 30s instance TTL, the instance was pruned, and every WS
+    // upgrade for it answered "unknown instance" — clients saw a multi-minute
+    // outage mid-turn. The heartbeat must register on schedule regardless.
+    const bodies: Array<Record<string, unknown>> = [];
+    const mock = startMockHub(bodies, { ok: true });
+    trackStop(() => stopMockHub(mock));
+    await mock.ready;
+
+    const server = new ZcodeAcpServer();
+    // Stalled backend: session/list never settles, so collectSessions hangs.
+    // Marked live and advertising one session so collectSessions actually
+    // takes the backend path (it skips the RPC when nothing is live).
+    server.registerSession("s-stalled", "sess_stalled");
+    server.markSessionActive("s-stalled");
+    server.backend = {
+      isDead: false,
+      request: () => new Promise(() => undefined),
+    } as unknown as ZcodeBackend;
+
+    const app = acp
+      .agent({ name: AGENT_INFO.name })
+      .onRequest("initialize", (ctx) => server.initialize(ctx.params));
+    trackConnections(app, server.clients);
+    const endpoint = await startRemoteEndpoint(server, app, testConfig(mock.port, 18513));
+    expect(endpoint).not.toBeNull();
+    trackStop(() => endpoint!.stop());
+
+    // First register is bounded by REFRESH_WAIT_MS (1.5s) even with the stall.
+    await withTimeout(
+      new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (bodies.length >= 1) {
+            clearInterval(check);
+            resolve();
+          }
+        }, 25);
+      }),
+      10_000,
+      "first register under a stalled backend",
+    );
+
+    // The 10s heartbeat must keep landing: two more bodies inside ~25s.
+    await withTimeout(
+      new Promise<void>((resolve) => {
+        const check = setInterval(() => {
+          if (bodies.length >= 3) {
+            clearInterval(check);
+            resolve();
+          }
+        }, 50);
+      }),
+      25_000,
+      "heartbeats continue while collectSessions is stalled",
+    );
+    // The stalled refresh never produced a list; discovery degrades to empty
+    // rather than holding the payload back (session/load still serves).
+    expect(Array.isArray(bodies.at(-1)!.sessions)).toBe(true);
+  });
+});
+
 describe("hub 401 self-heal (token rotation)", () => {
   it("keeps heartbeating after 401s, spawns one hub with its own token, and recovers", async () => {
     childProcessSpawn.mockClear();
