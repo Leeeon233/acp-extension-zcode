@@ -519,27 +519,28 @@ a `providerId` and a network read, so fetch them from
 
 ### Write endpoints
 
-| Endpoint                                  | Effect          | Purpose                                     |
-| ----------------------------------------- | --------------- | ------------------------------------------- |
-| `PUT /settings/providers/{id}`            | `immediate`     | Enable/disable, rename                      |
-| `POST /settings/models`                   | `immediate`     | Add a model to an existing provider         |
-| `DELETE /settings/models/{pid}/{mid}`     | `immediate`     | Remove a model                              |
-| `POST /settings/skills/enable`            | `immediate`     | `{path, enable}`                            |
-| `DELETE /settings/skills/{path}`          | `immediate`     | Delete a skill directory                    |
-| `POST /settings/skills/copy-to-user`      | `immediate`     | Copy a workspace skill to `~/.zcode/skills` |
-| `PUT /settings/mcp/{name}`                | `needs-restart` | Create or update an MCP server              |
-| `DELETE /settings/mcp/{name}`             | `needs-restart` | Remove an MCP server                        |
-| `POST /settings/mcp/enable`               | `needs-restart` | `{name, enable}`                            |
-| `PUT /settings/hooks/{event}/{index}`     | `needs-restart` | Edit one existing hook entry                |
-| `POST /settings/hooks/enabled`            | `needs-restart` | `{enabled}` — the whole hooks tree          |
-| `PUT /settings/agents/{id}`               | `needs-restart` | Create or update a subagent                 |
-| `DELETE /settings/agents/{id}`            | `needs-restart` | Delete a subagent                           |
-| `POST /settings/agents/{id}/enable`       | `needs-restart` | `{enable}`                                  |
-| `POST /settings/reset-cards/use`          | —               | Consume a reset card (see below)            |
-| `POST /settings/reset-cards/opportunity`  | —               | Request an opportunity (see below)          |
-| `POST /settings/reset-cards/history-read` | —               | Mark the reset history read                 |
-| `POST /settings/backups/restore`          | per file        | Restore a backup                            |
-| `POST /settings/app-update/install`       | —               | Download and stage a new app build          |
+| Endpoint                                  | Effect          | Purpose                                                       |
+| ----------------------------------------- | --------------- | ------------------------------------------------------------- |
+| `PUT /settings/providers/{id}`            | `immediate`     | Enable/disable, rename, edit `baseUrl` / `apiType` / `apiKey` |
+| `POST /settings/models`                   | `immediate`     | Add a model to an existing provider                           |
+| `POST /settings/models/test`              | —               | `{providerId, modelId}` → one minimal probe request           |
+| `DELETE /settings/models/{pid}/{mid}`     | `immediate`     | Remove a model                                                |
+| `POST /settings/skills/enable`            | `immediate`     | `{path, enable}`                                              |
+| `DELETE /settings/skills/{path}`          | `immediate`     | Delete a skill directory                                      |
+| `POST /settings/skills/copy-to-user`      | `immediate`     | Copy a workspace skill to `~/.zcode/skills`                   |
+| `PUT /settings/mcp/{name}`                | `needs-restart` | Create or update an MCP server                                |
+| `DELETE /settings/mcp/{name}`             | `needs-restart` | Remove an MCP server                                          |
+| `POST /settings/mcp/enable`               | `needs-restart` | `{name, enable}`                                              |
+| `PUT /settings/hooks/{event}/{index}`     | `needs-restart` | Edit one existing hook entry                                  |
+| `POST /settings/hooks/enabled`            | `needs-restart` | `{enabled}` — the whole hooks tree                            |
+| `PUT /settings/agents/{id}`               | `needs-restart` | Create or update a subagent                                   |
+| `DELETE /settings/agents/{id}`            | `needs-restart` | Delete a subagent                                             |
+| `POST /settings/agents/{id}/enable`       | `needs-restart` | `{enable}`                                                    |
+| `POST /settings/reset-cards/use`          | —               | Consume a reset card (see below)                              |
+| `POST /settings/reset-cards/opportunity`  | —               | Request an opportunity (see below)                            |
+| `POST /settings/reset-cards/history-read` | —               | Mark the reset history read                                   |
+| `POST /settings/backups/restore`          | per file        | Restore a backup                                              |
+| `POST /settings/app-update/install`       | —               | Download and stage a new app build                            |
 
 Notes that clients must honor:
 
@@ -547,8 +548,23 @@ Notes that clients must honor:
   four (`GET, POST, PUT, DELETE, OPTIONS`) — a browser-based client can issue
   them without a plugin fetch shim.
 - **Providers cannot be created or deleted** through this API — only enabled
-  state, display name, and the models inside an existing provider. Adding a
-  brand-new provider stays a desktop-app (or hand-edit) operation.
+  state, display name, the endpoint fields, and the models inside an existing
+  provider. Adding a brand-new provider stays a desktop-app (or hand-edit)
+  operation. Endpoint edits are presence-driven: send `baseUrl` (absolute
+  http(s) URL), `apiType` (`anthropic-messages` | `openai-chat-completions` |
+  `openai-responses`) and/or `apiKey`; `null` clears a field, an omitted key is
+  left alone. The models payload never echoes a key back — each provider
+  carries `hasApiKey` (presence only), because the payload crosses the hub
+  WebSocket and the client only needs to know whether the field is filled.
+- **`POST /settings/models/test` is a probe, not a prompt**: one request with
+  `max_tokens: 1` (`max_output_tokens: 16` for `openai-responses`) spelled for
+  the provider's `apiType`, 20s timeout, resolved from the personal provider
+  config's own `baseUrl` + `apiKey`. The answer is always `200 {ok, result}`
+  — `result.success:false` with the provider's `status` / truncated `message`
+  is a normal outcome the UI renders inline, and `result.reason`
+  (`no_key` | `no_base_url` | `unknown_provider`) means the probe could not
+  run at all. A green probe proves the endpoint accepts the model id with
+  that key; it does not prove quota, tool support or context length.
 - **MCP writes are type-checked**: `type` / `url` / `command` must be strings,
   `args` an array of strings, `env` / `headers` objects of strings, `enabled` a
   boolean — anything else is a `400`. Unknown keys still pass through, but a
@@ -561,9 +577,14 @@ Notes that clients must honor:
   and writes may only modify an existing entry's `command` / `timeoutMs` /
   `enabled`. Adding or removing events, matchers, or hook entries is not
   supported. Unknown keys on a hook object are preserved verbatim.
-- **Subagents**: `name`, `description`, `color`, `model`, `thoughtLevel` are
-  editable; the system-prompt body is not. Built-in agents (`general-purpose`,
-  `Explore`) cannot be edited or deleted — only their model override can change.
+- **Subagents**: `name`, `description`, `color`, `model`, `thoughtLevel`, the
+  `systemPrompt` body and the advanced frontmatter the runtime reads (`tools`,
+  `disallowedTools`, `skills` as string arrays; `permissionMode` from the
+  runtime's enum; `maxTurns` a positive integer; `background` /
+  `injectAgentsMd` booleans) are editable on custom agents. Presence decides:
+  an omitted key is left alone, `null` clears it (the app's "inherit" choice;
+  an empty list clears too). Built-in agents (`general-purpose`, `Explore`)
+  cannot be edited or deleted — only their model override can change.
   Send `{"providerId": null, "modelId": null}` on a built-in agent to CLEAR its
   override and return it to the workspace default.
 - **Reset cards are irreversible.** `POST /settings/reset-cards/use` requires

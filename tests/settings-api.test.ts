@@ -395,6 +395,116 @@ describe("settings API — agents and skills routes", () => {
   });
 });
 
+describe("settings API — the new agent and provider fields travel over HTTP", () => {
+  it("creates an agent with an advanced field set through the route", async () => {
+    const res = await loopbackSend("PUT", "agents/helper", {
+      description: "helps",
+      systemPrompt: "Be brief.",
+      tools: ["Read", "Grep"],
+      permissionMode: "plan",
+      maxTurns: 5,
+    });
+    expect(res.status).toBe(200);
+    const list = (await (await loopbackGet("agents")).json()) as {
+      agents: Array<{ name: string; systemPrompt: string; frontmatter: Record<string, unknown> }>;
+    };
+    const helper = list.agents.find((a) => a.name === "helper");
+    expect(helper?.systemPrompt).toBe("Be brief.");
+    expect(helper?.frontmatter.permissionMode).toBe("plan");
+    expect(helper?.frontmatter.maxTurns).toBe(5);
+    expect(helper?.frontmatter.tools).toEqual(["Read", "Grep"]);
+  });
+
+  it("clears an advanced field with an explicit null", async () => {
+    await loopbackSend("PUT", "agents/clearable", {
+      description: "d",
+      tools: ["Read"],
+    });
+    await loopbackSend("PUT", "agents/clearable", { tools: null });
+    const list = (await (await loopbackGet("agents")).json()) as {
+      agents: Array<{ name: string; frontmatter: Record<string, unknown> }>;
+    };
+    const entry = list.agents.find((a) => a.name === "clearable");
+    expect(entry?.frontmatter.tools).toBeUndefined();
+  });
+
+  it("rejects an unknown permission mode with a 400", async () => {
+    const res = await loopbackSend("PUT", "agents/badmode", {
+      description: "d",
+      permissionMode: "whatever",
+    });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/permissionMode must be one of/);
+  });
+
+  it("writes a provider endpoint and reports the key as present, never its value", async () => {
+    await put(zcodePersonalProviderPath(), {
+      schemaVersion: 1,
+      config: {
+        providerConfigRules: { providerRules: [{ providerId: "custom:x", enabled: true }] },
+        modelConfigRules: { providerModelRules: [], manualProviderModelRules: [] },
+      },
+    });
+    const write = await loopbackSend("PUT", "providers/custom:x", {
+      baseUrl: "https://api.example/v1",
+      apiType: "anthropic-messages",
+      apiKey: "sk-very-secret",
+    });
+    expect(write.status).toBe(200);
+
+    // The payload the client reads must say a key exists WITHOUT carrying it.
+    const models = await (await loopbackGet("models")).json();
+    const text = JSON.stringify(models);
+    expect(text).not.toContain("sk-very-secret");
+    const provider = (
+      models as {
+        models: {
+          providers: Array<{ providerId: string; hasApiKey?: boolean; baseUrl?: string }>;
+        };
+      }
+    ).models.providers.find((p) => p.providerId === "custom:x");
+    expect(provider?.hasApiKey).toBe(true);
+    expect(provider?.baseUrl).toBe("https://api.example/v1");
+  });
+
+  it("refuses a base URL that is not absolute http(s)", async () => {
+    await put(zcodePersonalProviderPath(), {
+      schemaVersion: 1,
+      config: {
+        providerConfigRules: { providerRules: [{ providerId: "custom:x", enabled: true }] },
+        modelConfigRules: { providerModelRules: [], manualProviderModelRules: [] },
+      },
+    });
+    const res = await loopbackSend("PUT", "providers/custom:x", { baseUrl: "not a url" });
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string };
+    expect(body.error).toMatch(/absolute http\(s\) URL/);
+  });
+
+  it("answers a connectivity probe for an unconfigured provider without a 5xx", async () => {
+    // No provider rule at all: the probe cannot even build a request, which is
+    // a normal result, not a server error.
+    const res = await loopbackSend("POST", "models/test", {
+      providerId: "custom:absent",
+      modelId: "m1",
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      ok: boolean;
+      result: { success: boolean; reason?: string };
+    };
+    expect(body.ok).toBe(true);
+    expect(body.result.success).toBe(false);
+    expect(body.result.reason).toBe("unknown_provider");
+  });
+
+  it("requires both ids on a connectivity probe", async () => {
+    const res = await loopbackSend("POST", "models/test", { providerId: "custom:x" });
+    expect(res.status).toBe(400);
+  });
+});
+
 describe("settings API — writes land in the real files", () => {
   it("persists a provider enable/disable", async () => {
     await put(zcodePersonalProviderPath(), {

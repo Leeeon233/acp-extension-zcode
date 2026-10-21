@@ -8,21 +8,25 @@
  *  - `~/.zcode/v2/agents-state.json` — enablement and model overrides. Built-in
  *    agents have no file at all, so their model override can ONLY live here.
  *
- * Scope of this module is deliberately narrow (ADR for the settings API):
- * frontmatter fields the app's own form exposes as first-class inputs
- * (`name`, `description`, `color`, `model`, `thoughtLevel`), plus create /
- * delete / enable. The system-prompt body and the advanced lists (tools,
- * skills, permissionMode, maxTurns, …) are NOT exposed — a body round-trip
- * through JSON risks silent whitespace and escaping damage, and those fields
- * are rare enough that editing the file directly is the better experience.
+ * Scope: everything the desktop app's own agent form edits — `name`,
+ * `description`, `color`, `model`, `thoughtLevel`, the system-prompt BODY, and
+ * the advanced frontmatter the runtime reads (`tools`, `disallowedTools`,
+ * `skills`, `permissionMode`, `maxTurns`, `background`, `injectAgentsMd`) —
+ * plus create / delete / enable.
  *
- * Consequences of that split, which callers must know:
+ * The advanced fields used to be out of scope, on the argument that a JSON
+ * round-trip risks whitespace and escaping damage. That risk is real but it is
+ * handled where it belongs: `updateAgent` re-parses what it just serialized and
+ * refuses the write when anything differs, so a field this module understands
+ * cannot be silently mangled. Fields it does NOT understand still ride through
+ * verbatim as unknown frontmatter keys.
  *
- *  - Creating an agent writes a minimal template body; a user who wants a real
- *    prompt edits the file (or the app opens it in an editor).
- *  - Editing an agent REWRITES its frontmatter from the parsed model, so any
- *    advanced field the user set by hand is preserved verbatim in the body of
- *    the file but its frontmatter keys are re-emitted in canonical order.
+ * Consequences which callers must know:
+ *
+ *  - Editing an agent REWRITES its frontmatter from the parsed model, so an
+ *    unknown key is re-emitted in canonical position while its value survives.
+ *  - A `null` in a patch clears that key (the app's "inherit" choice); an
+ *    omitted key is left alone.
  */
 
 import { mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
@@ -74,6 +78,17 @@ export interface AgentModelSelection {
   thoughtLevel?: string;
 }
 
+/** The advanced frontmatter a client may write. */
+export interface AgentAdvancedFields {
+  tools?: string[];
+  disallowedTools?: string[];
+  skills?: string[];
+  permissionMode?: string;
+  maxTurns?: number;
+  background?: boolean;
+  injectAgentsMd?: boolean;
+}
+
 /** The frontmatter fields this module reads and writes. */
 export interface AgentFrontmatter {
   name: string;
@@ -81,9 +96,26 @@ export interface AgentFrontmatter {
   color?: string;
   model?: string;
   thoughtLevel?: string;
+  tools?: string[];
+  disallowedTools?: string[];
+  skills?: string[];
+  permissionMode?: string;
+  maxTurns?: number;
+  background?: boolean;
+  injectAgentsMd?: boolean;
   /** Everything else in the file, preserved verbatim on rewrite. */
   [key: string]: unknown;
 }
+
+/** The permission modes the runtime accepts (subagent-profile.ts). */
+export const AGENT_PERMISSION_MODES = [
+  "acceptEdits",
+  "auto",
+  "bypassPermissions",
+  "default",
+  "dontAsk",
+  "plan",
+] as const;
 
 export interface AgentEntry {
   /** Lowercased name — the stable identity. */
@@ -480,19 +512,67 @@ function resolveAgentFile(name: string): string {
   return filePath;
 }
 
+/** A list-of-strings patch: absent = leave alone, null = clear. */
+function applyStringList(
+  fm: Record<string, unknown>,
+  key: "tools" | "disallowedTools" | "skills",
+  value: string[] | null | undefined,
+): void {
+  if (value === undefined) return;
+  if (value === null || value.length === 0) delete fm[key];
+  else fm[key] = [...value];
+}
+
+/** Validate the advanced fields a client sent, before anything is written. */
+function validateAdvanced(fields: AgentAdvancedFields): void {
+  for (const key of ["tools", "disallowedTools", "skills"] as const) {
+    const value = fields[key];
+    if (value === undefined) continue;
+    if (!Array.isArray(value) || value.some((v) => typeof v !== "string")) {
+      throw new Error(`${key} must be an array of strings`);
+    }
+  }
+  if (fields.permissionMode !== undefined) {
+    if (!AGENT_PERMISSION_MODES.includes(fields.permissionMode as never)) {
+      throw new Error(`permissionMode must be one of ${AGENT_PERMISSION_MODES.join(", ")}`);
+    }
+  }
+  if (fields.maxTurns !== undefined) {
+    if (!Number.isInteger(fields.maxTurns) || fields.maxTurns <= 0) {
+      throw new Error("maxTurns must be a positive integer");
+    }
+  }
+}
+
+/** Apply the advanced fields onto a frontmatter object. */
+function applyAdvanced(fm: AgentFrontmatter, fields: AgentAdvancedFields): void {
+  applyStringList(fm, "tools", fields.tools);
+  applyStringList(fm, "disallowedTools", fields.disallowedTools);
+  applyStringList(fm, "skills", fields.skills);
+  if (fields.permissionMode !== undefined) fm.permissionMode = fields.permissionMode;
+  if (fields.maxTurns !== undefined) fm.maxTurns = fields.maxTurns;
+  if (fields.background !== undefined) fm.background = fields.background;
+  if (fields.injectAgentsMd !== undefined) fm.injectAgentsMd = fields.injectAgentsMd;
+}
+
 /**
  * Create an agent file.
  *
  * Refuses to overwrite (the app's own create uses the `wx` flag for the same
- * reason) and seeds a minimal body so the agent is immediately usable.
+ * reason). A caller that supplies a system prompt gets exactly that text as the
+ * body; otherwise a minimal template seeds it so the agent is immediately
+ * usable.
  */
-export async function createAgent(input: {
-  name: string;
-  description: string;
-  color?: string;
-  model?: string;
-  thoughtLevel?: string;
-}): Promise<AgentEntry> {
+export async function createAgent(
+  input: {
+    name: string;
+    description: string;
+    color?: string;
+    model?: string;
+    thoughtLevel?: string;
+    systemPrompt?: string;
+  } & AgentAdvancedFields,
+): Promise<AgentEntry> {
   const filePath = resolveAgentFile(input.name);
   if (input.description.trim() === "") {
     throw new Error("description is required");
@@ -500,6 +580,7 @@ export async function createAgent(input: {
   if (input.color !== undefined && !AGENT_COLORS.includes(input.color as AgentColor)) {
     throw new Error(`color must be one of ${AGENT_COLORS.join(", ")}`);
   }
+  validateAdvanced(input);
   await mkdir(path.dirname(filePath), { recursive: true });
   const frontmatter: AgentFrontmatter = {
     name: input.name,
@@ -508,7 +589,12 @@ export async function createAgent(input: {
   if (input.color !== undefined) frontmatter.color = input.color;
   if (input.model !== undefined) frontmatter.model = input.model;
   if (input.thoughtLevel !== undefined) frontmatter.thoughtLevel = input.thoughtLevel;
-  const content = serializeAgentMarkdown(frontmatter, TEMPLATE_BODY);
+  applyAdvanced(frontmatter, input);
+  const body = input.systemPrompt?.trim() ? `${input.systemPrompt.trim()}\n` : TEMPLATE_BODY;
+  const content = serializeAgentMarkdown(frontmatter, body);
+  // Prove the bytes parse back before creating anything: a create is the one
+  // write with no previous file to fall back to.
+  assertRoundTrip(frontmatter, content);
   try {
     // Exclusive create: an existing agent must be edited, not replaced.
     await writeFile(filePath, content, { encoding: "utf8", flag: "wx" });
@@ -523,17 +609,17 @@ export async function createAgent(input: {
     fileName: agentFileName(input.name),
     path: filePath,
     frontmatter,
-    systemPrompt: TEMPLATE_BODY.trim(),
+    systemPrompt: body.trim(),
     enabled: true,
     readOnly: false,
   };
 }
 
 /**
- * Update an agent's editable frontmatter fields.
+ * Update an agent's editable fields.
  *
- * Only the fields present in `patch` change; the body and every other
- * frontmatter key are carried through from the file. `model`/`thoughtLevel`
+ * Only the fields present in `patch` change; every other frontmatter key is
+ * carried through from the file. `model`/`thoughtLevel` and the string lists
  * accept `null` to CLEAR the key (the app's "inherit" choice). Renaming is a
  * delete + create, which is why it is NOT offered here — a rename would orphan
  * the state file's disable record.
@@ -545,6 +631,15 @@ export async function updateAgent(
     color?: string;
     model?: string | null;
     thoughtLevel?: string | null;
+    /** `null` on a list clears it; a string sets the whole prompt body. */
+    systemPrompt?: string | null;
+    tools?: string[] | null;
+    disallowedTools?: string[] | null;
+    skills?: string[] | null;
+    permissionMode?: string | null;
+    maxTurns?: number | null;
+    background?: boolean | null;
+    injectAgentsMd?: boolean | null;
   },
 ): Promise<AgentEntry> {
   const filePath = resolveAgentFile(name);
@@ -571,55 +666,96 @@ export async function updateAgent(
     fm.color = patch.color;
   }
   // An explicit null clears the key (the app's "inherit" choice).
-  const applyModel = (key: string, value: string | null | undefined): void => {
+  const applyScalar = (key: string, value: string | null | undefined): void => {
     if (value === undefined) return;
     if (value === null || value === "") delete fm[key];
     else fm[key] = value;
   };
-  applyModel("model", patch.model);
-  applyModel("thoughtLevel", patch.thoughtLevel);
+  applyScalar("model", patch.model);
+  applyScalar("thoughtLevel", patch.thoughtLevel);
+  applyScalar("permissionMode", patch.permissionMode);
+  if (patch.maxTurns !== undefined) {
+    if (patch.maxTurns === null) delete fm.maxTurns;
+    else {
+      if (!Number.isInteger(patch.maxTurns) || patch.maxTurns <= 0) {
+        throw new Error("maxTurns must be a positive integer");
+      }
+      fm.maxTurns = patch.maxTurns;
+    }
+  }
+  for (const key of ["background", "injectAgentsMd"] as const) {
+    const value = patch[key];
+    if (value === undefined) continue;
+    if (value === null) delete fm[key];
+    else fm[key] = value;
+  }
+  for (const key of ["tools", "disallowedTools", "skills"] as const) {
+    const value = patch[key];
+    if (value === undefined) continue;
+    if (value !== null && (!Array.isArray(value) || value.some((v) => typeof v !== "string"))) {
+      throw new Error(`${key} must be an array of strings`);
+    }
+    applyStringList(fm, key, value);
+  }
+  if (patch.permissionMode !== undefined && patch.permissionMode !== null) {
+    if (!AGENT_PERMISSION_MODES.includes(patch.permissionMode as never)) {
+      throw new Error(`permissionMode must be one of ${AGENT_PERMISSION_MODES.join(", ")}`);
+    }
+  }
   const next: AgentFrontmatter = {
     ...fm,
     name: typeof fm.name === "string" ? fm.name : name,
     description: typeof fm.description === "string" ? fm.description : "",
   };
-  // Round-trip check: what we serialize must parse back to the same fields, or
-  // an escaping mistake would silently rewrite the user's agent. Every key is
-  // checked, not just the editable five — an unknown field (one the user added
-  // by hand, or a newer app version introduced) is exactly where a serialization
-  // bug would hide.
-  const written = serializeAgentMarkdown(next, split.body);
-  const reparsed = splitFrontmatter(written);
-  if (!reparsed) throw new Error("serialized agent has no frontmatter");
-  const roundTrip = parseFrontmatter(reparsed.frontmatter);
-  for (const [key, before] of Object.entries(next)) {
-    const after = roundTrip[key];
-    if (before === undefined) continue;
-    if (typeof before === "object") continue; // lists compared by their own path
-    if (String(before) !== String(after ?? "")) {
-      throw new Error(`frontmatter round-trip failed for '${key}' — not writing`);
-    }
-  }
-  for (const key of ["tools", "disallowedTools", "skills"] as const) {
-    const before = next[key];
-    if (before === undefined) continue;
-    const after = roundTrip[key];
-    const left = Array.isArray(before) ? before.join("\u0000") : "";
-    const right = Array.isArray(after) ? after.join("\u0000") : "";
-    if (left !== right) {
-      throw new Error(`frontmatter round-trip failed for '${key}' — not writing`);
-    }
-  }
+  // The body: an explicit string replaces it, `null` clears it, absent keeps it.
+  const body =
+    patch.systemPrompt === undefined
+      ? split.body
+      : patch.systemPrompt === null
+        ? ""
+        : patch.systemPrompt;
+  const written = serializeAgentMarkdown(next, body);
+  assertRoundTrip(next, written);
   await writeAgentFile(filePath, written);
   return {
     name: next.name,
     fileName: agentFileName(name),
     path: filePath,
     frontmatter: next,
-    systemPrompt: split.body.trim(),
+    systemPrompt: body.trim(),
     enabled: true,
     readOnly: false,
   };
+}
+
+/**
+ * Prove that `serialized` parses back to `expected`.
+ *
+ * An escaping mistake would silently rewrite the user's agent, so every known
+ * key — not just the editable ones — is compared, and the string lists are
+ * compared element by element. Unknown keys are covered too: they are the most
+ * likely place for a serializer bug to hide.
+ */
+function assertRoundTrip(expected: AgentFrontmatter, serialized: string): void {
+  const reparsed = splitFrontmatter(serialized);
+  if (!reparsed) throw new Error("serialized agent has no frontmatter");
+  const back = parseFrontmatter(reparsed.frontmatter);
+  for (const [key, before] of Object.entries(expected)) {
+    if (before === undefined) continue;
+    if (Array.isArray(before)) {
+      const after = back[key];
+      const left = before.join("\u0000");
+      const right = Array.isArray(after) ? after.join("\u0000") : "";
+      if (left !== right) {
+        throw new Error(`frontmatter round-trip failed for '${key}' — not writing`);
+      }
+      continue;
+    }
+    if (typeof before === "object") continue;
+    if (String(before) !== String(back[key] ?? "")) {
+      throw new Error(`frontmatter round-trip failed for '${key}' — not writing`);
+    }
+  }
 }
 
 /** Delete a user-scope agent file. */

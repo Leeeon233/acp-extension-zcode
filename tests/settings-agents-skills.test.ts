@@ -271,6 +271,103 @@ describe("agent enablement and model overrides", () => {
   });
 });
 
+// ---------- advanced fields ----------
+
+/**
+ * The advanced frontmatter (tools / permissionMode / the prompt body) used to
+ * be out of the settings API's scope. These cases pin the contract now that it
+ * is in scope: a field the client sends lands in the file, a `null` clears it,
+ * and an omitted field is left alone.
+ */
+describe("agent advanced fields", () => {
+  it("creates an agent carrying a real prompt and advanced fields", async () => {
+    const agent = await createAgent({
+      name: "reviewer",
+      description: "Reviews diffs",
+      color: "cyan",
+      systemPrompt: "You review diffs carefully.",
+      tools: ["Read", "Grep"],
+      skills: ["pdf"],
+      permissionMode: "plan",
+      maxTurns: 7,
+      injectAgentsMd: false,
+    });
+    expect(agent.systemPrompt).toBe("You review diffs carefully.");
+
+    const raw = await readFile(path.join(zcodeAgentsDir(), "reviewer.md"), "utf8");
+    expect(raw).toContain("You review diffs carefully.");
+    expect(raw).toContain('color: "cyan"');
+    expect(raw).toContain('permissionMode: "plan"');
+    expect(raw).toContain("maxTurns: 7");
+    expect(raw).toContain("injectAgentsMd: false");
+    expect(raw).toContain("  - Read\n  - Grep");
+    expect(raw).toContain("skills:\n  - pdf");
+
+    const listed = (await listAgents()).find((a) => a.name === "reviewer");
+    expect(listed?.systemPrompt).toBe("You review diffs carefully.");
+    expect(listed?.frontmatter.tools).toEqual(["Read", "Grep"]);
+    expect(listed?.frontmatter.permissionMode).toBe("plan");
+    expect(listed?.frontmatter.maxTurns).toBe(7);
+    expect(listed?.frontmatter.injectAgentsMd).toBe(false);
+  });
+
+  it("a null clears a field, an omitted key keeps it", async () => {
+    await createAgent({
+      name: "keeper",
+      description: "d",
+      tools: ["Read", "Write"],
+      maxTurns: 3,
+    });
+    await updateAgent("keeper", { tools: null, description: "edited" });
+    let raw = await readFile(path.join(zcodeAgentsDir(), "keeper.md"), "utf8");
+    expect(raw).not.toContain("tools:");
+    // maxTurns was not mentioned, so it must survive the rewrite.
+    expect(raw).toContain("maxTurns: 3");
+
+    await updateAgent("keeper", { maxTurns: 9 });
+    raw = await readFile(path.join(zcodeAgentsDir(), "keeper.md"), "utf8");
+    expect(raw).toContain("maxTurns: 9");
+  });
+
+  it("replaces the prompt body and keeps the frontmatter", async () => {
+    await createAgent({ name: "prompted", description: "d", color: "red" });
+    await updateAgent("prompted", { systemPrompt: "Line one.\nLine two." });
+    const listed = (await listAgents()).find((a) => a.name === "prompted");
+    expect(listed?.systemPrompt).toBe("Line one.\nLine two.");
+    expect(listed?.frontmatter.color).toBe("red");
+  });
+
+  it("keeps a hand-written unknown frontmatter key across an edit", async () => {
+    await put(
+      path.join(zcodeAgentsDir(), "handmade.md"),
+      '---\nname: "handmade"\ndescription: "d"\nmcpServers:\n  - search\n---\nBody.\n',
+    );
+    await updateAgent("handmade", { description: "changed" });
+    const raw = await readFile(path.join(zcodeAgentsDir(), "handmade.md"), "utf8");
+    expect(raw).toContain("mcpServers:\n  - search");
+    expect(raw).toContain('description: "changed"');
+  });
+
+  it("refuses fields the runtime would not accept", async () => {
+    await expect(
+      createAgent({ name: "badmode", description: "d", permissionMode: "nope" }),
+    ).rejects.toThrow(/permissionMode must be one of/);
+    await expect(createAgent({ name: "badturns", description: "d", maxTurns: 0 })).rejects.toThrow(
+      /maxTurns must be a positive integer/,
+    );
+    await expect(
+      createAgent({ name: "badtools", description: "d", tools: [1] as unknown as string[] }),
+    ).rejects.toThrow(/must be an array of strings/);
+  });
+
+  it("rejects a bad advanced field on update without touching the file", async () => {
+    await createAgent({ name: "stable", description: "d" });
+    const before = await readFile(path.join(zcodeAgentsDir(), "stable.md"), "utf8");
+    await expect(updateAgent("stable", { maxTurns: -1 })).rejects.toThrow(/positive integer/);
+    expect(await readFile(path.join(zcodeAgentsDir(), "stable.md"), "utf8")).toBe(before);
+  });
+});
+
 async function readState(): Promise<Record<string, unknown>> {
   const file = path.join(zcodeHomeDir(), "v2", "agents-state.json");
   try {

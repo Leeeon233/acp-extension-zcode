@@ -34,6 +34,7 @@ import {
   updateProvider,
   upsertModel,
 } from "../settings/provider-config.js";
+import { testModelConnectivity } from "../settings/model-connectivity.js";
 import {
   readCliConfig,
   readHooks,
@@ -404,6 +405,9 @@ async function route(
     }
     if (method === "POST" && path === "/settings/models") {
       return void (await handleUpsertModel(res, body));
+    }
+    if (method === "POST" && path === "/settings/models/test") {
+      return void (await handleModelTest(res, body));
     }
     if (method === "DELETE" && path.startsWith("/settings/models/")) {
       const rest = path.slice("/settings/models/".length);
@@ -796,6 +800,13 @@ async function handleModelsPayload(): Promise<unknown> {
       modelIds: rule.config?.personalModelIds ?? [],
       baseUrl: rule.config?.api?.baseUrl,
       apiType: rule.config?.api?.type,
+      // Presence only. The key never leaves the machine it was written on:
+      // the settings payload crosses a WebSocket, may be logged by a proxy,
+      // and the client has no use for the secret — it only needs to know
+      // whether the field is already populated.
+      hasApiKey: Boolean(rule.config?.access?.apiKey),
+      // Whether this provider can be edited at all (see updateProvider).
+      editable: true,
     })),
     modelRules: [
       ...personal.config.modelConfigRules.providerModelRules,
@@ -879,17 +890,57 @@ async function handleUpdateProvider(
 ): Promise<void> {
   const enabled = bool(body, "enabled");
   const providerName = str(body, "providerName");
-  if (enabled === undefined && providerName === undefined) {
-    sendError(res, 400, "nothing to update — send enabled and/or providerName");
+  // Endpoint edits. Presence decides ("null" clears), so these read the raw
+  // value rather than going through str(): `str` folds null into undefined
+  // and would make clearing unreachable.
+  const hasBaseUrl = "baseUrl" in body;
+  const hasApiType = "apiType" in body;
+  const hasApiKey = "apiKey" in body;
+  const nullable = (key: string): string | null =>
+    typeof body[key] === "string" ? (body[key] as string) : null;
+  if (
+    enabled === undefined &&
+    providerName === undefined &&
+    !hasBaseUrl &&
+    !hasApiType &&
+    !hasApiKey
+  ) {
+    sendError(
+      res,
+      400,
+      "nothing to update — send enabled, providerName, baseUrl, apiType and/or apiKey",
+    );
     return;
   }
   await guard(res, async () => {
     await updateProvider(providerId, {
       ...(enabled !== undefined ? { enabled } : {}),
       ...(providerName !== undefined ? { providerName } : {}),
+      ...(hasBaseUrl ? { baseUrl: nullable("baseUrl") } : {}),
+      ...(hasApiType ? { apiType: nullable("apiType") } : {}),
+      ...(hasApiKey ? { apiKey: nullable("apiKey") } : {}),
     });
     return { ok: true as const, effect: "immediate" as Effect };
   });
+}
+
+/**
+ * Probe one model with a minimal request (see settings/model-connectivity.ts).
+ *
+ * A failed probe is a NORMAL answer, not a 5xx: the UI renders the provider's
+ * message inline next to the row. Only a malformed request (no ids) is a 400.
+ */
+async function handleModelTest(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
+  const providerId = str(body, "providerId");
+  const modelId = str(body, "modelId");
+  if (!providerId || !modelId) {
+    sendError(res, 400, "providerId and modelId are required");
+    return;
+  }
+  await guard(res, async () => ({
+    ok: true as const,
+    result: await testModelConnectivity(providerId, modelId),
+  }));
 }
 
 async function handleUpsertModel(
@@ -1056,6 +1107,13 @@ async function handleAgentUpsert(
       return { ok: true as const, effect: "needs-restart" as Effect };
     }
     const description = str(body, "description");
+    // Advanced fields: a key's PRESENCE decides whether it is written, because
+    // `null` is the documented way to clear one ("inherit"). Reading through
+    // str()/bool() would fold null into undefined and make clearing
+    // unreachable.
+    const advanced = agentAdvancedPatch(body);
+    const promptPatch =
+      "systemPrompt" in body ? { systemPrompt: nullableString(body, "systemPrompt") } : {};
     const patch = {
       ...(description !== undefined ? { description } : {}),
       ...(str(body, "color") !== undefined ? { color: str(body, "color") } : {}),
@@ -1063,6 +1121,8 @@ async function handleAgentUpsert(
       ...("thoughtLevel" in body
         ? { thoughtLevel: (body["thoughtLevel"] as string | null) ?? null }
         : {}),
+      ...promptPatch,
+      ...advanced,
     };
     let agent;
     try {
@@ -1078,10 +1138,61 @@ async function handleAgentUpsert(
         ...(str(body, "color") !== undefined ? { color: str(body, "color") } : {}),
         ...(typeof body["model"] === "string" ? { model: body["model"] } : {}),
         ...(typeof body["thoughtLevel"] === "string" ? { thoughtLevel: body["thoughtLevel"] } : {}),
+        ...(typeof body["systemPrompt"] === "string" ? { systemPrompt: body["systemPrompt"] } : {}),
+        ...(Array.isArray(body["tools"]) ? { tools: body["tools"] as string[] } : {}),
+        ...(Array.isArray(body["disallowedTools"])
+          ? { disallowedTools: body["disallowedTools"] as string[] }
+          : {}),
+        ...(Array.isArray(body["skills"]) ? { skills: body["skills"] as string[] } : {}),
+        ...(typeof body["permissionMode"] === "string"
+          ? { permissionMode: body["permissionMode"] }
+          : {}),
+        ...(typeof body["maxTurns"] === "number" ? { maxTurns: body["maxTurns"] } : {}),
+        ...(typeof body["background"] === "boolean" ? { background: body["background"] } : {}),
+        ...(typeof body["injectAgentsMd"] === "boolean"
+          ? { injectAgentsMd: body["injectAgentsMd"] }
+          : {}),
       });
     }
     return { ok: true as const, effect: "needs-restart" as Effect, agent };
   });
+}
+
+/** A string field where `null` is meaningful (clear) and absent is not. */
+function nullableString(body: Record<string, unknown>, key: string): string | null {
+  const value = body[key];
+  return typeof value === "string" ? value : null;
+}
+
+/**
+ * The advanced agent fields present in a request body.
+ *
+ * Presence-driven like the model/thoughtLevel pair: `null` clears (or, for the
+ * lists, empties), an omitted key is left alone. Types are checked in the
+ * config module, which is also the only caller — this function's job is to tell
+ * "not sent" apart from "sent as null".
+ */
+function agentAdvancedPatch(body: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of ["tools", "disallowedTools", "skills"] as const) {
+    if (!(key in body)) continue;
+    const value = body[key];
+    out[key] = value === null ? null : Array.isArray(value) ? value : undefined;
+  }
+  if ("permissionMode" in body) {
+    const value = body["permissionMode"];
+    out.permissionMode = value === null ? null : typeof value === "string" ? value : undefined;
+  }
+  if ("maxTurns" in body) {
+    const value = body["maxTurns"];
+    out.maxTurns = value === null ? null : typeof value === "number" ? value : undefined;
+  }
+  for (const key of ["background", "injectAgentsMd"] as const) {
+    if (!(key in body)) continue;
+    const value = body[key];
+    out[key] = value === null ? null : typeof value === "boolean" ? value : undefined;
+  }
+  return out;
 }
 
 async function handleAgentEnable(
