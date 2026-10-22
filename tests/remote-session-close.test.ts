@@ -80,6 +80,36 @@ describe("session close endpoint", () => {
     expect((await collectSessions(server)).map((s) => s.sessionId)).not.toContain(acpSid);
   });
 
+  it("a turn that settles after the close does not re-advertise the conversation", async () => {
+    // The force-close waits a bounded ~3s for in-flight turns; one that
+    // outlives the bound settles AFTER the summary was deleted. Its settle
+    // path (the guarded markSessionActive in runPrompt's finally) must not
+    // re-advertise — the desktop's row that vanished, resurrected, then
+    // lingered (2026-10-22).
+    const server = new ZcodeAcpServer();
+    const { acpSid } = seedSession(server, { title: "running" });
+    const base = await bootClose(server);
+    const res = await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" });
+    expect(res.status).toBe(200);
+
+    // The turn started BEFORE the retirement (the close interrupted it); the
+    // settle path's guard reads exactly this pair.
+    const turnStartedAt = Date.now() - 60_000;
+    expect(server.wasDiscoveryRetiredSince(acpSid, turnStartedAt)).toBe(true);
+    if (!server.wasDiscoveryRetiredSince(acpSid, turnStartedAt)) {
+      server.markSessionActive(acpSid);
+    }
+    expect(server.sessionSummaries.has(acpSid)).toBe(false);
+    expect((await collectSessions(server)).map((s) => s.sessionId)).not.toContain(acpSid);
+
+    // A turn STARTED after the retirement is genuine new use: ADR-0006's
+    // re-arm must still bring the conversation back.
+    const freshTurnAt = Date.now() + 1;
+    expect(server.wasDiscoveryRetiredSince(acpSid, freshTurnAt)).toBe(false);
+    server.markSessionActive(acpSid);
+    expect((await collectSessions(server)).map((s) => s.sessionId)).toContain(acpSid);
+  });
+
   it("notifies attached clients ($/zcode/session_closed) per alias on a serve-origin close", async () => {
     // The martty-quit channel: an incubated window showing the closed session
     // exits cleanly on this notification instead of waiting for terminate

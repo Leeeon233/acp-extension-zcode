@@ -224,8 +224,11 @@ async function handleClose(
       await sleep(50);
     }
   }
-  server.sessionSummaries.delete(sessionId);
-  server.remoteCreatedSessions.delete(sessionId);
+  // Retire from discovery AND stamp the retirement: a turn that outlives the
+  // force-settle bound settles after this point, and its terminal activity
+  // must not re-advertise the conversation (the desktop's vanished-then-
+  // resurrected row, 2026-10-22).
+  server.retireDiscovery(sessionId);
   // Workflow-run progress pollers address this session's journal — stop them
   // with the teardown (best-effort, never throws) instead of letting them run
   // to the hard cap for a conversation nothing else references anymore.

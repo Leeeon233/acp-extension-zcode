@@ -34,6 +34,7 @@ interface FakeServerShape {
   sessionTitles: Map<string, string>;
   titleUserSetBy: Set<string>;
   sessionSummaries: Map<string, unknown>;
+  discoveryRetiredAt: Map<string, number>;
   sessionCwds: Map<string, string>;
   marttyClientSeen: boolean;
   acpSidByZcodeSid: Map<string, string>;
@@ -52,6 +53,7 @@ function makeServer(zcodeSid = "zcode_1", acpSid = "acp_1"): FakeServerShape {
     sessionTitles: new Map([[acpSid, "first prompt line as provisional title"]]),
     titleUserSetBy: new Set(),
     sessionSummaries: new Map([[acpSid, { title: "old" }]]),
+    discoveryRetiredAt: new Map(),
     sessionCwds: new Map([[acpSid, "/repo/proj"]]),
     marttyClientSeen: false, // no tty writes under vitest regardless (ttyTitleIo)
     acpSidByZcodeSid: new Map([[zcodeSid, acpSid]]),
@@ -117,6 +119,27 @@ describe("SessionTitleListener", () => {
     expect(server.notifies[0]!.sessionId).toBe("acp_1");
     expect(server.notifies[0]!.update["sessionUpdate"]).toBe("session_info_update");
     expect(server.notifies[0]!.update["title"]).toBe("Fix the login bug");
+  });
+
+  it("a trailing title push does not resurrect a remote-closed conversation", async () => {
+    // ADR-0006 close retires the summary; a generated push arriving after it
+    // (the dying turn's auto-title) must update the title but NOT recreate
+    // the discovery summary — that resurrected the closed row in remote
+    // lists (2026-10-22).
+    const server = makeServer("zcode_1", "acp_1");
+    server.sessionSummaries.delete("acp_1");
+    server.discoveryRetiredAt.set("acp_1", Date.now());
+    const l = new SessionTitleListener(server as unknown as ZcodeAcpServer, "zcode_1");
+    l.handleEvent(
+      titleEvent({
+        source: "generated",
+        title: "Fix the login bug",
+        previousTitle: "first prompt line as provisional title",
+      }),
+    );
+    await flush();
+    expect(server.sessionTitles.get("acp_1")).toBe("Fix the login bug");
+    expect(server.sessionSummaries.has("acp_1")).toBe(false);
   });
 
   it("skips default and first_input sources", async () => {

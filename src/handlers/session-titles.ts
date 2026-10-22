@@ -115,6 +115,11 @@ export class SessionTitleListener implements EventListener {
 
     for (const sid of aliases) {
       this.server.sessionTitles.set(sid, title);
+      // A trailing title push from the dying conversation must not resurrect
+      // an alias retired by a remote close (ADR-0006) — a summary recreated
+      // here with a title would re-advertise it. The stamp clears on the
+      // next genuine use (markSessionActive).
+      if (this.server.discoveryRetiredAt.has(sid)) continue;
       this.server.touchSessionSummary(sid, title);
       refreshTerminalTabTitle(this.server, sid);
     }

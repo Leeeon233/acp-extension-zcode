@@ -2131,13 +2131,21 @@ export async function runOneTurn(
     server.pendingTurns.delete(requestId);
     // Turn end = session activity — refresh the discovery summary and mark the
     // session discoverable regardless of outcome (end_turn, cancelled, retries
-    // exhausted). Also refresh the backend-loaded verification — but only on
-    // an instance this turn proved resident (a successful subscribe) that is
-    // STILL the live backend: an unconditional stamp let a failed backend-lost
-    // recovery vouch for a session the respawned backend never loaded (empty
-    // replays for the whole TTL window — same family as the respawn-stamp
-    // bug, found in review 2026-10).
-    server.markSessionActive(acpSid);
+    // exhausted). EXCEPT when a remote close retired the conversation while
+    // this turn was running (ADR-0006 force close): the close deletes the
+    // summary and only waits a bounded ~3s for the turn, so a turn settling
+    // after that would re-advertise a conversation the user ended — the
+    // desktop's row that vanished, resurrected, then lingered (2026-10-22).
+    // A turn STARTED after the retirement is genuine new use and re-arms.
+    if (!server.wasDiscoveryRetiredSince(acpSid, turnStartedAt)) {
+      server.markSessionActive(acpSid);
+    }
+    // Refresh the backend-loaded verification — but only on an instance this
+    // turn proved resident (a successful subscribe) that is STILL the live
+    // backend: an unconditional stamp let a failed backend-lost recovery
+    // vouch for a session the respawned backend never loaded (empty replays
+    // for the whole TTL window — same family as the respawn-stamp bug, found
+    // in review 2026-10).
     if (residentBackend && residentBackend === server.backend && !residentBackend.isDead) {
       server.markBackendLoaded(acpSid);
     }

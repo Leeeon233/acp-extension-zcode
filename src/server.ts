@@ -455,6 +455,14 @@ export class ZcodeAcpServer {
     string,
     { title?: string; updatedAt: number; hasActivity?: boolean }
   >();
+  /**
+   * Sessions retired from discovery by a remote close (ADR-0006), with the
+   * retirement time. Trailing activity from the dying conversation — a turn
+   * that outlives the force-close settle bound, a late title push — must not
+   * re-advertise them; a genuine later use clears the stamp via
+   * `markSessionActive` (the close's documented re-arm).
+   */
+  readonly discoveryRetiredAt = new Map<string, number>();
   /** Session titles already set, to enforce set-once (acp_sid → title). */
   readonly sessionTitles = new Map<string, string>();
   /**
@@ -903,11 +911,37 @@ export class ZcodeAcpServer {
       updatedAt: Date.now(),
       hasActivity: true,
     });
+    // Genuine use re-arms discovery after a remote close (ADR-0006): the
+    // retirement stamp only ever suppressed TRAILING activity of the retired
+    // conversation, and it must not suppress the next real one.
+    this.discoveryRetiredAt.delete(acpSid);
     // Self-heal soft-delete tombstones (ADR-0031 amendment): using a session
     // again cancels its tombstone — the session itself, and project-wide when
     // the workspace had gone fully invisible (project delete). Fire-and-forget
     // best-effort; never blocks or breaks the activity path.
     void this.reviveTombstonesFor(acpSid);
+  }
+
+  /**
+   * Retire a session from remote discovery (the ADR-0006 close): drop the
+   * summary and the remote-created placeholder, and stamp the retirement so
+   * activity landing AFTER the close cannot re-advertise the conversation.
+   */
+  retireDiscovery(acpSid: string): void {
+    this.sessionSummaries.delete(acpSid);
+    this.remoteCreatedSessions.delete(acpSid);
+    this.discoveryRetiredAt.set(acpSid, Date.now());
+  }
+
+  /**
+   * True when the session was retired from discovery at or after `sinceMs` —
+   * the guard a turn's settle path checks (`turnStartedAt`): a turn that was
+   * already running when the close retired the conversation belongs to the
+   * retired conversation, and its terminal activity must not resurrect it.
+   */
+  wasDiscoveryRetiredSince(acpSid: string, sinceMs: number): boolean {
+    const at = this.discoveryRetiredAt.get(acpSid);
+    return at !== undefined && at >= sinceMs;
   }
 
   /**
