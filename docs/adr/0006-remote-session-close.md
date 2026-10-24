@@ -48,3 +48,21 @@ an empty POST body drains and closes before the relayed response finishes
 writing, so every proxied close died with ECONNRESET/502. Abort on the
 RESPONSE side closing early (`res` `'close'` with `writableEnded` false)
 instead.
+
+Amendment (2026-10-24) — no resume guard for closed sessions. A client that
+held a closed session under a connection that was DOWN at broadcast time
+never receives its `$/zcode/session_closed` copy — the fan-out is live-only,
+so no client-side tombstone forms, and the client's revival ladder (three
+honest reconnects, then the ADR-0017 resume POST) can reincubate a
+conversation another client deliberately closed. This is the one residual of
+the resurrection class the desktop's socket-agnostic retirement closed
+(2026-10-23) for every holder whose connection was up. Considered and
+rejected: a hub-side guard that rejects resume POSTs for recently closed
+ids. The conjunction is rare (a remote close landing exactly inside a
+holder's disconnect window) and the failure self-heals (a ghost headless
+bridge a second close retires cleanly), while every guard shape costs more
+than the disease — a time-windowed rejection also refuses the legitimate
+close-then-reopen gesture and still misses ladders that fire past the
+window, and a complete guard needs clients to flag automated resumes, a
+cross-repo contract not worth its surface while the residual stays
+theoretical. Revisit with a real reproduction.
