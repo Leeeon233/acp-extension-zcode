@@ -300,6 +300,14 @@ export class ZcodeAcpServer {
    */
   workflowModeOnWire = false;
   /**
+   * True once this backend generation rejected the per-session `toolDenylist`
+   * key on session/create·resume (pre-toolDenylist strict schema). While set,
+   * the key is omitted up front instead of paying a rejected round-trip per
+   * session — the tool policy is NOT applied on such a backend (warned once).
+   * Reset at every spawn.
+   */
+  toolDenylistRejected = false;
+  /**
    * The full slash-command list (set once by buildAgentApp in index.ts).
    * Read by the gate-aware menu catch-up (resendMenuAfterGateSettled in
    * handlers/session.ts): a cold bridge's session/new snapshot predates the
@@ -852,6 +860,8 @@ export class ZcodeAcpServer {
     // …and the send-semantics evidence: the respawned process may be an
     // older build that still accepts mid-turn sends as steer.
     this.observedSendBusyReject = false;
+    // …and the toolDenylist schema verdict: the respawned build may accept it.
+    this.toolDenylistRejected = false;
     // …and the backend-loaded stamps: they vouch for residents of a process
     // that no longer exists. A surviving stamp kept isBackendSessionLive true
     // across a respawn, so session/load skipped the resume RPC and read a

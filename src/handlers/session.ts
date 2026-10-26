@@ -24,6 +24,7 @@ import { convertPromptContent, type NativePromptAttachment } from "./prompt-cont
 import { backendCapabilities } from "../backend/adapter.js";
 import type { ZcodeBackend } from "../backend/client.js";
 import { EventStreamListener, TurnMonitor } from "../backend/listener.js";
+import { disallowedToolList } from "../backend/resolve.js";
 import { resolveReal } from "../backend/sandbox.js";
 import type {
   ZcodeCreateResult,
@@ -162,6 +163,59 @@ async function workflowFlag(
 }
 
 /**
+ * Per-session tool denylist (#340). The app-server command path parses
+ * `--disallowed-tools` but never consumes it (upstream cli/src/run.ts hands
+ * `toolDisallowlist` to the prompt/TUI paths only), so the merged
+ * ZCODE_DISALLOWED_TOOLS + Cron* default list was silently dropped and every
+ * "disallowed" tool still reached the model. session/create AND session/resume
+ * take `toolDenylist` and project it onto `runtimeConfig.toolDisallowlist` — a
+ * registry-level removal (upstream server-operations.ts createRecord), the
+ * right layer for a process-wide policy. Resume must carry it too: a cold-
+ * recovered runtime is rebuilt from the resume params alone.
+ *
+ * Deliberately NOT sent on session/send: that per-turn list is only a
+ * provider-visibility hint, and a turn list holding every Cron mutation tool
+ * is upstream's "automation turn" signal (isAutomationMutationRestrictedTurn),
+ * which ordinary prompts must not spoof. Residual: session/fork has no
+ * tool-face field and its `inherit` does not copy the list, so a fork runs
+ * without it until its next resume.
+ *
+ * Omitted outright once this backend generation rejected the key
+ * (`server.toolDenylistRejected`) — see rejectsToolDenylistKey.
+ */
+function toolDenylistParam(
+  server: ZcodeAcpServer,
+): { toolDenylist: string[] } | Record<string, never> {
+  if (server.toolDenylistRejected) return {};
+  const list = disallowedToolList();
+  return list.length > 0 ? { toolDenylist: list } : {};
+}
+
+/**
+ * Pre-toolDenylist backend: strict zod rejects the key ("Unrecognized key:
+ * toolDenylist", quoted or bare). Word-bounded so an unrelated unrecognized
+ * key does not trigger the drop-and-retry.
+ */
+function rejectsToolDenylistKey(message: string | undefined): boolean {
+  return !!message && /unrecognized/i.test(message) && /\btoolDenylist\b/i.test(message);
+}
+
+/**
+ * Record a toolDenylist schema rejection for this backend generation and say
+ * so ONCE — the user's tool policy is not applied on such a backend, which
+ * must not pass silently.
+ */
+function noteToolDenylistRejected(server: ZcodeAcpServer, method: string): void {
+  if (!server.toolDenylistRejected) {
+    warn(
+      `${method}: backend rejects toolDenylist — retrying without it; ` +
+        `ZCODE_DISALLOWED_TOOLS / the Cron* default are NOT applied on this backend`,
+    );
+  }
+  server.toolDenylistRejected = true;
+}
+
+/**
  * Cold-bridge menu catch-up: the `/` menu snapshot sent at session/new is
  * filtered against the workflow gate, and on a COLD bridge (lazy session/new,
  * no backend yet) that snapshot was taken while the gate was still
@@ -184,9 +238,10 @@ export function resendMenuAfterGateSettled(server: ZcodeAcpServer, acpSid: strin
 
 /**
  * Shared `session/resume` params builder: {sessionId, workspace} + optional
- * session-lifetime mcpServers + the conditional dynamic-workflow flag. Every
- * resume construction site (session/resume, /resume adoption, session/load,
- * eviction/respawn reload) goes through here so the param shape cannot drift.
+ * session-lifetime mcpServers + the conditional dynamic-workflow flag + the
+ * per-session tool denylist. Every resume construction site (session/resume,
+ * /resume adoption, session/load, eviction/respawn reload) goes through here
+ * so the param shape cannot drift.
  */
 async function resumeParams(
   server: ZcodeAcpServer,
@@ -198,6 +253,7 @@ async function resumeParams(
     sessionId: zcodeSid,
     workspace: workspaceFor(cwd),
     ...(await workflowFlag(server)),
+    ...toolDenylistParam(server),
   };
   if (mcpServers) params.mcpServers = mcpServers;
   return params;
@@ -782,6 +838,7 @@ export async function ensureRealSession(
       // Dynamic-workflow enable rides create only when the gate says so —
       // workflowFlag writes nothing otherwise (strict zod).
       ...(await workflowFlag(server)),
+      ...toolDenylistParam(server),
     };
     if (pending.mcpServers && pending.mcpServers.length > 0) {
       createParams.mcpServers = pending.mcpServers;
@@ -795,16 +852,25 @@ export async function ensureRealSession(
         log(`session/create carrying ${remembered.length} remembered client MCP server(s)`);
       }
     }
-    let resp = await backend.request(server.nextId(), "session/create", createParams, 15000);
-    if (resp.error && createParams.mode === "guarded" && rejectsModeGuarded(resp.error.message)) {
+    // Compat retries build on the params ACTUALLY sent last, so a second
+    // rejection does not resurrect a key the first retry already dropped.
+    let sent = createParams;
+    let resp = await backend.request(server.nextId(), "session/create", sent, 15000);
+    if (resp.error && sent.mode === "guarded" && rejectsModeGuarded(resp.error.message)) {
       // 3.15.1's `guarded` on a pre-3.15 backend: the strict mode enum rejects
       // it and the whole create dies. Retry without the mode key (the backend
       // default then applies) and say so once — a session that works beats a
       // configured mode that bricks session/new.
       warn('session/create: backend rejects mode "guarded" — retrying with its default mode');
-      const rest = { ...createParams };
-      delete rest.mode;
-      resp = await backend.request(server.nextId(), "session/create", rest, 15000);
+      sent = { ...sent };
+      delete sent.mode;
+      resp = await backend.request(server.nextId(), "session/create", sent, 15000);
+    }
+    if (resp.error && "toolDenylist" in sent && rejectsToolDenylistKey(resp.error.message)) {
+      noteToolDenylistRejected(server, "session/create");
+      sent = { ...sent };
+      delete sent.toolDenylist;
+      resp = await backend.request(server.nextId(), "session/create", sent, 15000);
     }
     if (resp.error) {
       throw new Error(`zcode create failed: ${resp.error.message ?? ""}`);
@@ -3144,6 +3210,14 @@ async function resumeBackendSession(
       ATTEMPT_TIMEOUT_MS,
     );
     if (!resp.error) return (resp.result ?? {}) as Record<string, unknown>;
+    if ("toolDenylist" in zcParams && rejectsToolDenylistKey(resp.error.message)) {
+      // Schema-compat retry (pre-toolDenylist backend). Bounded by
+      // construction: the stripped params can no longer match this guard.
+      noteToolDenylistRejected(server, "session/resume");
+      const rest = { ...zcParams };
+      delete rest.toolDenylist;
+      return resumeBackendSession(server, rest);
+    }
     const isTimeout = resp.error.message === "timeout";
     if (!isTimeout || attempt === MAX_ATTEMPTS) {
       throw new Error(`zcode resume failed: ${resp.error.message ?? ""}`);

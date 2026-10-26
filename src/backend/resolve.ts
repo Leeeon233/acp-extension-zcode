@@ -268,11 +268,25 @@ function disallowedToolsValue(): string | undefined {
 }
 
 /**
+ * The same merged disallow list as an array — the shape the per-session
+ * `toolDenylist` param takes (handlers/session.ts). Empty when nothing is
+ * disallowed. Deduped; the user's entries come first, then the defaults.
+ */
+export function disallowedToolList(): string[] {
+  const value = disallowedToolsValue();
+  return value ? [...new Set(value.split(/[,\s]+/).filter(Boolean))] : [];
+}
+
+/**
  * The backend subcommand and its flags, shared by every launch path.
  *
  * `ZCODE_DISALLOWED_TOOLS` is merged with the default Cron* disallow list
  * (see AUTOMATION_TOOL_DEFAULTS) and passed as the app-server's
- * `--disallowed-tools` value; unset means only the defaults.
+ * `--disallowed-tools` value; unset means only the defaults. NOTE the
+ * app-server command path parses this flag but never consumes it (upstream
+ * cli/src/run.ts routes `toolDisallowlist` to the prompt/TUI paths only), so
+ * the EFFECTIVE channel is the per-session `toolDenylist` on session/create
+ * and session/resume (#340). The flag stays for a future CLI that wires it.
  */
 export function backendArgs(): string[] {
   const disallowed = disallowedToolsValue();

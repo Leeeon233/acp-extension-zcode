@@ -235,7 +235,7 @@ when a concrete ACP/editor need appears. Ranked shortlist in
 | `session/compact` `instructions` + `result.compact` (`index.ts:1829-1853`)                                                                                                                                                                                                                                                                                      | Custom compact instructions; result acks `{state: accepted\|already_running, inputId?, operationId?}`                                                     | Not forwarded — `/compact <focus>` could pass instructions; the backend's own `already_running` ack can backstop the bridge's `autoCompactInFlight` single-flight                                                                                                                                                                      |
 | `session/debug` (`index.ts:3571`, `bootstrap/src/zcode-protocol/session-debug.ts`)                                                                                                                                                                                                                                                                              | Per-session debug snapshot accumulated from the live event stream                                                                                         | Not used; `zcode-acp` diagnostics command / `/debug` extension                                                                                                                                                                                                                                                                         |
 | `session/list` rich params (`sessionIds` incl. hidden, `includeArchived`, `limit`, `index.ts:1600-1609`)                                                                                                                                                                                                                                                        | Explicit identity lookup, archived sessions                                                                                                               | Not used                                                                                                                                                                                                                                                                                                                               |
-| `session/create` extras: `toolAllowlist`/`toolDenylist` (per-session tool face — could move Cron* hiding off process-wide `--disallowed-tools`), `importedHistory` (claudeCode / sharedContext+sha256 provenance), `persistence:"immediate"\|"deferred"`, `titleGenerationEnabled:false` (bridge sets its own titles), `parentSessionId` (`index.ts:1558-1580`) | Session-creation knobs                                                                                                                                    | Not forwarded; `session/resume` also takes `toolAllowlist`/`toolDenylist` — a resume WITHOUT them drops the tool face on cold recovery (`index.ts:1589-1595`)                                                                                                                                                                          |
+| `session/create` extras: `toolAllowlist`/`toolDenylist` (per-session tool face — could move Cron* hiding off process-wide `--disallowed-tools`), `importedHistory` (claudeCode / sharedContext+sha256 provenance), `persistence:"immediate"\|"deferred"`, `titleGenerationEnabled:false` (bridge sets its own titles), `parentSessionId` (`index.ts:1558-1580`) | Session-creation knobs                                                                                                                                    | `toolDenylist` **WIRED (2026-10-26, #340)** on create AND every resume site (`toolDenylistParam`, handlers/session.ts) — see alignment item 10 below. `toolAllowlist`, `importedHistory`, `persistence`, `titleGenerationEnabled`, `parentSessionId` still not forwarded                                                               |
 | `mcp/list` `mode:"status"` (`index.ts:686-723`)                                                                                                                                                                                                                                                                                                                 | Status without connecting: per-server `{status, transport, toolCount, failureKind(19-value enum), authorization{authorizationUrl}}`                       | Not used; editor MCP health panel + OAuth start URL without new transport                                                                                                                                                                                                                                                              |
 | `process/childProcesses` (3.12.3)                                                                                                                                                                                                                                                                                                                               | List a session's child processes (`{pid, serverName, mcpSource, pluginName?}`, pure memory)                                                               | Not used; potentially useful for background-task diagnostics                                                                                                                                                                                                                                                                           |
 | `skills/referenceCatalog`, `plugins/referenceCatalog[WithCategory]` (categorized variant new in 0.16.9)                                                                                                                                                                                                                                                         | Session-scoped FROZEN catalogs — the authoritative per-session view vs the bridge's live disk reads                                                       | Not used; fixes the stale-catalog class of bug (backend freezes discovery at session start)                                                                                                                                                                                                                                            |
@@ -394,8 +394,9 @@ CronUpdate/CronDelete` whenever an `automationPort` is injected
 (`core/src/runtime/helpers/runtime-tools.ts:66`), and the legacy protocol
 server injects one for every session create
 (`server-operations.ts:3370`) — so the backend ALWAYS registers them in
-app-server mode. Opting out is entirely the bridge's `--disallowed-tools`
-(or per-session `toolDenylist`). Bonus:
+app-server mode. Opting out is entirely the bridge's per-session
+`toolDenylist` on create/resume (the `--disallowed-tools` argv flag is parsed
+but NOT consumed on the app-server path — #340, alignment item 10). Bonus:
 `AUTOMATION_MUTATION_TOOL_NAMES = [CronCreate, CronUpdate, CronDelete]` gets
 special turn-loop treatment (`turn-loop-state.ts:23`).
 
@@ -461,9 +462,31 @@ failureKind`, OAuth `authorizationUrl` indented beneath its server; any
    messageId): success renders prompt-cache stats (`cache N/M messages ·
 cache-read tokens`), non-success resultTypes surface verbatim as a
    warning line. Regression tests: `tests/turn-info-line.test.ts`.
-10. **Per-session `toolDenylist` at create/resume** — move Cron* hiding off
-    process-wide `--disallowed-tools`; note a resume WITHOUT the lists drops
-    the tool face on cold recovery. PENDING.
+10. ~~**Per-session `toolDenylist` at create/resume**~~ **WIRED (2026-10-26,
+    #340)** — the merged `ZCODE_DISALLOWED_TOOLS` + Cron* default list rides
+    session/create and every session/resume site as `toolDenylist`
+    (`toolDenylistParam`, handlers/session.ts; the array form is
+    `disallowedToolList` in backend/resolve.ts). Root cause from source: the
+    app-server command path PARSES `--disallowed-tools` but never consumes it
+    (`cli/src/run.ts` hands `toolDisallowlist` to `runPrompt`/`runTuiCommand`
+    only; `runZCodeProtocolCommand` takes none), so the argv flag the bridge
+    had passed since #190 was a no-op and every "disallowed" tool reached the
+    model. The backend projects the param onto
+    `runtimeConfig.toolDisallowlist` (`server-operations.ts` createRecord,
+    shared by create and resume — a registry-level removal). Compat: a
+    pre-toolDenylist strict schema rejects the key → drop + one retry, verdict
+    pinned per backend generation (`server.toolDenylistRejected`, reset on
+    respawn), warned once. The argv flag stays (harmless; a future CLI may
+    wire it). NOT sent on session/send: the per-turn list is a
+    provider-visibility hint only, and a turn list holding every Cron
+    mutation tool is upstream's "automation turn" signal
+    (`isAutomationMutationRestrictedTurn`) which ordinary prompts must not
+    spoof. Residual: `session/fork` has no tool-face field and
+    `registerForkedSession`'s `inherit` copies memory/toolSearch/shell but
+    NOT the tool lists, so a fork runs without the policy until its next
+    resume (upstream gap, also hits the desktop). `toolAllowlist` (an
+    allow-list env var) is a reasonable follow-up — same two sites,
+    `session/send` rejects it. Regression tests: `tests/tool-denylist.test.ts`.
 11. **v4/command channel** as the single implementation surface for
     rewind/edit/feedback/queue UX later. PENDING.
 

@@ -18,7 +18,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { resolveZcodeCommand } from "../src/backend/resolve.js";
+import { disallowedToolList, resolveZcodeCommand } from "../src/backend/resolve.js";
 
 const SAVED = {
   ZCODE_BIN: process.env.ZCODE_BIN,
@@ -129,6 +129,43 @@ describe("resolveZcodeCommand disallowed tools", () => {
     const argv = resolveZcodeCommand();
     expect(argv.slice(-2)).toEqual(["--disallowed-tools", `Bash Write ${CRON_DEFAULTS}`]);
     expect(argv.indexOf("/nonexistent/zcode.cjs")).toBeLessThan(argv.indexOf("app-server"));
+  });
+});
+
+// The array form feeds the per-session `toolDenylist` param (#340) — the
+// argv flag above is parsed but never consumed by the app-server path.
+describe("disallowedToolList (array form for session/create·resume toolDenylist)", () => {
+  const CRON_DEFAULTS = ["CronCreate", "CronList", "CronUpdate", "CronDelete"];
+
+  it("is the Cron* defaults when the env var is unset", () => {
+    delete process.env.ZCODE_DISALLOWED_TOOLS;
+    delete process.env.ZCODE_ENABLE_AUTOMATION_TOOLS;
+    expect(disallowedToolList()).toEqual(CRON_DEFAULTS);
+  });
+
+  it("merges the user list first, then the defaults, deduped across both separators", () => {
+    process.env.ZCODE_DISALLOWED_TOOLS = "Bash, Write Bash\tCronList";
+    delete process.env.ZCODE_ENABLE_AUTOMATION_TOOLS;
+    expect(disallowedToolList()).toEqual([
+      "Bash",
+      "Write",
+      "CronList",
+      "CronCreate",
+      "CronUpdate",
+      "CronDelete",
+    ]);
+  });
+
+  it("is the user list alone (normalized) when automation tools are opted in", () => {
+    process.env.ZCODE_DISALLOWED_TOOLS = "Bash,Write,Bash";
+    process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
+    expect(disallowedToolList()).toEqual(["Bash", "Write"]);
+  });
+
+  it("is empty on the opt-in path with the env var unset — nothing to deny", () => {
+    delete process.env.ZCODE_DISALLOWED_TOOLS;
+    process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
+    expect(disallowedToolList()).toEqual([]);
   });
 });
 

@@ -722,6 +722,30 @@ required for`); any other error aborts. Display side, `buildConfigOptions`
   zod: "Unrecognized key: jsonrpc", code -32600). The bridge's backend
   client never sends one — keep it that way when hand-probing
   `zcode app-server --stdio` (frames are bare `{id, method, params}`).
+- **`--disallowed-tools` on the app-server argv is a NO-OP — tool policy
+  travels as the per-session `toolDenylist` on create AND resume** (#340,
+  source 2026-10-26: `cli/src/run.ts` extracts the flag for every command
+  but hands `toolDisallowlist` only to `runPrompt`/`runTuiCommand`;
+  `runZCodeProtocolCommand` takes none, so the flag the bridge passed since
+  #190 never reached a session and every "disallowed" tool — the #192 Cron*
+  default included — still reached the model). `toolDenylistParam`
+  (handlers/session.ts) rides `createParams` and the shared `resumeParams`
+  builder; the backend projects it onto `runtimeConfig.toolDisallowlist`
+  (registry-level removal, `server-operations.ts` createRecord — shared by
+  create and resume, which is why resume MUST carry it: a cold-recovered
+  runtime is rebuilt from the resume params alone). Three rules: (1) do NOT
+  add it to `session/send` — the per-turn list is a provider-visibility hint
+  only, and a turn list holding every Cron mutation tool is upstream's
+  "automation turn" signal (`isAutomationMutationRestrictedTurn`), which
+  ordinary prompts must not spoof; (2) a pre-toolDenylist backend rejects
+  the key ("Unrecognized key: toolDenylist") → drop + one retry, verdict
+  pinned per backend generation (`server.toolDenylistRejected`, reset on
+  respawn), warned once — keep every new create/resume site on
+  `resumeParams`/`toolDenylistParam` so the compat path stays single;
+  (3) `session/fork` has no tool-face field and its `inherit` copies
+  memory/toolSearch/shell but not the lists — a fork runs without the policy
+  until its next resume (upstream gap; don't "fix" it with a close+resume
+  cycle on the fork response).
 - **`turnId` lives on the event ENVELOPE, never the payload** (source
   2026-09-21: `zcodeEventEnvelopeSchema` carries `turnId?`,
   `packages/shared/src/zcode-protocol/index.ts:1029-1041`, while
