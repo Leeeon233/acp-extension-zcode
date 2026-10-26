@@ -20,11 +20,15 @@ methods and streams events back as ACP `session/update` notifications.
 
 ZCode went open source (Apache-2.0): a local checkout lives at
 `~/Develop/NoBackup/ZCode` (remote `github.com/zai-org/ZCode`; checkout synced
-to source root 3.16.1 = app-server/`apps/zcode-cli` 0.17.0, commit `0a1fc56d`,
-audited 2026-10-19 with no bridge impact — see docs/BACKLOG.md; the bridge
-runs desktop 3.15.3, which still bundles the 0.16.9 CLI: every Gotchas
-behavior note below is 0.16.9-sourced and stays live until the desktop
-updates to 3.16.x). The agent runtime is under `apps/zcode-cli/packages/core/`;
+to source root 3.16.2 = app-server/`apps/zcode-cli` 0.17.0, commit `3c5b2276`,
+audited 2026-10-20 with no bridge impact — see docs/BACKLOG.md). The bridge
+runs desktop 3.16.3, whose bundled `zcode.cjs` self-reports CLI 0.17.0 — the
+SAME CLI the checkout carries, so the source is authoritative for the running
+backend (the 3.16.2→3.16.3 desktop delta is not in the public tree;
+`origin/main` IS `3c5b2276`). The Gotchas below were written against 0.16.9
+and re-verified file-by-file at the 0.17.0 audits (2026-10-19/20); the bundle
+recipe in docs/BACKLOG.md "Verification method" remains the way to re-prove a
+note against the binary. The agent runtime is under `apps/zcode-cli/packages/core/`;
 `packages/zcode-server-cli` is only a thin CLI shell. **Read the source BEFORE
 probing or reverse-engineering the bundled CLI** — every "verified against
 app-server" note in Gotchas below predates it and now has an authoritative

@@ -160,6 +160,22 @@ strings: every 3.16-era protocol token (`toolSearchMode`, `refreshRegistry`,
 and the pre-3.16 `includeArchived` are present — the running backend's
 protocol surface is exactly the 3.15.1-audited one, and the bridge has been
 running it without incident.
+Postscript (2026-10-26): the desktop is now 3.16.3 and its `zcode.cjs`
+self-reports CLI `0.17.0` — the checkout's CLI, so the 3.16.1/3.16.2 audits
+above now describe the RUNNING backend (the 3.16.2→3.16.3 desktop delta is
+not in the public tree: `origin/main` is `3c5b2276`). Bundle re-proof done
+for #340: all six `toolDenylist` sites in the binary match the source
+verbatim — the create/resume/send zod objects, the send→prompt-turn
+forwarding, `resolveSessionToolDenylist` (minified `Jhc`, wired as
+`toolDisallowlist:Jhc(t,c)` in createRecord's runtimeConfig) and
+`buildPromptTurnToolDisallowlist`. One 3.16.2 shared-contract change the
+2026-10-20 entry did not call out, relevant to ADR-0029:
+`dynamic-workflow-feature.ts` flipped the UI tier from "a server-offered
+`disabled` makes the user's choice ineffective" to "the feature is GA, the
+server only sets the DEFAULT, a valid user choice always wins" — which is
+exactly the bridge's existing override-over-verdict rule (local
+`workflow.mode` > remote verdict, unset = follow the verdict), so upstream
+moved toward the bridge; nothing to change.
 
 **3.14.0 audit (2026-09-20, app-server 0.16.9 — live-probed end to end)**: the
 dynamic-workflow family (ten model tools led by `CreateWorkflow`) is OFF by
