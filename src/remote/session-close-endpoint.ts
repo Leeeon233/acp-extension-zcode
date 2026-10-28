@@ -22,8 +22,10 @@
 import type { IncomingMessage, ServerResponse } from "node:http";
 import process from "node:process";
 
+import { cancelSessionTurns } from "../handlers/session.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { log } from "../utils.js";
+import { stopPollersForSession } from "../workflow/poller.js";
 
 function sendText(res: ServerResponse, code: number, message: string): void {
   if (res.writableEnded) return;
@@ -42,6 +44,39 @@ function sendJson(res: ServerResponse, code: number, body: Record<string, unknow
 
 /** Grace before the bridge exits itself when the TUI group signal missed. */
 const SELF_EXIT_MS = 1_500;
+
+/**
+ * Force close: how long to wait for the cancelled turn(s) to settle before
+ * evicting the resident runtime anyway (the eviction kills any generation
+ * that ignored the stop pair). Test hook override via the setter below.
+ */
+export let forceSettleMs = 3_000;
+
+/** Test hook: shrink the force-close settle bound so tests don't sleep. */
+export function setForceSettleMsForTests(ms: number): void {
+  forceSettleMs = ms;
+}
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+const MAX_CLOSE_BODY_BYTES = 256;
+
+/**
+ * Read the optional close body without trusting Content-Type (the hub's
+ * forward-and-relay proxy pipes bytes through without forwarding headers).
+ * Empty body → undefined; anything malformed throws for the 400 path.
+ */
+async function readCloseBody(req: IncomingMessage): Promise<unknown> {
+  const chunks: Buffer[] = [];
+  let size = 0;
+  for await (const chunk of req) {
+    size += (chunk as Buffer).length;
+    if (size > MAX_CLOSE_BODY_BYTES) throw new Error("body too large");
+    chunks.push(chunk as Buffer);
+  }
+  if (chunks.length === 0) return undefined;
+  return JSON.parse(Buffer.concat(chunks).toString("utf8"));
+}
 
 export interface ServeTerminateDecision {
   /** Terminate this bridge once the close response has flushed. */
@@ -135,7 +170,17 @@ function terminateAfterFlush(decision: ServeTerminateDecision, res: ServerRespon
         }
       }
     }
-    setTimeout(() => process.exit(0), SELF_EXIT_MS);
+    // Self-exit through the orderly path: signalling ourselves runs the
+    // index.ts SIGTERM handler (unregister with the hub, reap the backend
+    // group) — a bare process.exit(0) left the hub serving a corpse row for
+    // up to its 30s heartbeat TTL and the desktop's ladder dialing the dead
+    // id until the probe pruned it (2026-10-28), and it skipped the backend
+    // teardown the orderly shutdown owns. The hard exit stays as the
+    // backstop for a wedged orderly path (bounded like the unregister).
+    setTimeout(() => {
+      process.kill(process.pid, "SIGTERM");
+      setTimeout(() => process.exit(0), SELF_EXIT_MS).unref();
+    }, SELF_EXIT_MS);
   };
   // 'finish' fires asynchronously after end(), so attaching here never misses.
   if (res.writableEnded) res.once("finish", run);
@@ -148,8 +193,17 @@ async function handleClose(
   res: ServerResponse,
   sessionId: string,
 ): Promise<void> {
-  // Consume any request body so the client's connection drains cleanly.
-  req.resume();
+  // Optional JSON body: {force: true} stops an in-flight turn before closing
+  // (an explicit terminate gesture — the desktop's End session). Absent body
+  // keeps the plain ADR-0006 contract.
+  let body: unknown;
+  try {
+    body = await readCloseBody(req);
+  } catch {
+    sendText(res, 400, "invalid body");
+    return;
+  }
+  const force = (body as { force?: unknown } | undefined)?.force === true;
 
   // An empty REMOTE-created placeholder (no turn yet) has no summary but IS
   // advertised by discovery — it must be closable too, or it blocks the
@@ -158,13 +212,46 @@ async function handleClose(
     sendText(res, 404, "unknown session");
     return;
   }
+  // Every spelling this bridge knows for the conversation (editor alias(es) +
+  // backend sess_ id), captured before retirement: the $/zcode/session_closed
+  // fan-out below routes by payload sessionId, and the response's
+  // `sessionIds` lets the HUB tombstone the whole conversation — not just the
+  // one spelling the close URL happened to quote (a reconnect ladder may
+  // POST the backend id while the listing showed the alias).
+  const aliases = server.sessionAliases(sessionId);
   const zcodeSid = server.resolveSid(sessionId);
-  if (zcodeSid && [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid)) {
-    sendText(res, 409, "session is running — cancel the turn first");
+  const running =
+    zcodeSid !== undefined &&
+    [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
+  if (running && !force) {
+    sendText(res, 409, 'session is running — cancel the turn first (or send {"force":true})');
     return;
   }
-  server.sessionSummaries.delete(sessionId);
-  server.remoteCreatedSessions.delete(sessionId);
+  if (running && zcodeSid !== undefined) {
+    // Force close (ADR-0006 amendment): ESC semantics without a client
+    // connection — flag the turns cancelled, fire the stop pair, then give
+    // them a bounded window to settle (the stop's terminal event persists
+    // partial output cleanly) before the runtime eviction below proceeds
+    // regardless. The eviction kills any generation that ignored the stop.
+    cancelSessionTurns(server, zcodeSid);
+    log(`remote: force close cancelling in-flight turn(s) for ${zcodeSid}`);
+    const deadline = Date.now() + forceSettleMs;
+    while (Date.now() < deadline) {
+      if (![...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid)) break;
+      await sleep(50);
+    }
+  }
+  // Retire from discovery AND stamp the retirement: a turn that outlives the
+  // force-settle bound settles after this point, and its terminal activity
+  // must not re-advertise the conversation (the desktop's vanished-then-
+  // resurrected row, 2026-10-22). EVERY spelling gets the stamp (hub tombstone
+  // parity): a load or close may quote the backend id while the listing showed
+  // the alias, and the auto-load retirement gate checks the quoted spelling.
+  for (const sid of aliases) server.retireDiscovery(sid);
+  // Workflow-run progress pollers address this session's journal — stop them
+  // with the teardown (best-effort, never throws) instead of letting them run
+  // to the hard cap for a conversation nothing else references anymore.
+  if (zcodeSid) stopPollersForSession(zcodeSid);
   // Evict the backend's resident runtime so the conversation truly stops (no
   // background turn keeps it alive); the session file stays on disk and
   // session/list / a later resume still work. Best-effort — a bridge with no
@@ -197,14 +284,12 @@ async function handleClose(
     // wait per client, so this cannot hang the close. Clients that don't
     // know the method (old martty, editors) ignore it.
     await Promise.all(
-      server
-        .sessionAliases(sessionId)
-        .map((sid) =>
-          server.clients.notifyEach("$/zcode/session_closed", () => ({ sessionId: sid })),
-        ),
+      aliases.map((sid) =>
+        server.clients.notifyEach("$/zcode/session_closed", () => ({ sessionId: sid })),
+      ),
     );
   }
-  sendJson(res, 200, { ok: true });
+  sendJson(res, 200, { ok: true, sessionIds: aliases });
   if (terminate?.terminate) terminateAfterFlush(terminate, res);
 }
 

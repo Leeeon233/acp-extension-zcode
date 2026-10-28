@@ -53,10 +53,13 @@ ACP editor ────── stdio ──────────┘
 | `GET /api/instances/{id}/status`                       | required | Real-time per-session running status of one bridge.                                                                                                               |
 | `POST /api/instances/{id}/sessions/{sessionId}/close`  | required | Retire a session from remote discovery — see [Closing a session](#closing-a-session).                                                                             |
 | `POST /api/instances/{id}/sessions/{sessionId}/rename` | required | Rename a session — see [Renaming a session](#renaming-a-session).                                                                                                 |
+| `POST /api/instances/{id}/sessions/{sessionId}/delete` | required | Soft-delete (hide) a session from every listing — see [Deleting a project or session](#deleting-a-project-or-session).                                            |
 | `GET /api/quota`                                       | required | Account-level usage stats — same payload as `account/usage_stats`, no ACP connection needed.                                                                      |
 | `POST /api/upgrade`                                    | required | Trigger the hub's own staleness check — see [Hub self-upgrade](#hub-self-upgrade).                                                                                |
 | `GET /api/projects`                                    | required | Known-project list (remote session-create whitelist) — see below.                                                                                                 |
+| `GET /api/fs/list?path=`                               | required | One directory level for the browse-and-create flow — see [Starting a session in a new directory](#starting-a-session-in-a-new-directory).                         |
 | `GET /api/projects/sessions?workspacePath=`            | required | A project's full session store incl. closed ones — see [Resuming a closed session](#resuming-a-closed-session).                                                   |
+| `POST /api/projects/delete {workspacePath}`            | required | Soft-delete a project and all its sessions (hidden from every listing) — see [Deleting a project or session](#deleting-a-project-or-session).                     |
 | `POST /api/instances {workspacePath[, sessionId]}`     | required | Create a bridge for one known project — a visible terminal TUI window (session-create) or one that boots into a closed session (resume, `sessionId`) — see below. |
 
 HTTP auth: `Authorization: Bearer <token>` or `?token=<token>`.
@@ -111,6 +114,17 @@ HTTP auth: `Authorization: Bearer <token>` or `?token=<token>`.
 - `sessions[].status` is a coarse `"running" | "idle"` indicator riding the
   heartbeat (up to ~10s stale; absent on older bridges — treat as unknown).
   For the live value poll [`/api/instances/{id}/status`](#session-running-status).
+- **Duplicated sessions and the sort order**: two bridges can advertise the
+  same conversation (an editor bridge and a serve bridge for one workspace,
+  or two editor windows that loaded the same thread). The hub de-duplicates
+  per `sessionId` before answering: the winner is the instance whose session
+  `updatedAt` is newer, and on an exact tie the bridge whose `startedAt` is
+  newer. `startedAt` is the bridge's own boot instant (captured at process
+  start, carried identically on every heartbeat), NOT the moment the hub
+  first saw the registration — a slow cold start must not make an older
+  bridge rank as newer. The array itself sorts oldest-bridge-first, so
+  clients that pick "the first match" keep getting the longest-lived
+  instance, which is the one most likely to hold resident sessions.
 - **Prompt echo**: when any client sends `session/prompt`, the bridge
   broadcasts the user's text to every OTHER attached client as a
   `user_message_chunk` (messageId prefixed `uprompt_`). Your own prompts are
@@ -164,6 +178,14 @@ POST {hub}/api/instances  body {"workspacePath":"/Users/me/proj"}
   bound, not a security boundary: a token holder can already run any
   editor-bridge session in an arbitrary cwd; the trust boundary is the
   token itself.
+- **`remote.projectRoots` widening** (bridge ≥0.65, browse-and-create): the
+  machine's user config may list absolute directory roots
+  (`"remote": {"projectRoots": ["~/Develop"]}`, `~` expanded, read live;
+  env fallback `ZCODE_ACP_PROJECT_ROOTS`, a `:`-separated path-list). The
+  POST then also accepts any existing subdirectory under a configured
+  root, not just known projects. Unconfigured, the known list alone stays
+  the whitelist. See [Starting a session in a new
+  directory](#starting-a-session-in-a-new-directory).
 - On create the hub incubates a VISIBLE interactive TUI (Martty) in the machine's
   terminal (ADR-0016, macOS): the project's owner gets a real local CLI
   window, and its bridge registers with the hub like any serve instance (it
@@ -179,12 +201,12 @@ POST {hub}/api/instances  body {"workspacePath":"/Users/me/proj"}
   `ZCODE_ACP_HUB_TERMINAL_COMMAND` (a shell command; `{script}` is replaced
   by the quoted script path) wins over `ZCODE_ACP_HUB_TERMINAL_APP`, which
   is matched against built-in launch recipes: Terminal and iTerm run the
-  script via `open -a` (both execute `.command`); WezTerm, kitty, Alacritty,
-  and Ghostty are driven by their own CLI (`open -na <app> --args … -e …`);
-  any other name passes through to `open -a` as-is. Default: Terminal.app.
-  Warp cannot execute scripts or commands programmatically at all
-  (warpdotdev/warp#1917, #3959, #9083) — naming it warns, and the flow
-  degrades to the headless bridge after the register timeout.
+  script via `open -a` (both execute `.command`); WezTerm, kitty, and
+  Alacritty are driven by their own CLI (`open -na <app> --args … -e …`);
+  Ghostty opens an AppleScript tab in the project directory that types the
+  script into the default shell (auto-closes when the CLI exits); Warp opens its
+  `warp://action/new_tab?path=…` URI. Any other name passes through to
+  `open -a` as-is. Default: Terminal.app.
 - Create NEVER reuses a live serve-origin instance (ADR-0016 amendment):
   the App flow lists project history first, which incubates a headless serve
   bridge, and reuse meant the promised terminal window could never open once
@@ -193,11 +215,62 @@ POST {hub}/api/instances  body {"workspacePath":"/Users/me/proj"}
   spawn instead of racing a duplicate. A client that wants a HEADLESS attach
   should not POST at all — attach to the instance id the history listing
   already returns.
+- **Desktop Presence** (ADR-0016 amendment; app ADR-0010): while the ZCode
+  ACP desktop app is present, no window opens for anyone — create AND resume,
+  from the app, the phone, or the web alike — because the desktop app is the
+  presenting surface. The hub sees presence three ways: a proxied ACP
+  connection whose `initialize` carries `clientInfo.name:
+"zcode-acp-remote-desktop"`; an HTTP call stamped `x-zcode-client:
+zcode-acp-remote-desktop` (every desktop hub call is); or such a stamped
+  call within the last 45s — the app polls `GET /api/instances` every 15s
+  for its whole lifetime, so an idle app with no open tab (and therefore no
+  proxied connection) still counts. Under presence the reuse rule flips
+  back: a create or resume answers with the workspace's live serve-origin
+  instance (`reused: true`, nothing spawned) — a resume with the instance
+  already holding that session live, whatever its origin — and only a
+  workspace without one spawns, headless. Attach and `session/new` /
+  `session/load` exactly as after a headless fallback.
 - Lifetime depends on the surface: a terminal-TUI instance lives while its
   window lives (the owner closing it retires the bridge — re-create on
   demand); the headless fallback exists for remote interest only and exits
   ~10 minutes after the last client detaches AND the last running turn
   finishes. Treat any vanished instance like a dead bridge.
+
+## Starting a session in a new directory
+
+The known-project list only ever holds directories that already ran a
+session. To start one somewhere new, browse the machine's directory tree
+(bridge ≥0.65) and create in the picked directory — it must sit under a
+configured `remote.projectRoots` root (see above):
+
+```text
+GET {hub}/api/fs/list?path=/Users/me          (path optional — default: home)
+  → 200 {"path":"/Users/me","parent":"/Users",
+         "creatable":false,
+         "entries":[{"name":"Develop"},{"name":"Documents"}, …],
+         "truncated":false}
+  → 400 "absolute path required"   (relative path)
+  → 404 "directory not found"      (missing path, or a file)
+
+POST {hub}/api/instances  body {"workspacePath":"/Users/me/Develop/newproj"}
+  → 200 {"id":"47073","reused":false}   (exactly the known-project create flow)
+```
+
+- One directory level per call; walk down via `entries[].name`, up via
+  `parent` (null at `/`). `path` in the answer is the RESOLVED (realpath)
+  spelling — navigate by it, not by what you sent (symlinks).
+- Only subdirectories are listed (cap 2000; `truncated` flags the cut);
+  hidden (`.`-prefixed) entries ARE included — filter client-side if the
+  UI wants them gone.
+- `creatable` tells whether a NEW session may start in the LISTED
+  directory itself: a known project, or under a configured project root.
+  With no roots configured everything still browses, but `creatable` is
+  true only on known projects. A create that ignores it gets the normal
+  403 "unknown project".
+- The create itself is the ordinary session-create flow above (visible
+  terminal TUI on the machine, ~20s budget). After the first session runs,
+  the directory enters the tasks index and appears in `GET /api/projects`
+  like any known project.
 
 ## Resuming a closed session
 
@@ -274,7 +347,17 @@ POST {hub}/api/instances  body {"workspacePath":"/Users/me/proj",
   CLI (Martty never sets a terminal title itself, so the name sticks).
   Resuming the same session
   twice pops two windows; only identical concurrent requests share one
-  incubation.
+  incubation. Desktop Presence changes both rules — no window opens, and the
+  live bridge that already holds (or can host) the session answers instead
+  (see the Desktop Presence bullet under session-create).
+- **`intent` (optional body field)**: `"auto"` marks the POST as a client's
+  own reconnect ladder (a tab re-incubating itself after its bridge left
+  discovery); `"user"` — the default when omitted, so older clients need no
+  change — marks a human picking the session. An auto resume of a session the
+  hub tombstoned via [Closing a session](#closing-a-session) is refused with
+  `409 session closed`; a user resume always passes and clears the tombstone.
+  Reconnect ladders should send `"auto"` and treat `409` as "closed
+  remotely — retire the tab, do not retry".
 - `sessionId` here is the backend store id (`sess_…`), which `session/load`
   accepts as-is (pass-through resume). The same conversation may also appear
   in discovery under a different (ACP) id — treat discovery as the
@@ -361,9 +444,15 @@ section — so clients can reproduce the CLI layout exactly:
       "ollama": {
         "kind": "success",
         "windows": [
-          { "key": "session", "label": "5h", "usagePercent": 31 },
-          { "key": "weekly", "label": "Week", "usagePercent": 67.5 }
-        ]
+          { "key": "monthly", "label": "Month", "usagePercent": 2.6,
+            "resetsAt": 1729071480308 }
+        ],
+        "usage": {
+          "plan": "pro", "usageUsd": 1.5747, "creditUsd": 60,
+          "requestCount": 246, "inputTokens": 14294081,
+          "cachedInputTokens": 12922504, "outputTokens": 940919,
+          "window": "30d"
+        }
       }
     } }
 ```
@@ -380,12 +469,14 @@ section — so clients can reproduce the CLI layout exactly:
   means the user never set OpenCode Go credentials — omit the section, like
   the CLI does.
 - `ollama` (`kind`: `success` | `not_configured` | `auth_error` |
-  `unavailable`): on success, `windows` carries whichever entries the
-  account's plan exposes — legacy plans: `session` (`5h`) + `weekly`
-  (`Week`); current credit plans: `monthly` (`Month`) — each with
-  `usagePercent` (0–100) and, when available, `resetsAt` (epoch ms,
-  derived client-side: epoch-aligned 5h buckets / Monday 00:00 UTC weeks /
-  the `/api/me` billing period or subscription-day anniversary for monthly).
+  `unavailable`): since the 2026-10 upstream API rewrite the endpoint reports
+  spend only, so on success `windows` carries the derived `monthly` (`Month`)
+  entry — 30d `usageUsd` ÷ the plan's monthly credit, absent when the plan's
+  credit is unknown — with `resetsAt` (epoch ms, from the `/api/me` billing
+  period or subscription-day anniversary) when available. The additive
+  `usage` object carries the raw analytics (`plan`, `usageUsd`,
+  `creditUsd?`, `requestCount`/token totals, `window: "30d"`) for clients
+  that want to render spend directly; older clients ignore it.
   `not_configured` means no
   Ollama API key is set — omit the section, like the CLI does.
 - Provider failures are per-section `kind` strings, not JSON-RPC errors —
@@ -453,40 +544,72 @@ a `providerId` and a network read, so fetch them from
 
 ### Write endpoints
 
-| Endpoint                                  | Effect          | Purpose                                     |
-| ----------------------------------------- | --------------- | ------------------------------------------- |
-| `PUT /settings/providers/{id}`            | `immediate`     | Enable/disable, rename                      |
-| `POST /settings/models`                   | `immediate`     | Add a model to an existing provider         |
-| `DELETE /settings/models/{pid}/{mid}`     | `immediate`     | Remove a model                              |
-| `POST /settings/skills/enable`            | `immediate`     | `{path, enable}`                            |
-| `DELETE /settings/skills/{path}`          | `immediate`     | Delete a skill directory                    |
-| `POST /settings/skills/copy-to-user`      | `immediate`     | Copy a workspace skill to `~/.zcode/skills` |
-| `PUT /settings/mcp/{name}`                | `needs-restart` | Create or update an MCP server              |
-| `DELETE /settings/mcp/{name}`             | `needs-restart` | Remove an MCP server                        |
-| `POST /settings/mcp/enable`               | `needs-restart` | `{name, enable}`                            |
-| `PUT /settings/hooks/{event}/{index}`     | `needs-restart` | Edit one existing hook entry                |
-| `POST /settings/hooks/enabled`            | `needs-restart` | `{enabled}` — the whole hooks tree          |
-| `PUT /settings/agents/{id}`               | `needs-restart` | Create or update a subagent                 |
-| `DELETE /settings/agents/{id}`            | `needs-restart` | Delete a subagent                           |
-| `POST /settings/agents/{id}/enable`       | `needs-restart` | `{enable}`                                  |
-| `POST /settings/reset-cards/use`          | —               | Consume a reset card (see below)            |
-| `POST /settings/reset-cards/opportunity`  | —               | Request an opportunity (see below)          |
-| `POST /settings/reset-cards/history-read` | —               | Mark the reset history read                 |
-| `POST /settings/backups/restore`          | per file        | Restore a backup                            |
-| `POST /settings/app-update/install`       | —               | Download and stage a new app build          |
+| Endpoint                                  | Effect          | Purpose                                                       |
+| ----------------------------------------- | --------------- | ------------------------------------------------------------- |
+| `PUT /settings/providers/{id}`            | `immediate`     | Enable/disable, rename, edit `baseUrl` / `apiType` / `apiKey` |
+| `POST /settings/models`                   | `immediate`     | Add a model to an existing provider                           |
+| `POST /settings/models/test`              | —               | `{providerId, modelId}` → one minimal probe request           |
+| `DELETE /settings/models/{pid}/{mid}`     | `immediate`     | Remove a model                                                |
+| `POST /settings/skills/enable`            | `immediate`     | `{path, enable}`                                              |
+| `DELETE /settings/skills/{path}`          | `immediate`     | Delete a skill directory                                      |
+| `POST /settings/skills/copy-to-user`      | `immediate`     | Copy a workspace skill to `~/.zcode/skills`                   |
+| `PUT /settings/mcp/{name}`                | `needs-restart` | Create or update an MCP server                                |
+| `DELETE /settings/mcp/{name}`             | `needs-restart` | Remove an MCP server                                          |
+| `POST /settings/mcp/enable`               | `needs-restart` | `{name, enable}`                                              |
+| `PUT /settings/hooks/{event}/{index}`     | `needs-restart` | Edit one existing hook entry                                  |
+| `POST /settings/hooks/enabled`            | `needs-restart` | `{enabled}` — the whole hooks tree                            |
+| `PUT /settings/agents/{id}`               | `needs-restart` | Create or update a subagent                                   |
+| `DELETE /settings/agents/{id}`            | `needs-restart` | Delete a subagent                                             |
+| `POST /settings/agents/{id}/enable`       | `needs-restart` | `{enable}`                                                    |
+| `POST /settings/reset-cards/use`          | —               | Consume a reset card (see below)                              |
+| `POST /settings/reset-cards/opportunity`  | —               | Request an opportunity (see below)                            |
+| `POST /settings/reset-cards/history-read` | —               | Mark the reset history read                                   |
+| `POST /settings/backups/restore`          | per file        | Restore a backup                                              |
+| `POST /settings/app-update/install`       | —               | Download and stage a new app build                            |
 
 Notes that clients must honor:
 
+- **Methods include PUT and DELETE**, and the hub's CORS preflight allows all
+  four (`GET, POST, PUT, DELETE, OPTIONS`) — a browser-based client can issue
+  them without a plugin fetch shim.
 - **Providers cannot be created or deleted** through this API — only enabled
-  state, display name, and the models inside an existing provider. Adding a
-  brand-new provider stays a desktop-app (or hand-edit) operation.
+  state, display name, the endpoint fields, and the models inside an existing
+  provider. Adding a brand-new provider stays a desktop-app (or hand-edit)
+  operation. Endpoint edits are presence-driven: send `baseUrl` (absolute
+  http(s) URL), `apiType` (`anthropic-messages` | `openai-chat-completions` |
+  `openai-responses`) and/or `apiKey`; `null` clears a field, an omitted key is
+  left alone. The models payload never echoes a key back — each provider
+  carries `hasApiKey` (presence only), because the payload crosses the hub
+  WebSocket and the client only needs to know whether the field is filled.
+- **`POST /settings/models/test` is a probe, not a prompt**: one request with
+  `max_tokens: 1` (`max_output_tokens: 16` for `openai-responses`) spelled for
+  the provider's `apiType`, 20s timeout, resolved from the personal provider
+  config's own `baseUrl` + `apiKey`. The answer is always `200 {ok, result}`
+  — `result.success:false` with the provider's `status` / truncated `message`
+  is a normal outcome the UI renders inline, and `result.reason`
+  (`no_key` | `no_base_url` | `unknown_provider`) means the probe could not
+  run at all. A green probe proves the endpoint accepts the model id with
+  that key; it does not prove quota, tool support or context length.
+- **MCP writes are type-checked**: `type` / `url` / `command` must be strings,
+  `args` an array of strings, `env` / `headers` objects of strings, `enabled` a
+  boolean — anything else is a `400`. Unknown keys still pass through, but a
+  malformed known field is refused rather than persisted: the agent runtime
+  validates each server on its own and silently SKIPS the one that fails, so a
+  bad entry would make the server you just added vanish at the next start with
+  no error anywhere. `type` may be omitted — the runtime infers `stdio` from a
+  `command` and `http` from a `url`, and also accepts a legacy `remote`.
 - **Hooks are read-complete but write-limited**: the tree is returned in full,
   and writes may only modify an existing entry's `command` / `timeoutMs` /
   `enabled`. Adding or removing events, matchers, or hook entries is not
   supported. Unknown keys on a hook object are preserved verbatim.
-- **Subagents**: `name`, `description`, `color`, `model`, `thoughtLevel` are
-  editable; the system-prompt body is not. Built-in agents (`general-purpose`,
-  `Explore`) cannot be edited or deleted — only their model override can change.
+- **Subagents**: `name`, `description`, `color`, `model`, `thoughtLevel`, the
+  `systemPrompt` body and the advanced frontmatter the runtime reads (`tools`,
+  `disallowedTools`, `skills` as string arrays; `permissionMode` from the
+  runtime's enum; `maxTurns` a positive integer; `background` /
+  `injectAgentsMd` booleans) are editable on custom agents. Presence decides:
+  an omitted key is left alone, `null` clears it (the app's "inherit" choice;
+  an empty list clears too). Built-in agents (`general-purpose`, `Explore`)
+  cannot be edited or deleted — only their model override can change.
   Send `{"providerId": null, "modelId": null}` on a built-in agent to CLEAR its
   override and return it to the workspace default.
 - **Reset cards are irreversible.** `POST /settings/reset-cards/use` requires
@@ -508,7 +631,9 @@ POST {hub}/api/instances/{id}/backend/restart → 200 { "ok": true, "cancelledTu
 Cancels that bridge's in-flight turns, kills its `zcode app-server` child, and
 lets the next prompt respawn it — the same path the sandbox arm-flip uses.
 `cancelledTurns` is how many conversations were interrupted; surface it before
-the user commits to the action.
+the user commits to the action. The response also carries `closed`: `false`
+means the old child refused to die, the pending flag stays armed (the writes
+were NOT applied), and the restart is worth retrying.
 
 `GET /api/instances/{id}/settings/pending-restart` reports whether that bridge
 process has recorded any `needs-restart` write since it last restarted its
@@ -518,8 +643,10 @@ tracking it itself. The flag is cleared by a successful backend restart.
 Use the **per-instance** spelling, not the hub-local
 `GET /api/settings/pending-restart`: the counter lives in the bridge that served
 the write, and the hub has no backend of its own to restart, so its copy can
-never be cleared (the hub-local route answers `501` on a restart attempt and
-keeps reporting `true` until the hub idle-exits).
+never be cleared. The hub-local route therefore answers `409` with a pointer to
+the per-instance spelling rather than a `pendingRestart` boolean — reporting
+`true` would strand a client on "restart needed" with no request able to clear
+it, and reporting `false` would be a claim it cannot verify.
 
 ### Reset cards (coding-plan quota)
 
@@ -542,12 +669,30 @@ POST /settings/reset-cards/history-read   { providerId }
 ```
 
 - `resetType` is `FIVE_HOUR` or `WEEK`.
-- The `nonce` is single-use and issued per status read. Sending a stale one
-  answers `409` — refresh the status and retry. This is what stops a screen the
-  user left open an hour ago from spending a card they have since seen change.
+- The `nonce` is issued per status read. Sending one that was never issued (or
+  that a newer status read replaced) answers `409` — refresh the status and
+  retry. This is what stops a screen the user left open an hour ago from
+  spending a card they have since seen change.
+- The nonce is burned only **after** the spend settles, never before it. A spend
+  that reached the server and failed on the way back (timeout, dropped
+  response, upstream error) leaves the nonce valid, so the retry is judged by
+  the backend and its idempotency key — not rejected out of hand with a `409`
+  the user cannot act on.
+- A spend already in flight for the same provider is refused with `409` ("a
+  reset for this provider is already in progress"). The deferred burn is safe
+  for a RETRY of the same gesture — same key, so the backend answers with the
+  outcome it already recorded — but a second INDEPENDENT gesture (a double tap,
+  another client that read the same status) brings its own key, and nothing
+  upstream could stop it burning a second card. Serialize the UI on the busy
+  state the client already tracks.
 - The `idempotencyKey` is what makes a retry safe: the same key always answers
   the same outcome, so a dropped response cannot burn a second card. Generate
-  it once per user gesture and reuse it on retry.
+  it once per user gesture and reuse it on retry — a FRESH key per attempt is
+  exactly what defeats it.
+- Status codes carry the retry advice. A `409` is a nonce problem (refresh). A
+  `502`/`504` means the reset API was unreachable or failed — the card may have
+  been spent, so retry with the same key rather than assuming the write failed.
+  A `400` is a request the server rejected outright.
 - A denial is `{ok: true, granted: false, nextTryAt: <ms>}` — a countdown to
   render, not an error.
 - `credentials_unavailable` means the machine's encrypted credential store
@@ -683,7 +828,7 @@ Two layers (ADR-0005), both plain HTTP — no ACP connection needed:
 ## Closing a session
 
 ```text
-POST {hub}/api/instances/{id}/sessions/{sessionId}/close   → 200 { "ok": true }
+POST {hub}/api/instances/{id}/sessions/{sessionId}/close   → 200 { "ok": true, "sessionIds": ["…"] }
 ```
 
 Retires a conversation from remote discovery. This addresses a protocol gap:
@@ -706,8 +851,30 @@ visibility changes. Two guards shape the semantics (ADR-0006):
 
 Errors: `401` bad token, `404` unknown session (or instance), `409` running,
 `502` bridge unreachable. Takes effect immediately in
-`/api/instances/{id}/status` and within one heartbeat (≤10s) in
-`/api/instances`.
+`/api/instances/{id}/status` — and, on a 200, the hub also drops the sid from
+its cached `/api/instances` entry at once, so the listing stops offering it
+before the bridge's next heartbeat.
+
+**The hub keeps a close tombstone (24h).** A proxied close that answered 200
+records the sid hub-side, and `POST /api/instances` refuses an **auto**
+resume of it with `409 session closed` (the `intent` field under
+[Creating / resuming a session](#creating--resuming-a-session)) — a client's
+reconnect ladder must not resurrect a session the user closed from another
+surface. The stone covers EVERY id spelling of the conversation: the close
+answer reports the bridge-resolved set (the requested sid plus the backend
+`sess_…` id and local aliases), so the `409` holds whichever spelling an
+auto ladder quotes. A user-intent resume always passes and clears the whole
+group; so does a bridge re-advertising any spelling one heartbeat TTL after
+the close (real use again, the same self-heal contract as above).
+
+**`session/load` carries the same intent** (`_meta.zcode.intent`, same
+spelling and default): an `"auto"` load — a client reconnect ladder
+replaying its own tab after it missed the close — of a conversation the
+BRIDGE retired still replays the history asked for, but does NOT re-arm
+discovery (no re-advertise, so the hub tombstone above stays armed), and the
+result carries `_meta.zcode.sessionClosed: true`: retire the tab locally and
+do not retry. Omitted (or `"user"`) keeps the manual-reopen behavior — a
+human picking the session on a live bridge re-arms discovery as before.
 
 Cross-instance note: if the same conversation is also registered by another
 bridge of the project, the hub's dedupe re-attaches it under that instance —
@@ -727,7 +894,9 @@ TERMINATES the CLI that hosts it:
 - A **headless serve** bridge exits immediately (its idle timeout pulled
   forward to zero).
 
-The instance disappears from `/api/instances` within one heartbeat. The
+The instance disappears from `/api/instances` as soon as the exiting bridge
+unregisters (the orderly shutdown path; the heartbeat TTL stays the fallback
+for a bridge that died without one). The
 conversation itself is still resumable later via
 `POST /api/instances` / `GET /api/projects/sessions` — closing ends the
 process, not the history. If other advertised conversations (or remote-created
@@ -758,6 +927,52 @@ Errors: `400` missing/empty title or oversized body (>4 KB), `401` bad token,
 `404` unknown session (or instance), `502` bridge unreachable. Renaming during
 a running turn is allowed — titles are no longer turn-coupled.
 
+## Deleting a project or session
+
+```text
+POST {hub}/api/projects/delete
+     body: { "workspacePath": "/Users/me/proj" }          → 200 { "ok": true, "deletedTasks": 12 }
+
+POST {hub}/api/instances/{id}/sessions/{sessionId}/delete → 200 { "ok": true, "deleted": true }
+```
+
+Both are **soft deletes** (tombstones), matching the ZCode App's own delete
+semantics: the tasks-index rows get `deleted=1`, every listing hides them, and
+the backend's session store keeps the conversation bytes — nothing is purged,
+and a delete is reversible by clearing the flag (no undelete API yet).
+
+What hides, from where:
+
+- **Project delete** flips every tasks row of the workspace. The project
+  vanishes from `GET /api/projects`, `POST /api/instances` then refuses it
+  (`403 unknown project`), and all its sessions disappear from every listing.
+- **Session delete** tombstones one row (creating a minimal one for sessions
+  that predate tasks-index sync). The session disappears from
+  `GET /api/projects/sessions`, from ACP `session/list`, and from the CLI
+  `/resume` picker. The desktop App's sidebar reads the same index — deleted
+  items hide there too (machine-wide consistency).
+- Sessions **archived** in the desktop App (`archived=1`) are hidden from the
+  same listings — the remote default list mirrors the App's default list.
+
+Deletes are also **self-healing** — a hide, not a ban: opening the project
+anywhere (the CLI/editor `/resume` picker itself, or a new tab in it) revives
+a FULLY deleted project's conversations in the same listing, and a tombstoned
+session that is used again (loaded with history, resumed, or prompted through
+any CLI/editor tab) has its tombstone cancelled. Individually deleted sessions
+of a project that still
+has visible conversations stay deleted, and desktop-archived rows are never
+revived (archive is the App's own marker). Resuming a tombstoned session id
+via `POST /api/instances` still answers `404 session deleted` — a stale
+client cannot resurrect anything; only real bridge-side usage does. Deleting
+does not stop anything else either: live or running conversations are refused
+with `409` (stop or close them first).
+
+Errors: `400` missing `workspacePath` or malformed session id, `401` bad
+token, `404` unknown instance / deleted-on-resume, `409` session is live on
+this bridge, `502` bridge unreachable, `503` tasks index unavailable
+(session delete only — never a silent success). Project delete is idempotent:
+an unknown or already-deleted project answers `200` with `deletedTasks: 0`.
+
 ## Hub self-upgrade
 
 ```text
@@ -766,11 +981,16 @@ POST {hub}/api/upgrade   → 200 { "ok": true, "restarting": false, "reason": "u
 ```
 
 Lets a remote client pick up a hub that was rebuilt on the machine (e.g. code
-edited and `pnpm build` run through a remote agent session). The client only
-**triggers** the check — the restart decision is entirely the hub's own. The
-hub restarts onto the on-disk code only when it judges that code NEWER than
-itself, by either signal:
+edited and `pnpm build` run through a remote agent session). A local rebuild
+needs no manual call — `pnpm build`'s last step runs `hub-upgrade-notify`,
+which POSTs here with the configured token (the npm `postinstall` does the
+same for package consumers), so a rebuilt dist is picked up automatically.
+The client only **triggers** the check — the restart decision is entirely the
+hub's own. The hub restarts onto the on-disk code only when it judges that
+code NEWER than itself, by any of these signals:
 
+- the on-disk dist's content fingerprint differs from the one frozen into the
+  running process at start (the primary, release-independent signal), **or**
 - the on-disk `package.json` version is newer than the version frozen into
   the running process at start, **or**
 - any `.js` under `dist/` has an mtime later than process start (a rebuild,
@@ -784,6 +1004,36 @@ mtime, so the condition self-negates — no restart loops, and an OLDER on-disk
 version never triggers anything.
 
 Errors: `401` bad token. `GET` (or any other method) falls through to `404`.
+
+## Workflow overview (machine-level)
+
+```text
+GET {hub}/api/workflow-overview   → 200 { ok: true, groups: [...], activeRuns: [...] }
+```
+
+The management page's single read (bridge 0.60.0+, served by the HUB, not
+proxied per instance): the hub aggregates every registered bridge into one
+GROUP per workspace (editor + serve bridges of one project render once,
+freshest-started bridge preferred, siblings as fallback) plus `activeRuns` —
+the machine-wide `pending`/`running` journal window, each row annotated with
+`ownerInstanceId` (the instance currently listing the row's session, so
+stop/detail address correctly from a client attached elsewhere). Per-read
+budget 8s, per-group best-effort: one dead bridge degrades only its own
+workspace to an `error` group.
+
+**Live correction for falsely-interrupted rows**: the dwf journal is shared
+by every backend process, and upstream's orphan reconciliation can write
+`stopped(interrupted)` onto a run that is still executing in ANOTHER process
+(it never flips back mid-run). For every served row carrying
+`stopReason: "interrupted"`, the hub probes the owner workspace's bridges'
+session-scoped live read (`/settings/workflow-runs?sessionId=`, joining by
+`runId`) and overrides the row with the live verdict — the SAME read
+covers stop/resume addressing. Note the parent session reads `idle` while its
+workflow flies, so "is the session running" is never a liveness test for a
+run; the runId join is. Server-internal module:
+`src/remote/workflow-overview.ts`.
+
+Errors: `401` bad token.
 
 ## Session files (read-only)
 
@@ -858,10 +1108,28 @@ everything below and you get the full replay):
       "replayedMessages": 47,
       "replayedTurns": 12,
       "totalMessages": 1893,
-      "totalTurns": 412
+      "totalTurns": 412,
+      "lastMessageId": "msg_b7c1…"
     }
   }
   ```
+
+  `lastMessageId` (additive) is the id of the newest message at or below the
+  slice's end anchor — on a `session/load` (tail or metadata-only) that is
+  history's newest message, on a `load_earlier` page the last message of the
+  page. It is the preferred reconcile key for a cached re-attach: a client
+  that watched a turn live has the new tail but a stale `totalMessages` (the
+  count only refreshes on replay), so comparing counts alone forces a
+  redundant full replay on every re-entry. Null on an empty store or an
+  id-less tail.
+
+  A metadata-only attach (`limit 0`) is deliberately FAST over complete: the
+  bridge skips the hydration settle for it, so on a freshly-resumed backend
+  the meta may describe a mid-hydration PREFIX (smaller `totalMessages`,
+  prefix-tail `lastMessageId`). Treat reconcile conservatively — a mismatch
+  is "unknown, re-attach with a real limit"; only an exact tail-id match
+  means "nothing changed". The follow-up full attach is where the settle
+  runs, so it always sees the complete history.
 
 - **`session/load_earlier`** (`{ sessionId, before, limit }`, limit defaults
   to 50) delivers one page of `session/update`s strictly older than `before`,

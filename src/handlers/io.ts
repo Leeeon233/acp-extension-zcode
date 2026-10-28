@@ -14,7 +14,7 @@ import { RequestError } from "@agentclientprotocol/sdk";
 
 import type { ClientRegistry } from "../remote/broadcast.js";
 import type { ZcodeAcpServer } from "../server.js";
-import { warn } from "../utils.js";
+import { log, warn } from "../utils.js";
 
 /**
  * Send a `session/update` notification to the client, serialized through the
@@ -336,6 +336,70 @@ export function sendAvailableCommandsDeferred(
 /** Throw a JSON-RPC error from a handler (the SDK converts it to an error response). */
 export function throwError(code: number, message: string): never {
   throw new RequestError(code, message);
+}
+
+/**
+ * Turn-state notification method names, old and new.
+ *
+ * The original `$/zcode/turnState` spelling follows the LSP convention, but
+ * ACP reserves `_`-prefixed names for extension notifications (#311) —
+ * `_zcode/turnState` is the spec-compliant spelling (strict routers like the
+ * Python `agent-client-protocol` library error on `$/`). Both are emitted per
+ * transition during the migration window; `$/` is deprecated and will be
+ * dropped once consumers (martty, zcode-acp-remote) move over. Clients must
+ * subscribe to exactly ONE name or they see every transition twice.
+ */
+export const TURN_STATE_METHODS = ["$/zcode/turnState", "_zcode/turnState"] as const;
+
+/**
+ * Broadcast the turn-state notification pair for every ACP alias of the
+ * session ({@link TURN_STATE_METHODS} — see its doc for the naming story).
+ *
+ * The single emit path for ALL turn-state reporting — the turn loop, the
+ * cancel/early-return paths and the auto-compact busy window (which reports
+ * running:true at start and settles it only if this run raised it) — so a
+ * client that tracks only turns reads every busy window, not just model turns.
+ * `cx` targets one connection; without it the notification fans out to every
+ * attached client. The turn LIFECYCLE transitions (runOneTurn's start/end)
+ * must broadcast — attach-only clients clear their running state and flush
+ * queued follow-ups off the END transition, which a cx-targeted emit never
+ * delivered (force-send from an attached client dead-ended, 2026-10-21);
+ * early-return paths keep `cx` so one client's rejected prompt cannot clear
+ * another client's genuinely running turn. Failures are per-alias and logged,
+ * never thrown.
+ *
+ * The END transition (running:false) may carry the turn's ACP usage block
+ * (`usage`, plus `turnMs` wall time): PromptResponse.usage reaches only the
+ * client that SENT the prompt, so an attach-only client (zcode-acp-remote
+ * watching a turn driven from the TUI or the editor) would never see cache /
+ * speed readouts without this. Additive fields — clients that read only
+ * `running` are unaffected.
+ */
+export async function emitSessionTurnState(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  running: boolean,
+  cx?: acp.AgentContext,
+  extras?: { usage?: acp.Usage; turnMs?: number },
+): Promise<void> {
+  const targetCx = cx ?? server.clients.broadcast();
+  const params: Record<string, unknown> = { sessionId: acpSid, running };
+  if (!running && extras?.usage) params.usage = extras.usage;
+  if (!running && typeof extras?.turnMs === "number") params.turnMs = extras.turnMs;
+  const results = await Promise.allSettled(
+    server
+      .sessionAliases(acpSid)
+      .flatMap((sid) =>
+        TURN_STATE_METHODS.map((method) => targetCx.notify(method, { ...params, sessionId: sid })),
+      ),
+  );
+  for (const r of results) {
+    if (r.status === "rejected") {
+      log(
+        `turnState notify failed: ${r.reason instanceof Error ? r.reason.message : String(r.reason)}`,
+      );
+    }
+  }
 }
 
 /** Server instance attached to the running agent (set by index.ts on connect). */

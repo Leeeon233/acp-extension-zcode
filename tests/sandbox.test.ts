@@ -99,7 +99,7 @@ function writeConfig(root: string, cfg: Record<string, unknown>): void {
 }
 
 describe("sandboxActive", () => {
-  it("stays off with no env and no opted-in root; the read materializes the template", () => {
+  it("stays off with no env and no opted-in root; the read writes NO file", () => {
     const armed = withPlatform("darwin", () => {
       resetSandboxDecisionForTest();
       return sandboxActive([tmpRoot]);
@@ -111,6 +111,7 @@ describe("sandboxActive", () => {
       deny: [],
       strictGit: false,
     });
+    expect(existsSync(sandboxConfigPath(tmpRoot))).toBe(false);
   });
 
   it("env arms globally regardless of configs", () => {
@@ -151,7 +152,14 @@ describe("sandboxActive", () => {
 });
 
 describe("readSandboxConfig / appendSandboxAllow", () => {
-  it("auto-creates the discovery template (enabled:false) on first read", () => {
+  it("writes NO template on first read while unarmed (#332)", () => {
+    const cfg = readSandboxConfig(tmpRoot);
+    expect(cfg).toEqual({ enabled: false, allow: [], deny: [], strictGit: false });
+    expect(existsSync(sandboxConfigPath(tmpRoot))).toBe(false);
+  });
+
+  it("auto-creates the discovery template (enabled:false) on first read once globally armed", () => {
+    process.env[SANDBOX_ENV] = "1";
     const cfg = readSandboxConfig(tmpRoot);
     expect(cfg).toEqual({ enabled: false, allow: [], deny: [], strictGit: false });
     const onDisk = JSON.parse(readFileSync(sandboxConfigPath(tmpRoot), "utf8"));
@@ -213,15 +221,21 @@ describe("readSandboxConfig / appendSandboxAllow", () => {
     expect(readSandboxConfig(tmpRoot).enabled).toBe(true); // agent rename/rm must not disarm
   });
 
-  it("re-templates a config that vanished while never armed", () => {
-    appendSandboxAllow(tmpRoot, "/x"); // materializes the enabled:false template
+  it("re-templates a vanished never-armed config only while globally armed", () => {
+    writeConfig(tmpRoot, { enabled: false, allow: [] });
     rmSync(sandboxConfigPath(tmpRoot));
+    process.env[SANDBOX_ENV] = "1";
     expect(readSandboxConfig(tmpRoot)).toEqual({
       enabled: false,
       allow: [],
       deny: [],
       strictGit: false,
     });
+    expect(existsSync(sandboxConfigPath(tmpRoot))).toBe(true); // re-templated
+    rmSync(sandboxConfigPath(tmpRoot));
+    delete process.env[SANDBOX_ENV];
+    readSandboxConfig(tmpRoot);
+    expect(existsSync(sandboxConfigPath(tmpRoot))).toBe(false); // unarmed → no write
   });
 
   it("reads an EACCES config dir as armed (chmod-0000 must not disarm)", () => {

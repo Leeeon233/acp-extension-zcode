@@ -18,7 +18,9 @@ import { Readable, Writable } from "node:stream";
 import * as acp from "@agentclientprotocol/sdk";
 import { z } from "zod";
 
-import { accountUsageStats } from "./handlers/account.js";
+import { accountUsageStatsViaHub } from "./handlers/account.js";
+import { authenticate } from "./handlers/authenticate.js";
+import { installCrashGuards } from "./crash-guards.js";
 import {
   cancel,
   listSessions,
@@ -43,6 +45,7 @@ import { resendPendingInteractions } from "./handlers/server-requests.js";
 import { loadPluginCommands } from "./config/plugin-commands.js";
 import { loadSkillCommands } from "./config/skill-discovery.js";
 import { getLodyRateLimits, LODY_EXTENSION_METHODS } from "./lody.js";
+import { filterWorkflowCommands } from "./config/workflow-gate.js";
 import { trackConnections } from "./remote/broadcast.js";
 import { parseRemoteConfig } from "./remote/config.js";
 import { startRemoteEndpoint, type RemoteEndpointHandle } from "./remote/endpoint.js";
@@ -50,6 +53,7 @@ import { reexecToBunIfEligible } from "./runtime.js";
 import { messages } from "./i18n.js";
 import { ZcodeAcpServer } from "./server.js";
 import { AGENT_INFO, SLASH_COMMANDS, log, warn } from "./utils.js";
+import { armQuotaResumeWatchdog, hasQuotaResumePendingForCwd } from "./workflow/quota-resume.js";
 
 /**
  * Build the full slash-command list: static bridge commands + dynamic plugin
@@ -80,6 +84,9 @@ function buildAllCommands() {
 }
 
 export async function main(): Promise<void> {
+  // Crash guards FIRST: any later async task that rejects without a catch
+  // must warn, not kill the process (the whole TUI window dies with us).
+  installCrashGuards();
   // Remote config is parsed BEFORE the server exists: a hub-incubated REPL
   // bridge (ADR-0016) arrives with ZCODE_ACP_REMOTE_PIN_CWD=1, and the pin
   // must hold from the very first session/new — not from the endpoint start.
@@ -133,6 +140,11 @@ export async function main(): Promise<void> {
 
   const app = buildAgentApp(server, allCommands);
 
+  // Quota auto-resume watchdog: waits out usage caps and continues quota-
+  // stopped workflow runs. Scans only on an already-live backend, never
+  // spawns one; alive for the process lifetime.
+  armQuotaResumeWatchdog(server);
+
   // Register broadcast tracking BEFORE connect so the stdio connection is
   // captured, then wire the stdio transport. The same app is later shared
   // with the remote WS endpoint.
@@ -153,6 +165,9 @@ export async function main(): Promise<void> {
  * one build, two transports.
  */
 function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof buildAllCommands>) {
+  // Exposed for the gate-aware menu catch-up (resendMenuAfterGateSettled in
+  // handlers/session.ts) — a cold bridge's menu snapshot predates the verdict.
+  server.allCommands = allCommands;
   /** Passthrough params parser for the ZCode-specific extension methods. */
   const extParams = z.object({ sessionId: z.string() }).passthrough();
 
@@ -160,7 +175,7 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
     acp
       .agent({ name: AGENT_INFO.name })
       .onRequest("initialize", (ctx) => server.initialize(ctx.params, ctx.client))
-      .onRequest("authenticate", (ctx) => server.authenticate(ctx.params))
+      .onRequest("authenticate", (ctx) => authenticate(ctx.params))
       .onRequest(
         LODY_EXTENSION_METHODS.rateLimitsGet,
         z
@@ -175,7 +190,11 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .onRequest("session/new", async (ctx) => {
         const result = await newSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(result.sessionId)) {
-          sendAvailableCommandsDeferred(server.clients, sid, allCommands);
+          sendAvailableCommandsDeferred(
+            server.clients,
+            sid,
+            filterWorkflowCommands(server, allCommands),
+          );
         }
         return result;
       })
@@ -189,7 +208,11 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
         // updates keep fanning out via prompt()'s broadcast cx.
         const result = await resumeSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(ctx.params.sessionId)) {
-          sendAvailableCommandsDeferred(server.clients, sid, allCommands);
+          sendAvailableCommandsDeferred(
+            server.clients,
+            sid,
+            filterWorkflowCommands(server, allCommands),
+          );
         }
         // A client that (re)connects catches up via resume/load; any interaction
         // request still waiting for an answer is re-sent to it so a question
@@ -201,7 +224,11 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
         // Targeted replay — see the session/resume comment above.
         const result = await loadSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(ctx.params.sessionId)) {
-          sendAvailableCommandsDeferred(server.clients, sid, allCommands);
+          sendAvailableCommandsDeferred(
+            server.clients,
+            sid,
+            filterWorkflowCommands(server, allCommands),
+          );
         }
         resendPendingInteractions(server, ctx.client, ctx.params.sessionId);
         return result;
@@ -219,8 +246,9 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       )
       // Account-level plan quota for remote clients (non-standard; Proposal
       // 0002). Pull-only, no session required; errors carry the failure kind in
-      // `data.kind` so clients can hide the quota UI.
-      .onRequest("account/usage_stats", z.object({}).passthrough(), () => accountUsageStats())
+      // `data.kind` so clients can hide the quota UI. Hub-first: converge on
+      // the hub's cached /api/quota when remote is on, local query otherwise.
+      .onRequest("account/usage_stats", z.object({}).passthrough(), () => accountUsageStatsViaHub())
       .onRequest("session/prompt", (ctx) => {
         // Mirror the user's message to every other client before the turn
         // starts — the prompting client renders it locally, the others only
@@ -309,6 +337,10 @@ export function serveIdleDecision(
  * endpoint exits instead of degrading.
  */
 export async function runHeadless(): Promise<void> {
+  // Crash guards FIRST, mirroring main(): a serve bridge is a long-lived hub
+  // child driving live remote sessions — a stray unhandled rejection must
+  // warn, not kill every session it hosts.
+  installCrashGuards();
   const remoteConfig = parseRemoteConfig();
   if (!remoteConfig) {
     warn(
@@ -349,6 +381,9 @@ export async function runHeadless(): Promise<void> {
   // to come from — idle exit below is this mode's shutdown path.
 
   const app = buildAgentApp(server, allCommands);
+  // Quota auto-resume watchdog (see main) — a serve bridge hosts remote
+  // sessions the app started; it must not depend on the app being awake.
+  armQuotaResumeWatchdog(server);
   // Track connections BEFORE the endpoint accepts any WS client so every
   // remote connection lands in the broadcast registry from its first message.
   trackConnections(app, server.clients);
@@ -363,8 +398,24 @@ export async function runHeadless(): Promise<void> {
   // and heartbeat timers are all unref'd (ADR-0001), so without this interval
   // the process would exit immediately. Deliberately NOT unref'd.
   let lastBusy = Date.now();
+  const cwd = server.projectCwd();
   const idleCheck = setInterval(() => {
-    if (server.clients.size > 0 || server.pendingTurns.size > 0) {
+    // A live /auto loop counts as busy even between rounds: a quota wait
+    // sleeps for the window reset while registering neither a client nor a
+    // turn — exiting here would kill the wait the bridge exists to serve
+    // (same rationale as the pending quota resume below).
+    if (
+      server.clients.size > 0 ||
+      server.pendingTurns.size > 0 ||
+      (server.goalLoops?.size ?? 0) > 0
+    ) {
+      lastBusy = Date.now();
+      return;
+    }
+    // A pending quota auto-resume keeps the backend (and this wait) alive:
+    // exiting now would lose the only actor able to continue the run while
+    // the app is asleep — the case the watchdog exists for.
+    if (hasQuotaResumePendingForCwd(cwd)) {
       lastBusy = Date.now();
       return;
     }

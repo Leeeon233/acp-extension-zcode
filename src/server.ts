@@ -11,6 +11,7 @@ import type * as acp from "@agentclientprotocol/sdk";
 
 import {
   builtinProviderEnv,
+  type BackendKind,
   loadZcodeCredentials,
   mergeEnvWithCreds,
   resolveZcodeCommand,
@@ -18,13 +19,26 @@ import {
   ZcodeBackend,
 } from "./backend/index.js";
 import { armSandboxArgv, collectSandboxWorkspaces, sandboxActive } from "./backend/sandbox.js";
+import {
+  captureGate,
+  ensureWorkflowPolicyPushed,
+  resolveWorkflowGate,
+  type WorkflowGate,
+} from "./config/workflow-gate.js";
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
-import { enqueueSessionSend } from "./handlers/io.js";
+import { enqueueSessionSend, TURN_STATE_METHODS } from "./handlers/io.js";
 import { SandboxRestartBatcher, flushSandboxGrants } from "./handlers/sandbox-allow.js";
+import { authenticate } from "./handlers/authenticate.js";
 import { LODY_AGENT_CAPABILITIES } from "./lody.js";
-import { answerProviderRuntimeHeaders } from "./handlers/server-requests.js";
+import {
+  answerProviderRuntimeHeaders,
+  sweepOrphanedServerRequests,
+} from "./handlers/server-requests.js";
 import { SessionTitleListener } from "./handlers/session-titles.js";
+import { pushInteractionIfOffline } from "./push/push.js";
 import { ClientRegistry } from "./remote/broadcast.js";
+import { envWithLoginShell } from "./remote/login-shell-env.js";
+import { stopAllWorkflowRunPollers } from "./workflow/poller.js";
 import { AGENT_INFO, clientConnectionRoot, PROTOCOL_VERSION, log, warn } from "./utils.js";
 
 /** Client capabilities advertised in the initialize request. */
@@ -39,19 +53,10 @@ export interface ClientCapabilities {
 /**
  * Auth method advertised at `initialize` and accepted by `authenticate`.
  *
- * The GLM API key is read from `~/.zcode/v2/config.json` by the ZCode backend
- * subprocess, so there is no editor-side credential exchange: the auth method
- * is agent-type and `authenticate` only acknowledges it.
+ * Credentials come from desktop configuration or a saved bridge account.
+ * The agent-type method checks readiness without an editor-side key exchange.
  */
-export const ZCODE_AUTH_METHOD_ID = "zcode-credentials";
-const ZCODE_AUTH_METHODS: acp.AuthMethod[] = [
-  {
-    id: ZCODE_AUTH_METHOD_ID,
-    name: "ZCode built-in credentials",
-    description:
-      "Reads the GLM API key from ~/.zcode/v2/config.json managed by the ZCode desktop app. No editor-side credentials required.",
-  },
-];
+export { ZCODE_AUTH_METHOD_ID } from "./handlers/authenticate.js";
 
 /** A pending prompt turn. */
 export interface PendingTurn {
@@ -122,6 +127,13 @@ export const BACKEND_RESIDENT_TTL_MS = 5 * 60_000;
 export class ZcodeAcpServer {
   /** The ZCode subprocess client (lazy — spawned on first use). */
   backend: ZcodeBackend | null = null;
+  /**
+   * Backend kind this bridge serves (ADR-0023): fixed "zcode" until the dsh
+   * adapter lands (its port wires --backend / ZCODE_ACP_BACKEND selection).
+   * Capability gates read `backendCapabilities(backendKind)` — the single
+   * enforcement point — so flipping the kind flips every gated surface.
+   */
+  readonly backendKind: BackendKind = "zcode";
   /** acp_sid → zcode session id (usually identical, but kept for clarity). */
   readonly sessionMap = new Map<string, string>();
   /**
@@ -200,17 +212,44 @@ export class ZcodeAcpServer {
    * plateau inside the cap again meant the marker never cleared — every
    * session/load re-paid a capped settle (observed 2026-09-20 on a 7413-
    * message session: 22–56s loads). Reset on backend respawn — a rehydrating
-   * session starts growing from zero again.
+   * session starts growing from zero again. The entry's PRESENCE is also the
+   * generation marker: "this backend instance has settle-observed the store
+   * (0 = observed empty is a valid write)". Replay paths re-settle a session
+   * with NO entry instead of trusting a plain read (fetchMessagesForReplay);
+   * session/create and fork seed 0 because a fresh store is complete by
+   * construction.
    */
   readonly hydrationWatermark = new Map<string, number>();
   /**
-   * Backend session ids with a DETACHED auto-compact in flight (see
-   * runAutoCompactDetached in config/auto-compact.ts). The turn that armed it
-   * has already returned — cancel/preempt must not touch the compaction, the
-   * drain gate must not escalate on it, and a concurrent prompt's busy-retry
-   * extends its budget to the compaction settle bound instead of failing.
+   * Backend session ids with a compaction in flight — detached auto-compact
+   * (see runAutoCompactDetached in config/auto-compact.ts) AND manual
+   * /compact or direct session/compact calls (extensions.ts compact()
+   * registers the same flag). The turn that armed it has already returned —
+   * cancel/preempt must not touch the compaction, the drain gate must not
+   * escalate on it, a concurrent prompt HOLDS on this flag instead of racing
+   * the compact lock, and a busy-retry extends its budget to the compaction
+   * settle bound instead of failing.
    */
   readonly autoCompactInFlight = new Set<string>();
+
+  /**
+   * Workflow display names for run-settle push titles (runId → name). Set at
+   * launch time (settings/workflow.ts — the launch request knows the name);
+   * read by the background-task arm sites and cleared by the poller's
+   * teardown. Model-launched runs carry no name (title falls back to the run
+   * id prefix).
+   */
+  readonly workflowRunNames = new Map<string, string>();
+  /**
+   * Bridge-side session-scoped "always allow" grants for the workflow
+   * approval tools (SESSION_ALWAYS_TOOLS, src/interaction/adapter.ts):
+   * zcodeSid → tool names the client approved for this session. The v3 wire
+   * crops the backend's own session-always option, so the bridge re-offers
+   * it and mirrors the grant here — the semantic copy of upstream's
+   * in-memory grantSessionPermission, which dies with the backend runtime
+   * (this map therefore clears at every backend respawn).
+   */
+  readonly sessionAutoAllows = new Map<string, Set<string>>();
   /**
    * Last compact terminal state per backend session id, recorded from the
    * backend's `state.updated` notification (reasons `session_compacted` /
@@ -245,6 +284,52 @@ export class ZcodeAcpServer {
    * evidence only — no version sniffing. Reset on backend respawn.
    */
   observedSendBusyReject = false;
+  /**
+   * Dynamic-workflow gate verdict for the CURRENT backend generation
+   * (desktop-host parity, src/config/workflow-gate.ts): an anonymous remote
+   * read resolved ONCE per backend spawn and pinned to that instance — a
+   * server-side mode flip lands at the next respawn. session/create·resume
+   * params await it (workflowFlag in handlers/session.ts); the process-wide
+   * policy push chains off it in ensureBackend. Null before the first spawn
+   * reads as disabled (fail-closed).
+   */
+  backendWorkflowGate: Promise<WorkflowGate> | null = null;
+  /**
+   * Per-backend-generation marker for the dynamic-workflow policy push: set
+   * when `workspace/updateDynamicWorkflowPolicy` has been sent (spawn-time for
+   * an enabled verdict, or on the first gate consumption after a local
+   * override flips on — ensureWorkflowPolicyPushed). Reset at every spawn.
+   */
+  workflowPolicyPushed = false;
+  /**
+   * The push shape the current generation carried ("onDemand" | "alwaysOn" |
+   * "boolean" | null) — a mode change re-arms the once-per-generation guard
+   * (config/workflow-gate.ts). Reset at every spawn.
+   */
+  workflowPolicyPushedMode: "onDemand" | "alwaysOn" | "boolean" | null = null;
+  /**
+   * True once this backend generation ACCEPTED a mode-carrying policy push —
+   * only then may session/create·resume carry `dynamicWorkflowMode` (3.15.1;
+   * older strict schemas reject the key with no cheap retry on that path).
+   * Reset at every spawn.
+   */
+  workflowModeOnWire = false;
+  /**
+   * True once this backend generation rejected the per-session `toolDenylist`
+   * key on session/create·resume (pre-toolDenylist strict schema). While set,
+   * the key is omitted up front instead of paying a rejected round-trip per
+   * session — the tool policy is NOT applied on such a backend (warned once).
+   * Reset at every spawn.
+   */
+  toolDenylistRejected = false;
+  /**
+   * The full slash-command list (set once by buildAgentApp in index.ts).
+   * Read by the gate-aware menu catch-up (resendMenuAfterGateSettled in
+   * handlers/session.ts): a cold bridge's session/new snapshot predates the
+   * workflow verdict, so the materialization path re-sends the menu once the
+   * gate has settled.
+   */
+  allCommands: Array<{ name: string; description: string; input?: { hint: string } }> | null = null;
   /**
    * Sandbox dynamic-allow state (ADR-0011): realpaths granted for this
    * bridge lifetime ("仅此一次" answers) — folded into the Seatbelt profile
@@ -342,8 +427,22 @@ export class ZcodeAcpServer {
    * spend it — prompts from other attached clients (a phone app racing the
    * boot window) never disarm it. Null once spent or when the auto-submit was
    * lost (the same connection's first prompt was something else).
+   *
+   * Armed ONLY for a MARTTY connection (marttyConnectionRoots — the
+   * per-connection identity, NOT the sticky process flag): the create-bind
+   * path lets an attaching phone's session/new claim the same bind, and a
+   * sticky-gated arm there re-pointed the handshake at the phone — the TUI's
+   * auto-submitted trigger then missed the ack and reached the model
+   * (observed live from the mobile app, 2026-09-23).
    */
   bootResumeTriggerConnection: unknown = null;
+  /**
+   * Per-connection `connectionContext` roots that have already submitted at
+   * least one prompt. Backs the unarmed trigger fallback in runPrompt: a
+   * martty connection's FIRST prompt is a candidate for the banner
+   * handshake; anything after it is real user input.
+   */
+  readonly connectionPromptSeen = new Set<unknown>();
   /**
    * Hub session-create binding (remote create, ADR-0016): when the hub
    * incubates a TUI for a remote session-create it pre-generates the ACP
@@ -379,6 +478,14 @@ export class ZcodeAcpServer {
     string,
     { title?: string; updatedAt: number; hasActivity?: boolean }
   >();
+  /**
+   * Sessions retired from discovery by a remote close (ADR-0006), with the
+   * retirement time. Trailing activity from the dying conversation — a turn
+   * that outlives the force-close settle bound, a late title push — must not
+   * re-advertise them; a genuine later use clears the stamp via
+   * `markSessionActive` (the close's documented re-arm).
+   */
+  readonly discoveryRetiredAt = new Map<string, number>();
   /** Session titles already set, to enforce set-once (acp_sid → title). */
   readonly sessionTitles = new Map<string, string>();
   /**
@@ -396,7 +503,8 @@ export class ZcodeAcpServer {
    * bare `registerSession` mapping does NOT qualify, and neither does an old
    * timestamp: the backend answers `session/messages` only for sessions with
    * a live resident runtime, so `session/load` must not skip the resume RPC
-   * for those (the replay would silently come back empty). Use
+   * for those (the replay would silently come back empty). Cleared wholesale
+   * on backend respawn (resetBackendGeneration). Use
    * `markBackendLoaded`/`isBackendSessionLive` instead of touching the map.
    */
   readonly backendLoadedSessions = new Map<string, number>();
@@ -409,6 +517,18 @@ export class ZcodeAcpServer {
   readonly titleEligibleSessions = new Set<string>();
   /** Last mode id advertised to the client (acp_sid → modeId), for change detection. */
   readonly lastMode = new Map<string, string>();
+  /**
+   * Backend sessions (zcodeSid) whose runtime plan flag is ON. EnterPlanMode/
+   * ExitPlanMode flip the execution state's `planEnabled` WITHOUT touching
+   * `runtime.config.mode`, so every v3 read (session/read settings, state
+   * patches) keeps reporting the underlying mode — plan is invisible there
+   * (verified in upstream source: session-mode-port.ts sets only the flag;
+   * mapSessionSettings reads app.getMode()). Tracked here from the
+   * SessionModeChanged events (v3 wire: generic `session.updated` with a raw
+   * {mode, planEnabled} payload) and folded into every mode the bridge
+   * displays or advertises.
+   */
+  readonly sessionPlanActive = new Set<string>();
   /**
    * Timestamp of the last cancel (user stop or preempt), keyed by zcodeSid.
    * Set in cancel() and preemptInFlightTurn(); read in runEventTurn's stall
@@ -425,15 +545,16 @@ export class ZcodeAcpServer {
   readonly modelCache = new Map<string, string>();
   /**
    * Per-session (zcodeSid) FULL model-availability list, captured from the
-   * `session/create` snapshot (`settings.model.available`). Only create/resume
-   * return the complete list with authoritative `reasoning.defaultLevel` —
-   * `session/read` answers `modelAvailability:"current"` (just the active
-   * model). Model switches need a target's default reasoning level, so this
-   * cache is the lookup; an entry that declares no levels simply has none.
+   * `session/create`/`resume` snapshot (`settings.model.available`). Only
+   * create/resume return the complete list with authoritative
+   * `reasoning.defaultLevel` — `session/read` answers
+   * `modelAvailability:"current"` (just the active model). Model switches
+   * resolve the target's reasoning level from this cache first; an entry that
+   * declares no levels simply has none (the backend's own "level-less" verdict).
    */
   readonly modelAvailability = new Map<
     string,
-    Array<{ providerId?: string; modelId?: string; defaultLevel?: string }>
+    Array<{ providerId?: string; modelId?: string; defaultLevel?: string; levels?: string[] }>
   >();
   /**
    * Per-session (zcodeSid) background-task listeners. Registered once when a
@@ -462,6 +583,15 @@ export class ZcodeAcpServer {
    */
   readonly notifyTurnActiveSince = new Map<string, number>();
   /**
+   * Last USER-originated action (session/prompt or session/cancel, stamped via
+   * noteUserActivity) on this bridge, epoch ms. Read by pushSettled's quiet
+   * window: a settle within `push.quietMs` of it means the user is still at
+   * the desk and the "come back" ping would be noise. Bridge-internal rounds
+   * (sandbox continuations, goal-loop rounds) never stamp, so a settle long
+   * after the user left still pushes.
+   */
+  lastUserActivityAt = 0;
+  /**
    * Sessions (acpSid) whose title was set by MANUAL user intent (the remote
    * rename endpoint, or a `session.titleUpdated` push with source "custom"
    * from another surface). The backend's later `generated` title pushes must
@@ -477,6 +607,15 @@ export class ZcodeAcpServer {
    * short command with no progress, so the result emits output once).
    */
   readonly terminalSentData = new Map<string, string>();
+  /**
+   * Backend toolCallIds whose ACP tool card has been dispatched to clients
+   * (backend callId → acp card id; identical on the live dispatch path). Feeds
+   * the workflow-run guard in BackgroundTaskListener: a workflow background
+   * task folds its progress into the CreateWorkflow card only when that card
+   * is actually visible — otherwise the generic [background] card remains.
+   * Bounded FIFO (old ids age out; callIds are never reused by the backend).
+   */
+  readonly dispatchedToolCalls = new Map<string, string>();
   /** Monotonic id counter; base 10_000_000 to avoid collisions with zcode-originated ids. */
   private msgCounter = 10_000_000;
 
@@ -491,11 +630,38 @@ export class ZcodeAcpServer {
 
   constructor(opts: { serveMode?: boolean } = {}) {
     this.serveMode = opts.serveMode === true;
+    // Offline-push hook (§5.1): fires inside requestAny's zero-clients branch.
+    // The gate (clients.size / ACTIVE) lives in the push module; this wiring is
+    // the only connection between the remote layer and the push module.
+    this.clients.noClientsObserver = (method, params) =>
+      pushInteractionIfOffline(this, method, params);
+    // Orphaned-interaction sweep (see sweepOrphanedServerRequests): asks no
+    // turn loop will ever poll — above all a background workflow run's — are
+    // forwarded, pushed or settled instead of silently timing out. Unref'd,
+    // never keeps the process alive; a no-op while the queue is empty.
+    const sweep = setInterval(() => {
+      void sweepOrphanedServerRequests(this).catch(() => undefined);
+    }, 2_000);
+    sweep.unref();
   }
 
   /** Next JSON-RPC id for messages we send to zcode. */
   nextId(): number {
     return ++this.msgCounter;
+  }
+
+  /**
+   * Record that the ACP card for a backend tool call was dispatched (called
+   * from dispatchEvent's ToolCallNew branch). Bounded: when the cap is hit the
+   * oldest id ages out — a workflow run arms its poller within seconds of the
+   * card appearing, so stale entries are irrelevant.
+   */
+  noteDispatchedToolCall(backendCallId: string, acpCallId: string): void {
+    this.dispatchedToolCalls.set(backendCallId, acpCallId);
+    if (this.dispatchedToolCalls.size > 2048) {
+      const oldest = this.dispatchedToolCalls.keys().next().value;
+      if (oldest !== undefined) this.dispatchedToolCalls.delete(oldest);
+    }
   }
 
   /**
@@ -505,14 +671,54 @@ export class ZcodeAcpServer {
    * a Seatbelt profile built from the live workspace roots — session/new
    * records cwds before any backend RPC (lazy placeholders), so the whitelist
    * is complete by the time the backend materializes here.
+   *
+   * Async because the spawn env completes from a login-shell probe that must
+   * never run synchronously (it would freeze this process's event loop for the
+   * probe's full timeout). The in-flight probe is shared, so concurrent
+   * callers pay for ONE shell.
    */
-  ensureBackend(): ZcodeBackend {
+  async ensureBackend(): Promise<ZcodeBackend> {
     if (this.backend && !this.backend.isDead) return this.backend;
+    // Dynamic-workflow gate (desktop-host parity): kick the remote verdict off
+    // FIRST so the fetch parallels the login-shell probe and the spawn; the
+    // verdict is pinned to THIS backend generation. The assignment happens
+    // only in this spawn branch (re-entry on a live backend returns above),
+    // so exactly one gate resolution — and one policy push (below) — exists
+    // per backend instance. resolveWorkflowGate is fail-closed by design; the
+    // catch is belt-and-braces so the field can never hold a rejected
+    // promise (create/resume params await it). captureGate attaches the
+    // settled-value collector AT CREATION so the first workflowGateNow read
+    // after settlement sees the verdict (a read-time collector would be one
+    // microtask late — enough to filter the first `/` menu of a session).
+    const workflowGate = captureGate(
+      resolveWorkflowGate().catch((): WorkflowGate => ({
+        mode: "unknown",
+        enabled: false,
+        source: "default",
+      })),
+    );
+    this.backendWorkflowGate = workflowGate;
+    // Fresh backend generation: the policy-push marker from the previous
+    // instance is void (its push went to a dead process), and the in-memory
+    // session-always grants mirror the backend's own session ruleset, which
+    // dies with the runtime.
+    this.workflowPolicyPushed = false;
+    this.workflowPolicyPushedMode = null;
+    this.workflowModeOnWire = false;
+    this.sessionAutoAllows.clear();
     // builtinProviderEnv injects the CLI's built-in provider table the way the
     // desktop host does — a bare .app-bundle CLI cannot find it on its own.
     // zcodeDataBaseDirEnv translates the bridge's ZCODE_HOME into the CLI's
     // own ZCODE_DATA_BASE_DIR spelling so both sides read the same data tree.
+    // The login-shell completion goes FIRST so the provider/builtin env below
+    // overrides it. An editor-launched bridge (Zed's extension host, a JetBrains
+    // plugin) inherits launchd's environment — a bare PATH with no version
+    // managers in it — so a backend spawned from it cannot find `node`, `npx`
+    // or the user's own tools even though they work in a terminal. The CLI
+    // shells out to project tooling (npm scripts, local binaries), so a
+    // completed PATH changes what a session can actually do.
     const env = {
+      ...(await envWithLoginShell()),
       ...mergeEnvWithCreds(loadZcodeCredentials()),
       ...builtinProviderEnv(),
       ...zcodeDataBaseDirEnv(),
@@ -534,16 +740,29 @@ export class ZcodeAcpServer {
       // never be escaped from within.
       env.ZCODE_ACP_SANDBOX_ACTIVE = "1";
     }
+    // The backend's working directory is inherited from THIS process, which the
+    // launch path already put in the project directory: a remote TUI window's
+    // `.command` script `cd`s before exec (terminalTuiScript), and the headless
+    // serve spawn passes `cwd` (defaultSpawnServe). Forcing a single `cwd` here
+    // would be both redundant and wrong — the backend is one process shared by
+    // every session, while the directory belongs to each window/session.
     const backend = new ZcodeBackend(argv, env);
     this.backend = backend;
-    // Fresh backend process: every session rehydrates from scratch, so the
-    // settle bookkeeping from the previous instance is void.
-    this.hydrationUnsettled.clear();
-    this.hydrationWatermark.clear();
-    this.compactOutcomes.clear();
-    // …and the send-semantics evidence: the respawned process may be an
-    // older build that still accepts mid-turn sends as steer.
-    this.observedSendBusyReject = false;
+    this.resetBackendGeneration();
+    // Verdict observability (one line per spawn — a dark gate was previously
+    // indistinguishable from an enabled one in the logs) plus the first enable
+    // channel: the process-wide policy push, fire-and-forget through the
+    // flip-aware helper (never awaited here — the per-session create/resume
+    // flag is the second channel and must not depend on this flight). A
+    // backend that dies before the gate resolves just fails the push
+    // best-effort inside the helper.
+    void workflowGate.then((gate) => {
+      log(`workflow-gate: remote verdict mode=${gate.mode} source=${gate.source}`);
+      if (gate.mode === "unknown") {
+        warn("workflow-gate: client-config fetch failed — gate reads disabled (fail-closed)");
+      }
+      ensureWorkflowPolicyPushed(this);
+    });
     // Answer the provider runtime-headers handshake the moment it ARRIVES:
     // the backend asks before every model request on a zhipu-account provider,
     // and outside a turn loop (compact's internal turn, session/goal set) the
@@ -641,6 +860,33 @@ export class ZcodeAcpServer {
   }
 
   /**
+   * State void at every backend spawn — the previous process's residents,
+   * hydration bookkeeping, compaction outcomes and send-semantics evidence all
+   * died with it. Called from ensureBackend on every (re)spawn; exposed as a
+   * method so the generation-reset contract itself is testable without
+   * spawning a real backend.
+   */
+  resetBackendGeneration(): void {
+    // Fresh backend process: every session rehydrates from scratch, so the
+    // settle bookkeeping from the previous instance is void.
+    this.hydrationUnsettled.clear();
+    this.hydrationWatermark.clear();
+    this.compactOutcomes.clear();
+    // …and the send-semantics evidence: the respawned process may be an
+    // older build that still accepts mid-turn sends as steer.
+    this.observedSendBusyReject = false;
+    // …and the toolDenylist schema verdict: the respawned build may accept it.
+    this.toolDenylistRejected = false;
+    // …and the backend-loaded stamps: they vouch for residents of a process
+    // that no longer exists. A surviving stamp kept isBackendSessionLive true
+    // across a respawn, so session/load skipped the resume RPC and read a
+    // backend that never loaded the session — the replay came back empty
+    // (the backend's "Session is not active" is swallowed by fetchMessages),
+    // or a prefix when a sibling client's re-resume was still hydrating.
+    this.backendLoadedSessions.clear();
+  }
+
+  /**
    * Register the acp_sid ↔ zcode_sid mapping both ways. Use this instead of
    * `sessionMap.set(...)` directly so the reverse index stays in sync (the
    * background-task listener needs the reverse lookup to address notifications).
@@ -690,6 +936,66 @@ export class ZcodeAcpServer {
       updatedAt: Date.now(),
       hasActivity: true,
     });
+    // Genuine use re-arms discovery after a remote close (ADR-0006): the
+    // retirement stamp only ever suppressed TRAILING activity of the retired
+    // conversation, and it must not suppress the next real one.
+    this.discoveryRetiredAt.delete(acpSid);
+    // Self-heal soft-delete tombstones (ADR-0031 amendment): using a session
+    // again cancels its tombstone — the session itself, and project-wide when
+    // the workspace had gone fully invisible (project delete). Fire-and-forget
+    // best-effort; never blocks or breaks the activity path.
+    void this.reviveTombstonesFor(acpSid);
+  }
+
+  /**
+   * Retire a session from remote discovery (the ADR-0006 close): drop the
+   * summary and the remote-created placeholder, and stamp the retirement so
+   * activity landing AFTER the close cannot re-advertise the conversation.
+   */
+  retireDiscovery(acpSid: string): void {
+    this.sessionSummaries.delete(acpSid);
+    this.remoteCreatedSessions.delete(acpSid);
+    this.discoveryRetiredAt.set(acpSid, Date.now());
+  }
+
+  /**
+   * True when the session is currently retired from remote discovery — the
+   * remote-close stamp an AUTO `session/load` checks so a client reconnect
+   * ladder cannot resurrect the conversation (ADR-0006 follow-up): the load
+   * replays history but skips the re-arm and answers
+   * `_meta.zcode.sessionClosed: true`.
+   */
+  isDiscoveryRetired(acpSid: string): boolean {
+    return this.discoveryRetiredAt.has(acpSid);
+  }
+
+  /**
+   * True when the session was retired from discovery at or after `sinceMs` —
+   * the guard a turn's settle path checks (`turnStartedAt`): a turn that was
+   * already running when the close retired the conversation belongs to the
+   * retired conversation, and its terminal activity must not resurrect it.
+   */
+  wasDiscoveryRetiredSince(acpSid: string, sinceMs: number): boolean {
+    const at = this.discoveryRetiredAt.get(acpSid);
+    return at !== undefined && at >= sinceMs;
+  }
+
+  /**
+   * Tombstone revival behind markSessionActive. Guarded, not destructured:
+   * several test suites mock tasks-index PARTIALLY (without this export), and
+   * a missing index or unknown cwd must never surface on the activity path.
+   */
+  private async reviveTombstonesFor(acpSid: string): Promise<void> {
+    try {
+      const tasksIndex = await import("./tasks-index.js");
+      if (typeof tasksIndex.reviveTombstonesOnActivity !== "function") return;
+      await tasksIndex.reviveTombstonesOnActivity({
+        taskId: this.resolveSid(acpSid) ?? acpSid,
+        workspacePath: this.sessionCwds.get(acpSid),
+      });
+    } catch {
+      // best-effort — a tombstone revival failure must never break a turn
+    }
   }
 
   /**
@@ -742,8 +1048,8 @@ export class ZcodeAcpServer {
    * forwarded to the client. The turn loop's own listener coexists via the
    * backend's per-session listener Set.
    */
-  ensureBackgroundListener(zcodeSid: string): BackgroundTaskListener {
-    const backend = this.ensureBackend();
+  async ensureBackgroundListener(zcodeSid: string): Promise<BackgroundTaskListener> {
+    const backend = await this.ensureBackend();
     const existing = this.backgroundListeners.get(zcodeSid);
     if (existing && this.backgroundListenerBackend.get(zcodeSid) === backend) return existing;
     // Fresh session, or the backend was respawned since registration —
@@ -767,6 +1073,9 @@ export class ZcodeAcpServer {
    * in_progress forever (#194). Best-effort; called from shutdown paths.
    */
   async emitBackgroundTaskShutdownRecords(): Promise<void> {
+    // Workflow-run pollers poll the backend — stop them before the pipe
+    // closes (mirrors the listener records below).
+    stopAllWorkflowRunPollers();
     for (const listener of this.backgroundListeners.values()) {
       try {
         await listener.emitShutdownRecords();
@@ -917,7 +1226,7 @@ export class ZcodeAcpServer {
       agentInfo: { ...AGENT_INFO },
       agentCapabilities: {
         loadSession: true,
-        promptCapabilities: { image: true, audio: false, embeddedContext: false },
+        promptCapabilities: { image: true, audio: false, embeddedContext: true },
         // http MCP configs are forwarded verbatim to the backend (session/
         // create + resume), which mounts them fine — the declaration was the
         // only blocker keeping clients from sending http servers (#180).
@@ -925,31 +1234,32 @@ export class ZcodeAcpServer {
         sessionCapabilities: { list: {}, resume: {}, fork: {} },
         // Read-only session file access lives on the bridge's loopback /fs
         // endpoint, hub-proxied at /api/instances/{id}/fs/* (ADR-0004).
-        // `lody` advertises the provider-neutral extension surface consumed
-        // by Lody's ACP client (usage accounting, quota snapshots, task
-        // lifecycle metadata, and compaction activity markers).
-        _meta: { zcode: { fs: true }, lody: LODY_AGENT_CAPABILITIES },
+        // turnState: the out-of-band running notifications this bridge emits,
+        // old and new spellings (#311) — see TURN_STATE_METHODS.
+        _meta: {
+          zcode: { fs: true, turnState: [...TURN_STATE_METHODS] },
+          lody: LODY_AGENT_CAPABILITIES,
+        },
       },
-      // The GLM API key is read from ~/.zcode/v2/config.json by the ZCode
-      // backend subprocess; the editor never needs to supply credentials.
-      // Declared as AuthMethodAgent (no `type` field → defaults to "agent"),
-      // which the ACP registry CI accepts as "agent self-handles auth".
-      authMethods: ZCODE_AUTH_METHODS,
+      // Credentials come from the ZCode side — the desktop app's config.json
+      // / provider_config.json, or `zcode-acp setup`'s saved accounts — and
+      // the editor never supplies any. Declared as AuthMethodAgent (no `type`
+      // field → defaults to "agent"), which the ACP registry CI accepts as
+      // "agent self-handles auth". `authenticate` (the readiness check behind
+      // this declaration) lives in handlers/authenticate.ts.
+      authMethods: [
+        {
+          id: "zcode-credentials",
+          name: "ZCode built-in credentials",
+          description:
+            "Reads the GLM API key from the ZCode desktop app's credential files (~/.zcode/v2) or a saved zcode-acp account. No editor-side credentials required.",
+        },
+      ],
     };
   }
 
-  /**
-   * Handle ACP `authenticate`. The advertised method is backed by ZCode's own
-   * credential store (read lazily by the backend on first session RPC), so the
-   * bridge only needs to acknowledge the selected method. Without this route a
-   * client that follows the advertised `authMethods` gets -32601, which is the
-   * exact path Lody's registry-provider setup takes.
-   */
+  /** Check the advertised credential method without spawning a backend. */
   async authenticate(params: acp.AuthenticateRequest): Promise<acp.AuthenticateResponse> {
-    if (params.methodId !== ZCODE_AUTH_METHOD_ID) {
-      throw new Error(`Unsupported authentication method: ${params.methodId}`);
-    }
-    log(`authenticate: ${params.methodId} acknowledged`);
-    return {};
+    return authenticate(params);
   }
 }

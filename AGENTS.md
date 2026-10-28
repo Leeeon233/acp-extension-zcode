@@ -7,12 +7,28 @@
 via JSON-RPC over stdio. Translates ACP protocol requests into ZCode session
 methods and streams events back as ACP `session/update` notifications.
 
+## Related project directories (one product family, this machine)
+
+| Path                               | What it is                                                                                                                                                                                                                                               |
+| ---------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `~/Develop/tools/zcode-acp-server` | This bridge — the coordinator                                                                                                                                                                                                                            |
+| `~/Develop/tools/zcode-acp-app`    | The mobile app (npm package `zcode-acp-remote`). Its cross-repo requirement specs + ADRs live in that repo's `.zcode/docs/` (e.g. `workflow-parity-backend-requirements.md`, `push-backend-requirements.md`) — read specs from there, not from this repo |
+| `~/Develop/tools/zcode-acp-martty` | Source of the Rust `martty` TUI (this bridge's CLI frontend dependency)                                                                                                                                                                                  |
+| `~/Develop/NoBackup/ZCode`         | Open-source ZCode upstream (see the next section)                                                                                                                                                                                                        |
+
 ## ZCode upstream source (open-sourced 2026-09)
 
 ZCode went open source (Apache-2.0): a local checkout lives at
-`~/Develop/NoBackup/ZCode` (remote `github.com/zai-org/ZCode`; downloaded at
-desktop 3.14.0 = app-server/`apps/zcode-cli` 0.16.9 — same version the bridge
-runs today). The agent runtime is under `apps/zcode-cli/packages/core/`;
+`~/Develop/NoBackup/ZCode` (remote `github.com/zai-org/ZCode`; checkout synced
+to source root 3.16.2 = app-server/`apps/zcode-cli` 0.17.0, commit `3c5b2276`,
+audited 2026-10-20 with no bridge impact — see docs/BACKLOG.md). The bridge
+runs desktop 3.16.3, whose bundled `zcode.cjs` self-reports CLI 0.17.0 — the
+SAME CLI the checkout carries, so the source is authoritative for the running
+backend (the 3.16.2→3.16.3 desktop delta is not in the public tree;
+`origin/main` IS `3c5b2276`). The Gotchas below were written against 0.16.9
+and re-verified file-by-file at the 0.17.0 audits (2026-10-19/20); the bundle
+recipe in docs/BACKLOG.md "Verification method" remains the way to re-prove a
+note against the binary. The agent runtime is under `apps/zcode-cli/packages/core/`;
 `packages/zcode-server-cli` is only a thin CLI shell. **Read the source BEFORE
 probing or reverse-engineering the bundled CLI** — every "verified against
 app-server" note in Gotchas below predates it and now has an authoritative
@@ -34,7 +50,11 @@ fetch the matching tag), re-read `packages/shared/src/zcode-protocol/index.ts`
 for schema drift, and diff the behaviors Gotchas depends on (stop, provider
 bootstrap, runtime headers, compact, setModel strictness) against the source
 instead of the binary. Update `docs/BACKLOG.md` and the Gotchas bullets from
-source evidence (`file:line`), not bundle probes.
+source evidence (`file:line`), not bundle probes. The 3.14.3 commit was
+REWRITTEN upstream (2026-09-28: `328c1a0` → `29628c9`, same release; workflow
+runtime internals + bundled skills only — every protocol surface the Gotchas
+cite was byte-identical), so a non-fast-forward `pull` there means re-align
+with `git reset --hard origin/main`, not a local divergence.
 
 ## Commands
 
@@ -56,8 +76,10 @@ source evidence (`file:line`), not bundle probes.
 src/
 ├── index.ts              Entry point — wires server to stdio ACP stream
 ├── server.ts             ZcodeAcpServer — shared state + handler registration
-├── backend/              ZCode subprocess client (JSON-RPC over stdio)
-│   ├── client.ts         Spawns + communicates with zcode app-server
+├── backend/              Backend subprocess layer (ADR-0023 BackendAdapter seam)
+│   ├── adapter.ts        BackendKind + capability table (single gate source), BackendAdapter interface
+│   ├── jsonrpc-child.ts  Shared stdio JSON-RPC transport (read-loop mux, watchdog, dialect hooks)
+│   ├── client.ts         ZcodeBackend — zcode dialect (bare frames, arrival responders)
 │   ├── credentials.ts    Reads ~/.zcode/v2/config.json for GLM API key
 │   ├── listener.ts       EventStreamListener — subscribes to session/events
 │   └── types.ts          ZCode protocol types
@@ -90,6 +112,14 @@ src/
 │   ├── file-endpoint.ts  Read-only /fs/list + /fs/file, session-root scoped (ADR-0004)
 │   └── hub-server.ts     Hub daemon: auth, discovery, byte-level proxy (ACP WS + /fs files), ?probe=1 liveness
 ├── quota/                GLM Coding Plan usage API client (/quota command)
+├── push/                 Offline WeCom push (spec: zcode-acp-app
+│                         .zcode/docs/push-backend-requirements.md; channel
+│                         decision ADR-0010 there): config.ts = the single
+│                         ACTIVE predicate (enabled && corpId/agentId/secret),
+│                         wecom.ts = zero-dep HTTP client (token cache +
+│                         40014/42001 one-retry), push.ts = pushIfOffline
+│                         dispatch (fires only at clients.size === 0) and the
+│                         §6 interaction-hold predicate
 ├── cli.ts                Unified CLI entry (`acp-extension-zcode`): subcommand
 │                         dispatch; bare invocation → stdio ACP server
 │                         (ADR-0007). The Martty TUI launcher was removed.
@@ -180,79 +210,124 @@ ZCode protocol types into ACP notifications directly — always translate.
   (see `~/.zcode/agents/*.md`); `parseModelValue` accepts it. Entitlement
   comes from `coding-plan-cache.json`
   (desktop's resolved availability verdict) → legacy `config.json`
-  (`builtin:*` enabled + apiKey); `setting.json`'s
+  (`builtin:*` enabled + apiKey) → manual plan keys in `provider_config.json`
+  (access.type `zhipu-coding-plan-api-key`, family by official baseUrl —
+  `manualCodingPlanKeys`, the source-2 tier, #344); `setting.json`'s
   `modelProviderFamilySelectedKeys` is a _selection_ record, not an
-  entitlement — only as a last resort when both are empty. (2) `session/setModel`
+  entitlement — only as a last resort when both are empty. A bridge account
+  (`acp-accounts.json`, `zcode-acp setup`) entitles its own family's
+  individual coding plan on top of that ladder, even over an `unavailable`
+  verdict, and never counts as a verdict. It entitles only when the overlay
+  applied (`bridgeOverlays`), so a family the installed catalog lacks gains
+  nothing. The #320 store fallback must still
+  see only the raw desktop files (`desktopEntitledBuiltinProviders`) — the
+  provider_config rung lives in the `entitledBuiltinProviders` wrapper, not
+  the raw view. `authenticate` (#344) answers Xcode's sign-in call via
+  `zcodeCredentialsPresent` (handlers/authenticate.ts). (2) `session/setModel`
   is now strict: `{sessionId, model:{providerId, modelId, options?}, persistAsWorkspaceLastUsed}`,
   NO `runtimeModel` (`Unrecognized key`), and the OBJECT form requires
   `options.reasoningLevel` for level-bearing models ("Reasoning level is
   required for <p>/<m>") — the string form skips that check but carries no
   level. Provider ids must also be translated to the registry's spelling
   (`builtin:bigmodel-coding-plan` → `account:bigmodel-individual-coding-plan`,
-  `accountProviderIdFor`). `session/create` is the only response returning the
-  FULL `settings.model.available` list (with authoritative `reasoning.defaultLevel`);
-  `session/read` answers `"current"` only, so the create snapshot is cached in
-  `server.modelAvailability` for switch-time level resolution. `applyModelSwitch`
-  tries the modern shape then falls back once to the legacy overlay shape, so the
-  same bridge works on both builds. `workspace/updateProviderRegistry` is
-  GONE in 3.12+ (method-not-found) — the bridge logs it as a no-op, not a
-  failure. Also note `session.model_selection.persist_failed` ("FOREIGN KEY
-  constraint failed") — ROOT CAUSE found in source (2026-09-21): the
-  per-session model selection is a `session_entry` with a session FK, but
-  the session row is only created at FIRST INPUT (`ensureSessionPersisted`,
-  core events.ts) — so a setModel/setThoughtLevel BEFORE the first prompt
-  applies in-memory but cannot persist, and a session resumed without an
-  entry silently reverts to the workspace default
-  (`restorePersistedModelSelection` → `setSessionModelSelection(undefined)`)
-  while the editor dropdown keeps showing the user's choice ("displayed
-  default ≠ actually called", observed 2026-09-21). NOT a switch failure
-  itself (the following `session.model.updated` event is the success
-  signal); the bridge compensates: every switch path records the choice
-  (`server.sessionModelChoices` + `LazySessionRecord.modelChoice` in the
-  lazy-alias store, surviving bridge restarts; choices carry an `at` stamp —
-  store recovery is NEWER-WINS because two aliases can record the SAME
-  backend session) and `reassertModelChoice` re-applies it after EVERY
-  resume flight (silent, best-effort; model and thought re-applied
-  independently; `repairUnavailableModel` still wins for unavailable
-  models). A RESET (thought level absent/null) is remembered as an EMPTY
-  level — recording nothing would resurrect the old level on every resume.
-  Same-process
-  drafts self-heal: first-input persistence captures the runtime's then-
-  current selection. Don't chase persist_failed as a switching bug — chase
-  it as a stickiness bug only if the re-assert stops firing.
-  **Account turns
-  also need runtime headers**: the backend asks its host
-  `interaction/requestProviderRuntimeHeaders` before EVERY model request on a
-  `zhipu-account` provider and a `headersApplied:false` answer throws -32031
-  (every send on a GLM model dies in a retry loop — observed 2026-09-17 after
-  switching started working; the switch looked fine, sends never ran). The
-  bridge answers `headersApplied:true, requestAuth:{apiKey}` with the plan's
-  config.json key for individual coding plans
-  (`answerProviderRuntimeHeaders`, server-requests.ts) — the same key the
-  pre-3.12 `builtin:` provider used; start-plan stays declined (Aliyun
-  captcha, #123). **The answer is wired at frame ARRIVAL**
-  (`ZcodeBackend.providerRuntimeHeadersResponder`, set in ensureBackend), not
-  just the turn-loop queue: a headers ask that lands while no turn loop is
-  polling — compact's internal turn above all — used to sit unanswered until
-  the backend's 180s cap killed the generation as "Captcha verification
-  request timed out" (observed 2026-09-19: auto-compact "succeeded" per the
-  bridge for weeks while never compacting; backend log `~/.zcode/cli/log/`
-  carries the truth, `querySource: "compact"`). The backend's own
-  "standalone" self-signing channel needs
-  an identity credential pair in its ENCRYPTED store
-  (`account-provider:…:account:<uid>:api-key` exists but the `…:identity`
-  half was never written on the observed machine), so the bridge cannot rely
-  on it.
+  `accountProviderIdFor`). `session/create` AND `session/resume`/`fork` return the
+  FULL `settings.model.available` list (with authoritative `reasoning.defaultLevel`
+  - `reasoning.levels`); `session/read` answers `"current"` only, so the snapshot
+    is cached in `server.modelAvailability` (levels list included) for switch-time
+    level resolution. **Switch-time level resolution is a LADDER, not a single
+    shot** (2026-09-28): BOTH local files can lie — config.json is legacy-stale by
+    design, and even provider_config.json's own rule disagreed with the live
+    registry (`Reasoning effort "max" is not supported by <p>/<m>`, four
+    consecutive failed switches to one model). `candidateReasoningLevels` orders
+    candidates snapshot → personal rule (default = LAST value, the upstream
+    `values.at(-1)` rule, model-catalog-port.ts) → legacy config.json; a snapshot
+    hit declaring NO levels is FINAL (level-less — file variants are suppressed).
+    `applyModelSwitch` walks `[best, omit, rest]` (≤5 attempts), retrying ONLY on
+    the two level-shape rejections (`is not supported by` / `Reasoning level is
+required for`); any other error aborts. Display side, `buildConfigOptions`
+    CLAMPS the advertised thought current to the model's available list (upstream
+    session-mapper.ts does the same server-side: "setModel 后 runtime 可能短暂
+    保留上一个模型的 thoughtLevel") — without the clamp the CLI keeps showing
+    and re-sending the previous model's level. And a REBUILT dist does NOT
+    restart RUNNING bridges — CLI windows keep serving the old code until
+    closed (the post-0.48.1 "deleted model still listed" report was stale
+    processes, not a fix regression). The HUB is the exception:
+    `pnpm build`'s last step (and the npm `postinstall`) pokes
+    `POST /api/upgrade` (hub-upgrade-notify.ts) and the hub restarts itself
+    onto the fresh dist when its frozen fingerprint / version / dist mtimes
+    say the disk is newer (`restartSoon` → `respawnSelf`); verified live
+    2026-10-01 — the 0.60.0 rebuild auto-updated the running hub with no
+    manual restart. A newly started bridge on the newer build votes a stale
+    hub out the same way via the register reply. `workspace/updateProviderRegistry` is
+    GONE in 3.12+ (method-not-found) — the bridge logs it as a no-op, not a
+    failure. Also note `session.model_selection.persist_failed` ("FOREIGN KEY
+    constraint failed") — ROOT CAUSE found in source (2026-09-21): the
+    per-session model selection is a `session_entry` with a session FK, but
+    the session row is only created at FIRST INPUT (`ensureSessionPersisted`,
+    core events.ts) — so a setModel/setThoughtLevel BEFORE the first prompt
+    applies in-memory but cannot persist, and a session resumed without an
+    entry silently reverts to the workspace default
+    (`restorePersistedModelSelection` → `setSessionModelSelection(undefined)`)
+    while the editor dropdown keeps showing the user's choice ("displayed
+    default ≠ actually called", observed 2026-09-21). NOT a switch failure
+    itself (the following `session.model.updated` event is the success
+    signal); the bridge compensates: every switch path records the choice
+    (`server.sessionModelChoices` + `LazySessionRecord.modelChoice` in the
+    lazy-alias store, surviving bridge restarts; choices carry an `at` stamp —
+    store recovery is NEWER-WINS because two aliases can record the SAME
+    backend session) and `reassertModelChoice` re-applies it after EVERY
+    resume flight (silent, best-effort; model and thought re-applied
+    independently; `repairUnavailableModel` still wins for unavailable
+    models). A RESET (thought level absent/null) is remembered as an EMPTY
+    level — recording nothing would resurrect the old level on every resume.
+    Same-process
+    drafts self-heal: first-input persistence captures the runtime's then-
+    current selection. Don't chase persist_failed as a switching bug — chase
+    it as a stickiness bug only if the re-assert stops firing.
+    **Account turns
+    also need runtime headers**: the backend asks its host
+    `interaction/requestProviderRuntimeHeaders` before EVERY model request on a
+    `zhipu-account` provider and a `headersApplied:false` answer throws -32031
+    (every send on a GLM model dies in a retry loop — observed 2026-09-17 after
+    switching started working; the switch looked fine, sends never ran). The
+    bridge answers `headersApplied:true, requestAuth:{apiKey}` with the plan's
+    config.json key for individual coding plans
+    (`answerProviderRuntimeHeaders`, server-requests.ts) — the same key the
+    pre-3.12 `builtin:` provider used; start-plan stays declined (Aliyun
+    captcha, #123). **The answer is wired at frame ARRIVAL**
+    (`ZcodeBackend.providerRuntimeHeadersResponder`, set in ensureBackend), not
+    just the turn-loop queue: a headers ask that lands while no turn loop is
+    polling — compact's internal turn above all — used to sit unanswered until
+    the backend's 180s cap killed the generation as "Captcha verification
+    request timed out" (observed 2026-09-19: auto-compact "succeeded" per the
+    bridge for weeks while never compacting; backend log `~/.zcode/cli/log/`
+    carries the truth, `querySource: "compact"`). The backend's own
+    "standalone" self-signing channel needs
+    an identity credential pair in its ENCRYPTED store
+    (`account-provider:…:account:<uid>:api-key` exists but the `…:identity`
+    half was never written on the observed machine), so the bridge cannot rely
+    on it.
 - **Desktop 3.12+ writes user-added models to `provider_config.json` and legacy
-  config.json has STOPPED syncing — the dropdown must union both** (observed
+  config.json has STOPPED syncing — the dropdown must union both, EXCEPT custom
+  providers where the personal list is authoritative** (observed
   2026-09-20: a model added in the app landed only in
   `~/.zcode/v2/provider_config.json` `modelConfigRules.providerModelRules`,
   config.json's mtime stayed days stale, and the dropdown built from
   `loadAllModels()` never showed it while the backend registry accepted the
-  model fine). `loadAllModels` (src/config/options.ts) merges: config.json
-  stays authoritative for enablement/credentials; the personal config
-  contributes model ids per provider plus WHOLE providers config.json lacks
-  (same `providerSelectable` rule applied to the rule's own
+  model fine. Observed 2026-09-28: DELETIONS behave the same way — a model
+  removed in the app vanishes from the personal file only, config.json keeps
+  it, and the union resurrected it in the dropdown. The desktop also mirrors
+  the full custom-provider list into
+  `providerConfigRules.providerRules[].config.personalModelIds`, and the
+  backend registry knows custom-provider models from NO source but the
+  personal file — a config.json-only entry is a deleted-model ghost that would
+  fail on switch). `loadAllModels` (src/config/options.ts) therefore merges:
+  config.json stays authoritative for enablement/credentials; for CUSTOM
+  providers (non-`builtin:`) with ≥1 personal model rule the personal list
+  REPLACES config.json's models; for builtin providers the union holds (their
+  catalog comes from the account snapshot — a personal rule is an override,
+  not a complete list); the personal config also contributes WHOLE providers
+  config.json lacks (same `providerSelectable` rule applied to the rule's own
   `config.access.apiKey` / `config.api.baseUrl`). Shapes that bite: personal
   rule ids use the REGISTRY spelling (`account:…` — normalize through
   `configProviderIdFor` before matching config.json's `builtin:*` keys), the
@@ -290,20 +365,31 @@ ZCode protocol types into ACP notifications directly — always translate.
   `server-operations.ts:2082-2119` — real compact failure is now OBSERVABLE
   on the v3 stream; wiring it into the bridge's success reporting is a
   pending alignment item, see docs/BACKLOG.md.) Invariants that must stay: single-flight per sid
-  (`server.autoCompactInFlight`), drain gate exempt while it runs, and a
-  prompt landing in the compaction window is REJECTED outright — entry gate
-  in runPrompt plus the busy-reject fallback in runOneTurn (notice asks the
-  user to resend after the ✓ line) — NEVER queued behind the lock: the
-  queued turn's listener is already subscribed and would dispatch the
-  compaction's whole internal-turn stream as its own output once the lock
-  releases (its turn.completed ends the turn before the real reply starts;
-  observed as corrupted follow-up turns). Flows with no user to resend wait
-  the compaction out BEFORE subscribing instead
-  (`waitForAutoCompactIdle`: goal-loop rounds retry via
+  (`server.autoCompactInFlight` — keyed by the BACKEND sid and covering manual
+  /compact too, not just auto) and the drain gate exempt while it runs. The
+  compaction window is reported as BUSY by `compact()` itself (extensions.ts:
+  broadcast `running:true` at entry — every client, every entry path — settle
+  in the finally; `maybeAutoCompact` no longer raises its own indicator) —
+  a client that tracks only turns would otherwise read the whole window as
+  idle, drop its spinner, and offer Send where Cancel belongs (manual /compact
+  had exactly that hole: the prompt hit the backend's compact lock and died as
+  "backend still busy" instead of queueing). A prompt landing
+  in the window is HELD, never queued behind the lock: `runPrompt` announces
+  the neutral `autoCompactHeld` notice and waits via `waitForAutoCompactIdle`
+  BEFORE the turn registers and BEFORE the listener subscribes — the only
+  residue-free place to wait. A subscribed listener would accumulate the
+  compaction's whole internal-turn stream as this prompt's own output once the
+  lock releases (its turn.completed even ends the turn before the real reply
+  starts; observed as corrupted follow-up turns). After the wait the prompt
+  runs the normal send path, and the send loop's busy-retry absorbs the tail
+  where the flag cleared but the backend's lock is still held. Only a
+  compaction that outlived `AUTO_COMPACT_SETTLE_MS` (330s) falls back to a
+  rejection with the `autoCompactBusy` resend notice — never a silent drop.
+  Flows with no user to resend use the same pre-subscribe wait
+  (`waitForAutoCompactIdle`): goal-loop rounds retry via
   `turn.compactRejected` — the neutral `autoCompactGoalWait` note, never the
-  resend notice; a round rejected TWICE throws → `paused-crash`, never
-  counted as a completed round — and sandbox continuations wait at prompt
-  entry).
+  resend notice; a round rejected TWICE throws → `paused-crash`, never counted
+  as a completed round — and sandbox continuations wait at prompt entry.
 - **Preempt lock**: concurrent prompts for the same session are serialized via
   `withPreemptLock`. Don't bypass it — two simultaneous turns corrupt the listener.
 - **The lazy-alias store (`~/.zcode/v2/acp-lazy-sessions.json`) is shared by
@@ -319,10 +405,88 @@ ZCode protocol types into ACP notifications directly — always translate.
   `process.env.HOME` assignment so `vi.unstubAllEnvs()` cannot leak back to
   the real HOME); the same setup DELETES `ZCODE_ACP_REMOTE_ORIGIN` /
   `ZCODE_ACP_TUI_CLI_PID`, because a vitest run started from inside an
-  incubated terminal bridge inherits them and the session-close endpoint would
-  signal the REAL window's process tree from a test (observed live 2026-09-08 —
-  the run killed its own host window). Keep new tests store-safe by default and
-  don't bypass the setup file.
+  incubated TUI inherits them and the session-close endpoint would signal the
+  REAL window's process tree from a test (observed live 2026-09-08 — the run
+  killed its own host window). Keep new tests store-safe by default and don't
+  bypass the setup file.
+- **DWF journal rows can LIE about a living run — the hub corrects them
+  server-side; never trust `dwf_run.status` for liveness** (source + live
+  2026-10-02): upstream's orphan reconciliation (`reconcileOrphanRuns`,
+  bootstrap.app, runs at EVERY app construction) assumes "no in-flight run in
+  MY process registry ⇒ every non-terminal row of this session is a dead
+  process's leftover" and writes `stopped(interrupted)` onto runs still
+  executing in ANOTHER process — observed live: a second process constructed
+  the ai-hot-app session (11:44) and marked a run interrupted that kept
+  dispatching sub-agents until it truly completed 2.5h later; the row never
+  flips back mid-run, so every journal read (v3 `workflows/runs`, global
+  scope included) reports "stopped" for the whole flight — the reported "有
+  运行中工作流但活动列表为空". The TRUSTWORTHY live read is the session-scoped
+  v4 registry overlay (`/settings/workflow-runs?sessionId=` →
+  `v4/conversation/workflowRuns` → `listRunsForSession`, upstream comment:
+  "否则这一面会独自显示一个被外来写入标死的 run" — its live registry beats the
+  foreign journal write). `buildWorkflowOverview` (workflow-overview.ts)
+  therefore probes rows carrying `stopReason:"interrupted"` against the owner
+  WORKSPACE's bridges and joins by `runId`, overriding the false verdict (and
+  setting `ownerInstanceId` from the answering instance — the live-truth
+  owner wins over the session-listing heuristic, which can pick a sibling
+  bridge that merely lists the same alias); keep every NEW liveness consumer
+  on the same read, not the journal. Two traps that shaped
+  the probe: (a) the parent session reads IDLE while its workflow flies — a
+  "running sessions only" trigger misses exactly the reported case; (b) the
+  row's `acpSessionId` spelling differs per bridge (editor alias vs backend
+  id) — probe each instance with ITS OWN listed session ids, never the row's.
+  App side: the page polls every 5s unconditionally while open (a
+  falsely-terminal row would keep a "looks live" gate off forever). Also:
+  the engine's own settle (run-settled event) OVERWRITES the interrupted
+  verdict when the run truly finishes — a row that later reads completed does
+  not mean the correction was unnecessary during the flight.
+- **Quota exhaustion (1308 family) is WAITED OUT bridge-side — no component
+  upstream ever schedules the "after the reset" continuation** (2026-10-02,
+  source-verified): both the workflow policy (`workflow-model-failure-policy.ts`
+  WORKFLOW_QUOTA_PROVIDER_CODES → `stopRun` → `stopped(provider)` +
+  `ProviderStopDetails{kind:"quota", resetAt?}`, notification text "after the
+  reset, call ResumeWorkflowRun") and the /auto loop (turn failure 1308) stop
+  and expect a HUMAN/MODEL to act later — with the app asleep nothing does, and
+  that was the reported "配额恢复后不自动继续". The bridge owns the waiting now
+  (`quota.autoResume`, default on, `ZCODE_ACP_QUOTA_AUTO_RESUME=0` opts out):
+  (a) `/auto` driver — on a classified quota failure it pauses the round loop
+  WITHOUT ending it, waits for the reset (provider `resetAt` ← Retry-After, else
+  the fresh quota card's earliest future `nextResetTime` at ≥98% used, else an
+  exponential backoff ladder), then re-enters `runRounds`; ESC//auto pause//auto
+  stop take effect within a 30s sleep chunk, and the recovery count is bounded
+  (6) so a truly stuck provider still ends in a pause. (b) Workflow watchdog —
+  `src/workflow/quota-resume.ts` scans `workflows/runs` (one session-less RPC,
+  live backend only, NEVER spawns) for `stopped(provider)` rows, reads each
+  parent session's `v4/conversation/workflowRuns` summaries (the failure MESSAGE
+  with the `[1308]` bracket is the only quota signal that travels — the summary
+  carries no structured providerStop), and schedules a persisted resume in
+  `~/.zcode/v2/acp-quota-resumes.json` (shared store, temp+rename merge-at-write
+  like the dismissals store). `fire()` re-checks everything at due time — the
+  quota card first (a future reset defers WITHOUT burning an attempt), then the
+  live run state (running again / completed / not resumable → drop), then sends
+  the same `resumeWorkflowRun` command the App's Resume button uses; an accepted
+  resume is re-verified after 10min (stopped again → attempt + backoff); ≥6
+  attempts announces "resume manually" and drops. The serve bridge's idle-exit
+  is EXEMPT while one of its project's resumes is pending (`hasQuotaResumePendingForCwd`)
+  or a live /auto loop exists (`server.goalLoops.size` — its quota wait
+  registers no turn either) — exiting would kill the only actor able to
+  continue while the app is asleep. `workflow_disabled` retires only for a
+  REAL verdict: the fail-closed gate fetch rejection (`gate mode=unknown …`)
+  backs off and retries instead of retiring the entry machine-wide off one
+  network blip. Cross-process single-flight: the side-effecting tail of a fire
+  runs only under a lock-protected `firing:{pid}` claim on the store entry
+  (`claimFire` via the shared settings file lock) — and ALL store mutations
+  (schedule merge / reschedule / retire) serialize on that same lock, because
+  an unlocked whole-table write could erase a sibling's live claim; a claim
+  whose write does not persist is NOT granted (fail closed). So two bridges of
+  one workspace (editor + serve) can never resume the same run twice — a
+  money-level double execution; a retired (`gaveUp`) entry is never
+  re-scheduled by a later scan of the same journal row, and an overdue
+  abandoned entry is pruned only past the TTL while a future-dated wait (a
+  weekly window's reset) survives it. Classification lives in `src/quota/resume.ts`: structured
+  `providerStop.kind` is authoritative, code sets are read by SHAPE
+  (RequestError.data / turn.failed cause / WorkflowErrorJson), and the message
+  fallback is deliberately narrow (non-retryable + rate_limited + quota wording).
 - **A store-recovered alias is NOT resident; "Session not found" ≠ "Session is
   not active" (same -32004!)**: after a bridge restart, `ensureRealSession`'s
   durable-store branch runs the SAME eviction guard as in-memory mappings
@@ -360,6 +524,43 @@ ZCode protocol types into ACP notifications directly — always translate.
   deferred replay must pass the REQUESTING connection's `ctx.client` into the
   handler — not `server.clients.broadcast()`. Live turn updates DO fan out
   (prompt() keeps the broadcast cx); only replay-shaped dispatch is targeted.
+- **Replay history reads are generation-guarded — four aligned facts, do not
+  un-align them** (2026-10 wake-reconnect report: first entry after phone
+  wake replayed a conversation that "ended in the middle"; re-entry, once
+  hydration finished, replayed whole — the mid-hydration prefix from
+  `session/messages` meets an unguarded plain read): (1) `backendLoadedSessions`
+  stamps are VOID on every spawn (`resetBackendGeneration`) — a stamp that
+  survived a respawn kept `isBackendSessionLive` true for a process that never
+  loaded the session, so `session/load` skipped the resume RPC and replayed
+  from a residentless/mid-re-hydration backend (empty or prefix); the turn
+  path's finally re-stamps only while the subscribe-PROVEN instance is still
+  the live backend (`residentBackend` — a failed backend-lost recovery must
+  not vouch for a session the respawn never loaded); (2) the
+  `hydrationWatermark` ENTRY PRESENCE — not its value — is the "this backend
+  instance settle-observed the store" marker: `fetchMessagesForReplay`
+  settle-polls a no-entry session instead of a plain read (one poll per
+  session per generation), `raiseWatermark` materializes the entry at 0
+  (observed-empty ≠ never-observed), and create/fork seed 0 (a fresh store is
+  complete by construction); (3) the turn-path baseline opts OUT of that
+  first-read guard (`guardFirstRead:false`) — no-watermark is unreachable
+  there once stamps are void, and a settle's 2×300ms gaps would sit on every
+  prompt; (4) a METADATA-ONLY attach (`_meta.zcode.limit 0`, the App's
+  cache-reconcile re-entry) opts out of BOTH the resume flight's settle
+  (`resumePreservingModel {skipSettle}`) and the replay-read guards (plain
+  `fetchMessages`) — its reconcile is CONSERVATIVE (a mid-hydration prefix
+  only makes ids/counts mismatch → the client falls back to a full attach,
+  which is where the settle then runs, once), and settling every metadata
+  attach burned a full settle cap on the cold path before the client even
+  knew whether anything changed, then armed `hydrationUnsettled` for the
+  follow-up full attach to pay AGAIN (observed 2026-10-06: minute-long
+  "session never loads" on wake-reconnect with a fresh cache). A joiner of a
+  skipped flight settles itself — no watermark was written, so its replay
+  read re-arms the first-read guard. `loadSession`/`resumeIntoSession` also
+  feed their just-read history into `buildSnapshot` (`presetMessages`) — the
+  differ baseline must never re-scan the store the load just paid for.
+  Residual, accepted: a read landing ABOVE the watermark while a
+  false-stable hydration still grows ships a prefix — the client-side
+  last-message-id reconciliation is that defense.
 - **Remote failures never touch stdio**: any remote-side failure (port, hub,
   token) must warn and disable remote only — the editor link stays up.
 - **User-level TUI env does NOT reach hub-incubated windows by itself — two
@@ -381,6 +582,34 @@ ZCode protocol types into ACP notifications directly — always translate.
   `MARTTY_PASSTHROUGH_ENV` AND resolved through a settings.ts accessor —
   an env-only knob silently works from a shell and fails from every
   hub-opened window.
+- **Login-shell env completion must be NON-INTERACTIVE, and its PATH must be
+  unioned — never caller-wins** (`src/remote/login-shell-env.ts`,
+  `envWithLoginShell`; wired at the hub spawn `endpoint.ts`, the hub's
+  per-incubation env `hub-server.ts`, and the backend spawn `server.ts`).
+  Observed 2026-09-23 (#242, released 0.47.2): the probe shipped as
+  `zsh -ilc 'env -0'`, and every hub-incubated CLI window froze COMPLETELY —
+  no keyboard, no mouse, not just "messages queued" (the whole TUI; a manual
+  session resume then aborted too — one root cause, same fix). (a) The shell
+  must not be interactive: `-i` arms job control / zle / prompt / terminal
+  modes inside a process that only wants a value back, and it runs INSIDE a
+  live TUI window's process tree (martty → bridge), where that is exactly
+  wrong — several rc tools (compinit, autosuggestions, orbstack) assume a
+  terminal it does not have. Use a login shell that sources the rc explicitly
+  (`. "$HOME/.zshrc"` guarded by `[ -r ]`, then `env -0`): the toolchain paths
+  live in `~/.zshrc` (interactive-only), so it is sourced EXPLICITLY, which
+  gets every path with none of the interactive state (`zsh -lc` alone loses
+  them — only `.zshenv`/`.zprofile` are read non-interactively). (b) `PATH` is
+  a UNION (shell first, deduped), NOT caller-wins: the editor-launched bridge
+  already carries launchd's bare PATH, so caller-wins silently DROPPED every
+  toolchain dir — the probe did not even achieve its goal, it only leaked ~40
+  unrelated vars (JAVA_HOME, PROMPT, mise session state). Non-env names are
+  rejected (an rc that prints to stdout would glue noise onto the first
+  record). (c) Do NOT force a `cwd` on the backend spawn (the reverted half of
+  #242): the directory already arrives by INHERITANCE — the TUI `.command`
+  script `cd`s before exec (terminalTuiScript) and the headless serve spawn
+  passes `cwd` (defaultSpawnServe) — and one backend process serves EVERY
+  session, so a single `projectCwd()` is both redundant and wrong for
+  multi-session cases.
 - **User remote prefs live in `~/.config/zcode-acp/config.json`, NOT env**:
   the hub is a detached daemon that idle-exits (~10 min) and is re-spawned by
   whichever bridge needs it next, so its birth env rotates between
@@ -420,14 +649,28 @@ ZCode protocol types into ACP notifications directly — always translate.
   text on purpose: `/` would hit martty's slash dispatch before agent caps are
   known, `!` runs a local shell). Martty auto-submits it at boot — banner dives
   immediately, the text queues until the bind — and `runPrompt` answers it with
-  a one-line ack and `end_turn` (no model turn). The one-shot is scoped to the
+  a one-line ack and `end_turn` (no model turn); the ack MUST emit
+  `$/zcode/turnState { running: false }` before returning, or martty remains
+  stuck in `RunState::Running` and queues all subsequent user prompts
+  indefinitely ("remote-launched CLI unresponsive to input", observed
+  2026-09-23; slash-command early returns and compact-busy share the same
+  running:false settlement). The one-shot is scoped to the
   booting CONNECTION (`connectionContext` identity, like the prompt-echo
   exclusion): a phone app attached to the same bridge during the boot window
   and prompting first must not spend or disarm it — a global "first prompt"
   flag let the app's prompt race ahead and the trigger LEAKED TO THE MODEL as
   a real prompt (observed live; the backend record showed both "hi" and
   "resume session" as user messages). Only the same connection submitting
-  something else first disarms (the auto-submit was lost). `marttyClientSeen`
+  something else first disarms (the auto-submit was lost). The ARM side must
+  be per-connection too (2026-09-23, mobile create/resume): both arming
+  sites gated on the STICKY `isMarttyClient`, so after the TUI's initialize
+  the PHONE's create-bind claim ALSO passed the gate and re-pointed the arm
+  at itself, and a phone winning the boot-resume env race armed NOTHING —
+  either way the TUI's auto-submit missed the ack and reached the model.
+  Arms now gate on `marttyConnectionRoots` (the per-connection set), plus a
+  first-prompt fallback: a martty connection's FIRST prompt equal to the
+  trigger acks even unarmed (`connectionPromptSeen`, non-martty never
+  matches — the app typing the same words is real input). `marttyClientSeen`
   (sticky) replaces clientName for martty gating — clientName is
   last-write-wins across multi-client attaches and an app's initialize can
   land between the TUI's initialize and its session/new. Its `/resume` prefers
@@ -493,6 +736,30 @@ ZCode protocol types into ACP notifications directly — always translate.
   zod: "Unrecognized key: jsonrpc", code -32600). The bridge's backend
   client never sends one — keep it that way when hand-probing
   `zcode app-server --stdio` (frames are bare `{id, method, params}`).
+- **`--disallowed-tools` on the app-server argv is a NO-OP — tool policy
+  travels as the per-session `toolDenylist` on create AND resume** (#340,
+  source 2026-10-26: `cli/src/run.ts` extracts the flag for every command
+  but hands `toolDisallowlist` only to `runPrompt`/`runTuiCommand`;
+  `runZCodeProtocolCommand` takes none, so the flag the bridge passed since
+  #190 never reached a session and every "disallowed" tool — the #192 Cron*
+  default included — still reached the model). `toolDenylistParam`
+  (handlers/session.ts) rides `createParams` and the shared `resumeParams`
+  builder; the backend projects it onto `runtimeConfig.toolDisallowlist`
+  (registry-level removal, `server-operations.ts` createRecord — shared by
+  create and resume, which is why resume MUST carry it: a cold-recovered
+  runtime is rebuilt from the resume params alone). Three rules: (1) do NOT
+  add it to `session/send` — the per-turn list is a provider-visibility hint
+  only, and a turn list holding every Cron mutation tool is upstream's
+  "automation turn" signal (`isAutomationMutationRestrictedTurn`), which
+  ordinary prompts must not spoof; (2) a pre-toolDenylist backend rejects
+  the key ("Unrecognized key: toolDenylist") → drop + one retry, verdict
+  pinned per backend generation (`server.toolDenylistRejected`, reset on
+  respawn), warned once — keep every new create/resume site on
+  `resumeParams`/`toolDenylistParam` so the compat path stays single;
+  (3) `session/fork` has no tool-face field and its `inherit` copies
+  memory/toolSearch/shell but not the lists — a fork runs without the policy
+  until its next resume (upstream gap; don't "fix" it with a close+resume
+  cycle on the fork response).
 - **`turnId` lives on the event ENVELOPE, never the payload** (source
   2026-09-21: `zcodeEventEnvelopeSchema` carries `turnId?`,
   `packages/shared/src/zcode-protocol/index.ts:1029-1041`, while
@@ -535,7 +802,42 @@ payload}` for years and the translator read `payload["turnId"]`, which on
     Ask debounce marks are timestamps: a user decision (or a structural
     hint) pins forever; a FAILED ask (timeout / killed by another grant's
     restart / instantly-rejecting client) cools down 60s and may re-ask —
-    the old permanent mute left the model on a bare EPERM with no way out. Well-known system temp trees (/tmp → /private/tmp,
+    the old permanent mute left the model on a bare EPERM with no way out.
+    **The allow loop OWNS turn pacing while its ask is open (ADR-0032,
+    2026-10-13)** — three layers, all born from one live report (remote
+    phone: popup "expired" unanswered, model free-ran on, the WeCom notice
+    pointed at a dead ask). (1) FREEZE: a real ask first sends the stop pair
+    — the EPERM result already reached the model and it works past the
+    denial otherwise; structural early-returns (island/over-broad/
+    deny-listed/generic/debounce) never freeze. Every settled outcome then
+    ends the round `cancelled` + continuation: allow → the batched restart
+    as before; rejection/timeout/an ask that died UNDELIVERED (all attempts
+    failed while clients were around — the turn is already frozen, and
+    nothing will re-trigger the EPERM, so a bare warn would strand the round
+    on the stop's half reply) → same backend, continuation pointing the
+    model at already-granted dirs (it only ever saw a bare EPERM; the
+    undelivered case keeps the 60s cooldown mark — not a user decision). Goal
+    rounds take the sandboxRestart mark instead (driver re-dispatches). The
+    turn loop HOLDS the round while the batch window still has the session's
+    grant (`waitForSandboxBatchFlush` after the ask returns) — the freeze's
+    stop leaves a terminal event in the backlog, and processing it before
+    the flush would end the round end_turn, drop it from pendingTurns, and
+    orphan the grant's continuation. (2) HOLD: an ask whose every attempt
+    failed holds as long as the registry is EMPTY at failure time — zero
+    clients at fire OR every connection dying mid-wait (the phone-sleep
+    case: ordinary connection error, NOT the typed NoClientsError the old
+    §6 branch keyed on); the push config only decides notification, never
+    ask lifetime. (3) UNATTENDED TIMEOUT: goal-loop rounds and sessions
+    with an in-flight workflow run (the parent must receive results and
+    steer) ask with `sandbox.unattendedAskTimeoutMs` (user config, default
+    60s, 0 = wait forever); on timeout the ask ends NO-DECISION — nothing
+    persisted, path pinned in memory for the REST of the context only
+    (lazily re-checked: loop stop / run settle un-pins, so a returning user
+    regains grant control). A timeout is NOT a rejection: rejection is a
+    user decision with persistence semantics (reject_always writes the deny
+    list); the timeout's continuation says "denied for the rest of this
+    automated run — write inside granted directories", never "forever".
+    Well-known system temp trees (/tmp → /private/tmp,
     /var/tmp, /private/var/folders) are DEFAULT-ALLOWED — tools hardcode /tmp
     and $TMPDIR names only the per-user /var/folders leaf; don't "tighten"
     them back into popup storms (verify-sandbox.sh fixtures moved to HOME for
@@ -590,6 +892,31 @@ permitted` (#127); the slave allow is extension-gated (`require-all` +
   restart channel from inside such a session is an `open` one (e.g. Warp's
   `warp://action/new_tab?path=<restart.command>`), which hands execution to a
   clean user shell.
+- **Plan mode is INVISIBLE to every v3 read — the bridge tracks it from events
+  (2026-09-30, source-verified)**: EnterPlanMode/ExitPlanMode flip the runtime
+  execution state's `planEnabled` WITHOUT touching `runtime.config.mode`
+  (`session-mode-port.ts` passes `{planEnabled}` only; `execution-state.ts:62`
+  writes config.mode from the UNCHANGED resolved mode), so `session/read`'s
+  `settings.mode.current` (= `app.getMode()`, `mapSessionSettings`) and every
+  `state.updated` settings patch keep reporting the UNDERLYING mode (yolo/build)
+  forever — the App/editor mode indicator could never follow an auto plan entry
+  ("mode 不跟随", reported twice). Upstream's own display fold is
+  `planEnabled ?? mode === "plan"` (product-projection.ts:3785-3797); the bridge
+  mirrors it: `server.sessionPlanActive` (zcodeSid set) is fed from
+  SessionModeChanged events — which ride the v3 wire as a GENERIC
+  `session.updated` with the RAW `{mode, planEnabled, source, toolCallId}`
+  payload (the mapper has no dedicated type; payload passthrough) — in the
+  translator (turn path → ConfigChanged with the folded effective mode +
+  broadcast) and BackgroundTaskListener (out-of-turn, set only);
+  `buildModes`/`buildConfigOptions`/`dispatchConfigChanged` fold the flag into
+  every advertised mode; `setMode`//`/mode` mirror the runtime's own
+  execution-state fold (`"plan"` enables the flag, anything else disables it —
+  resolveExecutionState) so their emissions aren't racing the event. Known
+  hole: a COLD resume of a plan-active session starts with an empty set (the
+  backend restores planEnabled from its store but replays no event) — the
+  display shows the underlying mode until the first transition event/setMode;
+  do NOT "fix" the fold away, and do not read the mode from settings expecting
+  "plan".
 - **Start Plan providers are desktop-only — do NOT "fix" this with an
   unofficial provider client**: `zcode-plan` requests need an Aliyun captcha
   session only the desktop renderer can provide; the bridge answers
@@ -606,6 +933,76 @@ permitted` (#127); the slave allow is extension-gated (`require-all` +
   call site (see `handlers/server-requests.ts`) when sending server→client
   requests; the SDK types also require the `toolCall` field on permission
   requests (Zed renders the popup against it).
+- **Dynamic workflow availability = LOCAL override > remote verdict** (ADR-0029,
+  revised 2026-09-29): the REMOTE half mirrors the desktop host by anonymously
+  fetching `/api/v1/client/configs` (`dynamicWorkflow.mode`, fail-closed) once
+  per backend spawn (`server.backendWorkflowGate`,
+  `src/config/workflow-gate.ts`). On top sits a LOCAL override read LIVE per
+  consumption — config-file `workflow.mode`
+  (~/.config/zcode-acp/config.json, written by the App settings toggle via
+  `PUT /settings/workflow-gate {mode: auto|disabled|onDemand|alwaysOn}`,
+  per-instance mount only) over the upstream env
+  `ZCODE_DYNAMIC_WORKFLOW_MODE`; a hit folds to `source:"override"` and
+  short-circuits before any network/backend spawn, and a flip to enabled
+  re-fires the per-generation policy push (`ensureWorkflowPolicyPushed`).
+  This is NOT a drift from upstream: the shared contract's headless-host tier
+  (`dynamic-workflow-feature.ts`) explicitly reads the env directly — only
+  the packaged desktop production tier strips it. Do NOT "fix away" the
+  switch (the pre-2026-09-29 "no bridge-side switch" stance is superseded);
+  equally do NOT make the override the default — unset means the remote
+  verdict stays the whole story. Fail-closed observability split: 200 without
+  the key = `{mode:"disabled", source:"default"}` (upstream: pulling the key
+  IS off), fetch failure = `{mode:"unknown", source:"default"}`; the 403 body
+  carries `gate mode=… source=…` in its message. Enabling still goes through
+  the dual channel (policy push + `dynamicWorkflowEnabled` on every
+  create/resume — the `session/requestRuntimePreferences` schema still cannot
+  carry the flag). Wire facts that bite: v3 STRIPS
+  `dynamic_workflow_run_progress` (`session-mapper.ts:366-373`) — per-actor
+  progress only exists via `v4/conversation/workflowRunEvents` (the poller,
+  `src/workflow/poller.ts`, armed by `taskKind:"workflow"` background tasks;
+  `taskId ≡ runId`); the v4 start/resume commands are gated ONLY on the
+  journal port, NOT on the policy — every settings route re-checks the gate
+  (403 `workflow_disabled`) and launch consent IS the API call (upstream
+  skips the permission popup for hub clicks); `/workflow` is a pure prompt
+  expansion the backend applies on `session/send` (bridge passes it through
+  when enabled); `computer-use/operation-event` is the CUA channel, never a
+  workflow channel. Launch creates a REAL registered session
+  (`{acpSessionId, runId, toolCallId}`) and closes it only when the bridge
+  itself created it and the ack was not accepted.
+- **Project/session delete is a tasks-index TOMBSTONE — there is no physical
+  delete path, and none may be added** (ADR-0031, 2026-09-29): upstream's own
+  `deleteTask` sets the App tasks-index row `deleted=1` and keeps the CLI
+  store intact ("标记为列表不可见；CLI session 内容继续保留"), and the v3
+  protocol has no delete RPC at all (`session/close` only releases the
+  runtime). The bridge mirrors exactly that: `POST /api/projects/delete` and
+  `POST /api/instances/{id}/sessions/{sid}/delete` write tombstones
+  (`src/tasks-index.ts` softDelete* — a session with no tasks row gets a
+  born-tombstoned INSERT), `listSessions` filters `deleted=1 OR archived=1`
+  BEFORE sorting/pagination (desktop-archived sessions hide from the remote
+  lists too; pages stay dense), title writes guard `deleted=0`, and the hub
+  refuses to resume a tombstoned id (404; bogus ids keep their honest window
+  — unknown ≠ deleted). Do NOT "clean up" CLI db.sqlite rows or files behind
+  a tombstone — the backend process owns that store, and upstream keeps the
+  bytes by design (undelete is AUTOMATIC since 2026-09-30:
+  `reviveTombstonesOnActivity`, wired at THREE "the project is open" moments
+  — `session/new` (CLI boot / editor attach, fire-and-forget),
+  `session/list` with a cwd (AWAITED before the tombstone filter is read, so
+  a project-deleted workspace's /resume picker is NEVER empty — the reported
+  "恢复会话为空"), and `markSessionActive` (load with history / resume /
+  prompt — the used session revives under its backend id). A FULLY invisible
+  workspace — exactly the state a project delete leaves — revives ALL its
+  deleted rows at any of these, so reopening a project from the CLI brings it
+  back whole. Archived rows are never revived (the desktop's own marker),
+  individually deleted sessions of a still-visible workspace stay deleted,
+  and the hub's tombstoned-resume 404 is unchanged — only real bridge-side
+  opens/usage revive). Live conversations are
+  refused (409); a session live on ANOTHER bridge just disappears when it
+  next closes and re-lists. `listKnownWorkspaces` (the /api/projects source)
+  likewise filters `deleted=0 AND archived=0` (2026-09-30): a workspace whose
+  every row is archived rendered as an EMPTY project entry ("没有会话的项目"
+  in the remote history list) because the session listing hides archived rows
+  while the workspace list kept the group — the sessions count now counts
+  only visible rows too.
 - **Releases are fully automated** (release-please + npm OIDC trusted
   publishing, zero npm secrets): land conventional commits on `main`, merge
   the `chore(main): release X.Y.Z` PR, and tag + GitHub Release + npm publish
@@ -620,6 +1017,10 @@ permitted` (#127); the slave allow is extension-gated (`require-all` +
 - `docs/PROTOCOL.md` — ACP + ZCode protocol mapping
 - `docs/DEVELOPMENT.md` — dev setup and debugging guide
 - `docs/TROUBLESHOOTING.md` — common issues and diagnostics
+- `.zcode/AGENTS.md` — OPTIONAL machine-local agent notes, gitignored and
+  absent on fresh clones (irrelevant to repo visitors); if present, read it
+  for environment-specific rules (e.g. gh CLI auth) and the gitignored
+  runbooks under `.zcode/docs/`
 
 ## Agent skills
 

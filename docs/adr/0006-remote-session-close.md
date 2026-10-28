@@ -26,6 +26,20 @@ in-use signal, a pending turn, is rejected outright (409). A bridge-restart
 auto-resume alone does not resurrect a closed session — `registerSession`
 writes a summary with `hasActivity` unset.
 
+Amendment (2026-10-20) — force close. The 409 guard protects conversations
+from a mere list refresh, but it also blocks the client that MEANT to
+terminate: a desktop user pressing "End session" on a running conversation
+got the refusal and no path to act on it (observed live: the session kept
+generating until the user walked to the hosting CLI window and stopped it
+there). A close body `{"force":true}` now opts an explicit gesture through:
+the bridge applies ESC semantics without a client connection (flag the
+session's in-flight turns cancelled, fire the stop pair), waits a bounded
+~3s for them to settle so the stop's terminal event persists partial output,
+then proceeds with the eviction regardless — the `session/close` runtime
+eviction already documented as the drain gate's kill escalation finishes any
+generation that ignored the stop. Plain close keeps the refuse-when-running
+contract; nothing changes for clients that send no body.
+
 The hub stays a router (ADR-0002): the POST is forwarded by instance id and
 session id only; the running guard and retirement semantics live in the
 bridge. One implementation note for future write proxies: aborting the
@@ -34,3 +48,21 @@ an empty POST body drains and closes before the relayed response finishes
 writing, so every proxied close died with ECONNRESET/502. Abort on the
 RESPONSE side closing early (`res` `'close'` with `writableEnded` false)
 instead.
+
+Amendment (2026-10-24) — no resume guard for closed sessions. A client that
+held a closed session under a connection that was DOWN at broadcast time
+never receives its `$/zcode/session_closed` copy — the fan-out is live-only,
+so no client-side tombstone forms, and the client's revival ladder (three
+honest reconnects, then the ADR-0017 resume POST) can reincubate a
+conversation another client deliberately closed. This is the one residual of
+the resurrection class the desktop's socket-agnostic retirement closed
+(2026-10-23) for every holder whose connection was up. Considered and
+rejected: a hub-side guard that rejects resume POSTs for recently closed
+ids. The conjunction is rare (a remote close landing exactly inside a
+holder's disconnect window) and the failure self-heals (a ghost headless
+bridge a second close retires cleanly), while every guard shape costs more
+than the disease — a time-windowed rejection also refuses the legitimate
+close-then-reopen gesture and still misses ladders that fire past the
+window, and a complete guard needs clients to flag automated resumes, a
+cross-repo contract not worth its surface while the residual stays
+theoretical. Revisit with a real reproduction.

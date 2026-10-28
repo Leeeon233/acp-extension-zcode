@@ -18,6 +18,7 @@ import {
   modelContextWindow,
   parseModelValue,
 } from "../config/options.js";
+import { showCompletionStatus } from "../config/settings.js";
 import {
   extractExitCode,
   parseSubagentMetadata,
@@ -96,7 +97,7 @@ export async function dispatchEvent(
         await dispatchUsageDelta(server, cx, sid, ev);
         break;
       case "TurnInfo":
-        await dispatchTurnInfo(cx, sid, ev, chunkMsgId);
+        await dispatchTurnInfo(server, cx, sid, ev, chunkMsgId);
         break;
       case "TextDelta":
         await sendSessionUpdate(cx, sid, {
@@ -151,6 +152,16 @@ async function dispatchConfigChanged(
     // Fall back to null (defaults) only if the session mapping isn't live yet —
     // events routed through a registered turn loop always have it.
     const zcodeSid = server.resolveSid(acpSid) ?? null;
+    // Track the runtime plan flag FIRST — read paths (buildModes/
+    // buildConfigOptions) fold it, and a later plan-blind state.updated patch
+    // must not regress the display while the flag is on.
+    if (ev.planEnabled !== undefined && zcodeSid !== null) {
+      if (ev.planEnabled) server.sessionPlanActive.add(zcodeSid);
+      else server.sessionPlanActive.delete(zcodeSid);
+    }
+    const planActive = zcodeSid !== null && server.sessionPlanActive.has(zcodeSid);
+    const mode =
+      ev.mode === undefined ? undefined : planActive && ev.mode !== "plan" ? "plan" : ev.mode;
     const options = await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx));
     // Find by id — the array order buildConfigOptions returns is not a
     // contract; index-based writes would silently hit the wrong option if
@@ -162,7 +173,7 @@ async function dispatchConfigChanged(
     if (ev.model) {
       setById("model", formatModelValue(ev.model.providerId, ev.model.modelId));
     }
-    if (ev.mode !== undefined) setById("mode", ev.mode);
+    if (mode !== undefined) setById("mode", mode);
     if (ev.thought !== undefined) setById("thought", ev.thought);
     const configUpdate: acp.SessionUpdate = {
       sessionUpdate: "config_option_update",
@@ -174,13 +185,13 @@ async function dispatchConfigChanged(
     // reached everyone with the send above — an "others" leg on it would
     // double-deliver (it has no connectionContext to exclude anyone by).
     if (!isBroadcastSource(cx)) sendSessionUpdateToOthers(server, cx, acpSid, configUpdate);
-    if (ev.mode !== undefined) {
+    if (mode !== undefined) {
       // Mirror the advertised mode so turn-completion reconciliation
       // (emitModeIfChanged) doesn't re-emit the same value.
-      server.lastMode.set(acpSid, ev.mode);
+      server.lastMode.set(acpSid, mode);
       const modeUpdate: acp.SessionUpdate = {
         sessionUpdate: "current_mode_update",
-        currentModeId: ev.mode,
+        currentModeId: mode,
       };
       await sendSessionUpdate(cx, acpSid, modeUpdate);
       if (!isBroadcastSource(cx)) sendSessionUpdateToOthers(server, cx, acpSid, modeUpdate);
@@ -217,6 +228,10 @@ function dispatchToolCallNew(
       }),
     });
   }
+  // Workflow-run visibility feed: the background-task listener suppresses a
+  // workflow run's [background] card only when the CreateWorkflow card for
+  // this callId actually reached clients.
+  server.noteDispatchedToolCall(ev.callId, ev.callId);
 
   const update: acp.SessionUpdate = {
     sessionUpdate: "tool_call",
@@ -417,13 +432,22 @@ async function dispatchTerminalUpdate(
  * backend sent no cacheStats); any non-success resultType is surfaced
  * verbatim as a warning-flavored line. Distinct messageId (chunkMsgId
  * prefix) so editors keep it a separate message from the reply text.
+ *
+ * The success line ships only where it has a home: the Martty TUI (its
+ * timeline expects it) or an explicit config/env opt-in. Editor clients that
+ * render only the last assistant message of a turn — or fold everything but
+ * it — would bury the real reply behind this line (observed in T3 Code,
+ * pingdotgg/t3code#18080), so the default for them is off.
  */
 async function dispatchTurnInfo(
+  server: ZcodeAcpServer,
   cx: acp.AgentContext,
   acpSid: string,
   ev: Extract<InternalEvent, { kind: "TurnInfo" }>,
   chunkMsgId: string,
 ): Promise<void> {
+  const statusLineOn = showCompletionStatus() ?? server.hasMarttyClient();
+  if (ev.resultType === "success" && !statusLineOn) return;
   const m = messages();
   let line: string;
   if (ev.resultType === "success") {

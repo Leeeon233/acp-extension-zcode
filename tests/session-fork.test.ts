@@ -90,10 +90,11 @@ describe("session/fork", () => {
     expect(result.modes).toMatchObject({ currentModeId: "yolo" });
     expect(result.configOptions).toHaveLength(1);
     expect(server.resolveSid("zcode-fork")).toBe("zcode-fork");
+    expect(server.hydrationWatermark.get("zcode-fork")).toBe(0);
     expect(server.sessionCwds.get("zcode-fork")).toBe("/tmp/project");
     expect(server.sessionMcpServers.get("zcode-fork")).toEqual(inheritedMcp);
     expect(server.modelAvailability.get("zcode-fork")).toEqual([
-      { providerId: "test-provider", modelId: "test-model", defaultLevel: "high" },
+      { providerId: "test-provider", modelId: "test-model", defaultLevel: "high", levels: [] },
     ]);
 
     const call = backend.calls.find((c) => c.method === "session/fork");

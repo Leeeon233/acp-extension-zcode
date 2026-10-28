@@ -7,15 +7,18 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
-const { queryQuotaMock, buildOptionsMock, remoteConfigMock, queryOcUsageMock } = vi.hoisted(() => ({
-  queryQuotaMock: vi.fn(),
-  buildOptionsMock: vi.fn(),
-  remoteConfigMock: vi.fn(),
-  queryOcUsageMock: vi.fn(),
-}));
+const { queryQuotaMock, buildOptionsMock, remoteConfigMock, queryOcUsageMock, queryCpUsageMock } =
+  vi.hoisted(() => ({
+    queryQuotaMock: vi.fn(),
+    buildOptionsMock: vi.fn(),
+    remoteConfigMock: vi.fn(),
+    queryOcUsageMock: vi.fn(),
+    queryCpUsageMock: vi.fn(),
+  }));
 
 vi.mock("../src/quota/index.js", () => ({ queryQuota: queryQuotaMock }));
 vi.mock("../src/quota/ollama-cloud/index.js", () => ({ queryOcUsage: queryOcUsageMock }));
+vi.mock("../src/quota/cliproxy/index.js", () => ({ queryCpUsage: queryCpUsageMock }));
 vi.mock("../src/config/options.js", () => ({ buildConfigOptions: buildOptionsMock }));
 vi.mock("../src/remote/config.js", () => ({ parseRemoteConfig: remoteConfigMock }));
 
@@ -85,6 +88,8 @@ beforeEach(() => {
   remoteConfigMock.mockReset();
   queryOcUsageMock.mockReset();
   queryOcUsageMock.mockResolvedValue({ kind: "not_configured" });
+  queryCpUsageMock.mockReset();
+  queryCpUsageMock.mockResolvedValue({ result: { kind: "not_configured" }, otherCount: 0 });
   remoteConfigMock.mockReturnValue(null);
   buildOptionsMock.mockResolvedValue([{ id: "model" }]);
 });
@@ -221,6 +226,35 @@ describe("hub-first lookup", () => {
     } finally {
       vi.unstubAllGlobals();
     }
+  });
+
+  it("direct fallback composes the CLIProxy segment (pool aggregate)", async () => {
+    remoteConfigMock.mockReturnValue(null); // local-only: direct path
+    queryQuotaMock.mockResolvedValue(SUCCESS);
+    const resetAt = 1_800_000_000_000 + 3_600_000;
+    queryCpUsageMock.mockResolvedValue({
+      result: {
+        kind: "success",
+        fetchedAt: 1_800_000_000_000,
+        accounts: [
+          {
+            label: "will",
+            provider: "antigravity",
+            models: [
+              { name: "Gemini Models", windows: [{ window: "week", used: 0.634, resetAt }] },
+            ],
+          },
+        ],
+      },
+      otherCount: 1,
+    });
+    const { server } = fakeServer();
+    startQuotaRefresher(server);
+    await flushMicrotasks();
+    expect(queryCpUsageMock).toHaveBeenCalledTimes(1);
+    const d = new Date(resetAt);
+    const date = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    expect(server.quotaDock).toBe(`45% · 12% · cp 63.4% ${date}`);
   });
 
   it("keeps the last-known dock text when the hub reports formatted:null (sticky)", async () => {

@@ -11,7 +11,16 @@
 
 import { createServer, type Server } from "node:http";
 
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// Tombstones: listSessions consults hiddenTaskIds() (deleted/archived rows in
+// the App's tasks index) before sorting. Mock only that function — the rest
+// of tasks-index stays real (its module graph is imported by the server).
+const hiddenMock = vi.hoisted(() => ({ ids: new Set<string>() }));
+vi.mock("../src/tasks-index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/tasks-index.js")>();
+  return { ...actual, hiddenTaskIds: async () => hiddenMock.ids };
+});
 
 import type { ZcodeBackend } from "../src/backend/client.js";
 import {
@@ -19,11 +28,13 @@ import {
   DEFAULT_SESSION_LIMIT,
   MAX_SESSION_LIMIT,
 } from "../src/remote/session-list-endpoint.js";
+import { dismissWorkflowRunIds } from "../src/settings/workflow-run-dismissals.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
 const cleanups: Array<() => Promise<void> | void> = [];
 
 afterEach(async () => {
+  hiddenMock.ids = new Set();
   while (cleanups.length) {
     const stop = cleanups.pop()!;
     await stop();
@@ -106,6 +117,31 @@ describe("session history endpoint", () => {
     expect(typeof body.sessions[0]!.updatedAt).toBe("string");
     // Fewer rows than the page size — no continuation.
     expect(body.nextCursor).toBeNull();
+  });
+
+  it("hides tombstoned (deleted/archived) sessions before sorting and pagination", async () => {
+    // Delete sess_004 + sess_002: pages must stay DENSE (hidden rows never
+    // occupy a slot) and cursors keep naming the exact next visible row.
+    hiddenMock.ids = new Set(["sess_004", "sess_002"]);
+    const server = new ZcodeAcpServer();
+    server.backend = listBackend(fixture(5));
+    const base = await bootList(server);
+    type Cursor = { before: number; beforeId: string } | null;
+
+    const page1 = (await (await fetch(`${base}/sessions?limit=2`)).json()) as {
+      sessions: Array<{ sessionId: string }>;
+      nextCursor: Cursor;
+    };
+    expect(page1.sessions.map((s) => s.sessionId)).toEqual(["sess_003", "sess_001"]);
+    expect(page1.nextCursor).toEqual({ before: 1_001, beforeId: "sess_001" });
+
+    const page2 = (await (
+      await fetch(
+        `${base}/sessions?limit=2&before=${page1.nextCursor!.before}&beforeId=${page1.nextCursor!.beforeId}`,
+      )
+    ).json()) as { sessions: Array<{ sessionId: string }>; nextCursor: Cursor };
+    expect(page2.sessions.map((s) => s.sessionId)).toEqual(["sess_000"]);
+    expect(page2.nextCursor).toBeNull();
   });
 
   it("sorts newest-first (id desc tiebreak) and paginates with the composite cursor", async () => {
@@ -268,5 +304,132 @@ describe("session history endpoint", () => {
     const res = await fetch(`${base}/sessions`);
     expect(res.status).toBe(502);
     expect(await res.text()).toContain("backend down");
+  });
+});
+
+// ---------- workflowActivity join (desktop task-row parity) ----------
+
+describe("session history — workflowActivity", () => {
+  it("rows carry running count + newest run joined from the journal's newest window", async () => {
+    const server = new ZcodeAcpServer();
+    server.backendWorkflowGate = Promise.resolve({
+      mode: "alwaysOn",
+      enabled: true,
+      source: "override",
+    } satisfies import("../src/config/workflow-gate.js").WorkflowGate);
+    server.backend = {
+      isDead: false,
+      request: async (_id: number, method: string) => {
+        if (method === "session/list") {
+          return {
+            result: {
+              sessions: [
+                { sessionId: "sess_wf", title: "Runner", updatedAt: 900 },
+                { sessionId: "sess_plain", title: "Plain", updatedAt: 800 },
+              ],
+            },
+          };
+        }
+        if (method === "workflows/runs") {
+          return {
+            result: {
+              runs: [
+                // Out of order on purpose: `last` is picked by updatedAt, not
+                // arrival order.
+                { runId: "r2", parentSessionId: "sess_wf", status: "completed", updatedAt: 4000 },
+                {
+                  runId: "r1",
+                  parentSessionId: "sess_wf",
+                  status: "running",
+                  updatedAt: 5000,
+                  name: "deploy",
+                },
+              ],
+            },
+          };
+        }
+        return { error: { message: "unhandled" } };
+      },
+    } as unknown as ZcodeBackend;
+
+    const res = await fetch(`${await bootList(server)}/sessions`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      sessions: Array<{
+        sessionId: string;
+        workflowActivity?: { active: number; last?: { status: string } };
+      }>;
+    };
+    expect(body.sessions.find((s) => s.sessionId === "sess_wf")!.workflowActivity).toMatchObject({
+      active: 1,
+      last: { status: "running", updatedAt: 5000, name: "deploy" },
+    });
+    expect(
+      body.sessions.find((s) => s.sessionId === "sess_plain")!.workflowActivity,
+    ).toBeUndefined();
+  });
+
+  it("gate off degrades silently — the page still answers, rows carry no field", async () => {
+    const server = new ZcodeAcpServer();
+    server.backendWorkflowGate = Promise.resolve({
+      mode: "disabled",
+      enabled: false,
+      source: "remote",
+    } satisfies import("../src/config/workflow-gate.js").WorkflowGate);
+    server.backend = listBackend([{ sessionId: "sess_x", title: "X", updatedAt: 100 }]);
+
+    const res = await fetch(`${await bootList(server)}/sessions`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      sessions: Array<{ sessionId: string; workflowActivity?: unknown }>;
+    };
+    expect(body.sessions[0]!.workflowActivity).toBeUndefined();
+  });
+
+  it("dismissed journal runs drop out of the activity join", async () => {
+    // Dismiss the RUNNING row through the store (the route would 409; the
+    // join only ever sees already-dismissed ids).
+    dismissWorkflowRunIds(["r1"]);
+    const server = new ZcodeAcpServer();
+    server.backendWorkflowGate = Promise.resolve({
+      mode: "alwaysOn",
+      enabled: true,
+      source: "override",
+    } satisfies import("../src/config/workflow-gate.js").WorkflowGate);
+    server.backend = {
+      isDead: false,
+      request: async (_id: number, method: string) => {
+        if (method === "session/list") {
+          return {
+            result: { sessions: [{ sessionId: "sess_wf", title: "Runner", updatedAt: 900 }] },
+          };
+        }
+        if (method === "workflows/runs") {
+          return {
+            result: {
+              runs: [
+                { runId: "r2", parentSessionId: "sess_wf", status: "completed", updatedAt: 4000 },
+                { runId: "r1", parentSessionId: "sess_wf", status: "running", updatedAt: 5000 },
+              ],
+            },
+          };
+        }
+        return { error: { message: "unhandled" } };
+      },
+    } as unknown as ZcodeBackend;
+
+    const res = await fetch(`${await bootList(server)}/sessions`);
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      sessions: Array<{
+        sessionId: string;
+        workflowActivity?: { active: number; last?: { status: string } };
+      }>;
+    };
+    // r1 dismissed → no active count, the newest VISIBLE run decides `last`.
+    expect(body.sessions[0]!.workflowActivity).toMatchObject({
+      active: 0,
+      last: { status: "completed", updatedAt: 4000 },
+    });
   });
 });

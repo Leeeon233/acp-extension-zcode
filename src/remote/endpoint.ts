@@ -30,7 +30,10 @@ import { runtimeSpawnParts } from "../runtime.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { AGENT_INFO, log, warn } from "../utils.js";
 import { createFileHandler } from "./file-endpoint.js";
+import { envWithLoginShell } from "./login-shell-env.js";
 import { createSessionCloseHandler } from "./session-close-endpoint.js";
+import { createSessionDeleteHandler } from "./session-delete-endpoint.js";
+import { createPushTestHandler } from "./push-test-endpoint.js";
 import { createSessionListHandler } from "./session-list-endpoint.js";
 import { createSessionRenameHandler } from "./session-rename-endpoint.js";
 import { createSettingsHandler } from "./settings-endpoint.js";
@@ -47,6 +50,33 @@ interface AdvertisedSession {
 
 /** How often the bridge re-registers with the hub (also the heartbeat). */
 const HEARTBEAT_MS = 10_000;
+
+/**
+ * How long a heartbeat may wait for the discovery refresh before it registers
+ * with the previous list. A healthy `collectSessions` takes ~100-300ms; the
+ * cap only bites on a stalled one, where waiting further would push the
+ * register past the hub's 30s TTL. The in-flight refresh keeps running and
+ * its result rides the next heartbeat.
+ */
+const REFRESH_WAIT_MS = 1_500;
+
+/** Resolve after `ms`, without pinning the event loop (the heartbeat is unref'd). */
+function sleepUnref(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    timer.unref();
+  });
+}
+
+/**
+ * This process's boot instant, in epoch ms.
+ *
+ * Captured once at module load and read through `uptime()` rather than sampled
+ * with `Date.now()` at first register: `Date.now()` there measures when the
+ * register ARRIVED, not when the bridge started, and the gap is exactly what
+ * makes two bridges' start order ambiguous (see the register payload).
+ */
+const processStartTime = Date.now() - process.uptime() * 1000;
 /** Minimum spacing between hub spawn attempts (avoids spawn storms). */
 const SPAWN_THROTTLE_MS = 60_000;
 /** Cap for the 401-spawn backoff ladder (starts at SPAWN_THROTTLE_MS, doubles). */
@@ -225,21 +255,26 @@ export async function startRemoteEndpoint(
   const statusHandler = createStatusHandler(server);
   const settingsHandler = createSettingsHandler(server);
   const sessionCloseHandler = createSessionCloseHandler(server);
+  const pushTestHandler = createPushTestHandler(server);
   const sessionRenameHandler = createSessionRenameHandler(server);
+  const sessionDeleteHandler = createSessionDeleteHandler(server);
   const sessionListHandler = createSessionListHandler(server);
 
   const httpServer = createServer((req, res) => {
     const path = new URL(req.url ?? "/", "http://127.0.0.1").pathname;
     const closeMatch = path.match(/^\/sessions\/([^/]+)\/close$/);
     const renameMatch = path.match(/^\/sessions\/([^/]+)\/rename$/);
+    const deleteMatch = path.match(/^\/sessions\/([^/]+)\/delete$/);
     // Settings lives under a prefix so the routes above stay unambiguous, and
     // so the hub can strip the same prefix when it re-serves them (ADR-0025).
     if (path === "/acp") acpHttpHandler(req, res);
     else if (path.startsWith("/settings")) settingsHandler(req, res);
+    else if (path === "/push/test") pushTestHandler(req, res);
     else if (path.startsWith("/fs/")) fileHandler(req, res);
     else if (path === "/status") statusHandler(req, res);
     else if (closeMatch) sessionCloseHandler(req, res, closeMatch[1]!);
     else if (renameMatch) sessionRenameHandler(req, res, renameMatch[1]!);
+    else if (deleteMatch) sessionDeleteHandler(req, res, deleteMatch[1]!);
     else if (path === "/sessions") sessionListHandler(req, res);
     else {
       res.writeHead(404, { "Content-Type": "text/plain" });
@@ -304,6 +339,14 @@ export async function startRemoteEndpoint(
     id: instanceId,
     port,
     pid: process.pid,
+    // This process's own boot instant, for the hub's session-dedupe tie-break.
+    // The hub would otherwise stamp its `Date.now()` at first register, which
+    // is skewed by however long that first register took to arrive — a bridge
+    // whose cold start is slow (provider sync) would rank as NEWER than a
+    // bridge that really started after it, and win a session the other is
+    // driving. A heartbeat re-registration carries the same value, so the
+    // ranking is stable across the bridge's whole life.
+    startedAt: processStartTime,
     workspace: server.workspaceLabel(),
     sessions,
     // "editor" (stdio bridge) or "serve" (headless, hub-spawned, ADR-0014):
@@ -320,17 +363,24 @@ export async function startRemoteEndpoint(
     version: AGENT_INFO.version,
   });
 
-  const spawnHub = (): void => {
+  const spawnHub = async (): Promise<void> => {
     try {
       // dist/remote/endpoint.js → dist/bin/hub.js (one level up, then bin/).
       const hubJs = fileURLToPath(new URL("../bin/hub.js", import.meta.url));
+      // The hub is detached and long-lived; it spawns the terminal windows,
+      // serve bridges and (through them) the backends. If IT starts with a
+      // bare launchd PATH, every one of those inherits it and a remotely
+      // opened session cannot find the user's toolchain — so complete the
+      // environment here, once, at the root of the tree. Awaited (async probe)
+      // so this bridge's own event loop never freezes for the probe's timeout.
+      const shellEnv = await envWithLoginShell();
       const child = spawn(...runtimeSpawnParts(hubJs), {
         detached: true,
         // Surface the daemon's stderr through the bridge's diagnostics — a
         // detached "ignore" pipe silently eats startup failures.
         stdio: ["ignore", "ignore", "pipe"],
         env: {
-          ...process.env,
+          ...shellEnv,
           ZCODE_ACP_HUB_PORT: String(config.hubPort),
           ZCODE_ACP_HUB_HOST: config.hubHost,
           ZCODE_ACP_REMOTE_TOKEN: config.token,
@@ -356,19 +406,51 @@ export async function startRemoteEndpoint(
   // Last-good session list: an unexpected collectSessions failure must not
   // blank the discovery payload, so we keep advertising the previous one.
   let lastSessions: AdvertisedSession[] = [];
-
-  const registerOnce = async (): Promise<void> => {
-    if (stopped) return;
-    // Project-scoped session list before every heartbeat (session/list merge,
-    // ~100-300ms). Skipped while token-rejected: the payload would be refused
-    // anyway, so keep advertising lastSessions until a hub accepts us again.
-    // Never throws; wrapped anyway so a surprise failure can't fall into the
-    // hub-spawn catch below (which would misread it as "hub unreachable").
-    if (!authRejected) {
+  // Single-flight guard for the discovery refresh. The heartbeat MUST NOT wait
+  // on it: collectSessions awaits a backend `session/list` (10s cap), and a
+  // busy backend holds that RPC for the whole wait — the register POST then
+  // slips past the hub's 30s TTL, the instance is pruned, and every WS
+  // upgrade for it answers "unknown instance" until a register lands again
+  // (observed 2026-10-21: a serve bridge stuck 2.5+ min mid-turn). The
+  // heartbeat races a bounded wait against the in-flight refresh and sends
+  // the previous list when it loses; discovery staleness is harmless (the hub
+  // re-reads live state through /api/instances?probe=1 and session/load).
+  let refreshing: Promise<void> | null = null;
+  let refreshedOnce = false;
+  const refreshSessions = (): Promise<void> => {
+    if (refreshing) return refreshing;
+    refreshing = (async () => {
       try {
         lastSessions = await collectSessions(server);
       } catch {
         /* keep lastSessions */
+      } finally {
+        refreshedOnce = true;
+        refreshing = null;
+      }
+    })();
+    return refreshing;
+  };
+
+  const registerOnce = async (): Promise<void> => {
+    if (stopped) return;
+    // Discovery refresh, decoupled from the register itself. Skipped while
+    // token-rejected: the payload would be refused anyway, so keep advertising
+    // lastSessions until a hub accepts us again.
+    //
+    // Only the FIRST registration (nothing advertised yet) waits, and only for
+    // a bounded moment; every later heartbeat registers at once with the
+    // previous list while the refresh runs in the background — its result
+    // rides the next heartbeat. A backend-busy collectSessions (it awaits a
+    // `session/list` with a 10s cap) must never delay a heartbeat past the
+    // hub's 30s TTL: that prunes the instance, and every WS upgrade for it
+    // answers "unknown instance" until a register lands again (observed
+    // 2026-10-21: a serve bridge stuck 2.5+ min mid-turn).
+    if (!authRejected) {
+      if (refreshedOnce) {
+        void refreshSessions();
+      } else {
+        await Promise.race([refreshSessions(), sleepUnref(REFRESH_WAIT_MS)]);
       }
     }
     try {
@@ -396,7 +478,7 @@ export async function startRemoteEndpoint(
         if (Date.now() >= nextAuthSpawnAt) {
           nextAuthSpawnAt = Date.now() + authSpawnBackoffMs;
           authSpawnBackoffMs = Math.min(authSpawnBackoffMs * 2, AUTH_SPAWN_MAX_BACKOFF_MS);
-          spawnHub();
+          void spawnHub();
           const retry = setTimeout(() => void registerOnce(), 1500);
           retry.unref();
         }
@@ -433,7 +515,7 @@ export async function startRemoteEndpoint(
             if (stopped || authRejected) return;
             if (Date.now() < spawnThrottledUntil) return;
             spawnThrottledUntil = Date.now() + SPAWN_THROTTLE_MS;
-            spawnHub();
+            void spawnHub();
             const retry = setTimeout(() => void registerOnce(), 1500);
             retry.unref();
           }, 2000);
@@ -446,7 +528,7 @@ export async function startRemoteEndpoint(
       // instead of waiting a full heartbeat cycle.
       if (Date.now() >= spawnThrottledUntil) {
         spawnThrottledUntil = Date.now() + SPAWN_THROTTLE_MS;
-        spawnHub();
+        void spawnHub();
         const retry = setTimeout(() => void registerOnce(), 1500);
         retry.unref();
       }

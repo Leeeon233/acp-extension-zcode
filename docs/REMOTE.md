@@ -110,7 +110,13 @@ ran a session (system temp trees, `~/.zcode` itself, and vanished
 directories filtered out), newest activity first. The list gates the POST —
 paths outside it get 403 (a convenience bound, not a security boundary: a
 token holder can already drive an editor-bridge session in any cwd; the
-trust boundary is the token). On create the hub incubates a VISIBLE
+trust boundary is the token). The gate is WIDENED by the optional
+`remote.projectRoots` config (an array of absolute directory roots, `~`
+expanded, read live from the config file with the
+`ZCODE_ACP_PROJECT_ROOTS` path-list as the env fallback): any existing
+subdirectory under a configured root is accepted too, powering the mobile
+app's browse-and-create flow. Unconfigured, the known list alone stays the
+whitelist. On create the hub incubates a VISIBLE
 interactive TUI window in the machine's terminal (ADR-0016 as amended by
 ADR-0020, macOS; headless/SSH, `remote.terminal.enabled: false` in the config
 file, or `ZCODE_ACP_HUB_TERMINAL=0` falls back to the detached headless
@@ -129,7 +135,13 @@ open_file). Hyper stays unsupported (no programmatic command execution,
 vercel/hyper#3677).
 Create NEVER reuses a live serve-origin instance (ADR-0016 as amended) —
 every create incubates its own window, and identical concurrent requests
-join the same in-flight spawn. A
+join the same in-flight spawn. Desktop Presence (app ADR-0010) inverts this
+while the ZCode ACP desktop app is present — a proxied connection initialized
+as `zcode-acp-remote-desktop`, an HTTP call stamped `x-zcode-client`, or such
+a call within the last 45s (the app's 15s discovery poll): no window opens
+for any client, create and resume answer with the workspace's live
+serve-origin instance (`reused: true`), and only a workspace without one
+spawns, headless. A
 terminal-TUI instance lives while its window lives; the headless fallback
 exits ~10 minutes after the last client detaches and the last turn
 finishes. Session roots are pinned to the project cwd in both surfaces
@@ -147,6 +159,43 @@ The listing is the project's full backend session store; the hub incubates
 the project's serve bridge on first listing and reuses it after. Resume is
 the normal attach flow with `session/load` on a listed backend id. See
 `docs/REMOTE-CLIENTS.md` ("Resuming a closed session") for the client contract.
+
+**Directory browsing** (browse-and-create). A remote client may walk the
+machine's directory tree to pick a working directory no session has used
+yet:
+
+```text
+GET /api/fs/list?path=<abs> → {path, parent, creatable, entries:[{name}], truncated}
+```
+
+One directory level per call; an absent `path` (or `~`) lists the home dir,
+the answer carries the RESOLVED (realpath) spelling. Only subdirectories
+are listed (2000 cap, `truncated` flags the cut). Browsing is read-only and
+unscoped — the token is the boundary, like every hub route. `creatable`
+flags whether a NEW session may start in the listed directory itself: a
+known project, or under a configured `remote.projectRoots` root. With no
+roots configured every directory browses fine but `creatable` stays false
+outside the known list. See `docs/REMOTE-CLIENTS.md` ("Starting a session
+in a new directory") for the client contract.
+
+**Remote project/session delete** (ADR-0031). Both are soft deletes
+(tombstones in the App's tasks-index, upstream `deleteTask` semantics — the
+backend store keeps every conversation byte):
+
+```text
+POST /api/projects/delete {workspacePath}              → {ok, deletedTasks}
+POST /api/instances/{id}/sessions/{sid}/delete         → {ok, deleted}
+```
+
+A deleted project leaves `GET /api/projects` (and the session-create
+whitelist); a deleted session leaves every listing (`/api/projects/sessions`,
+ACP `session/list`, the CLI `/resume` picker, the desktop App sidebar).
+Sessions archived in the desktop App hide the same way. Deleting never stops
+anything: live conversations are refused (`409`), tombstoned resume ids get
+`404`, and deletes are self-healing — opening the project anywhere (the CLI's
+`/resume` picker, an editor tab) or using any session again cancels the hide;
+a fully deleted project comes back whole the moment it is reopened.
+See `docs/REMOTE-CLIENTS.md` ("Deleting a project or session").
 
 `sessions` lists the project's **currently running** conversations (live
 editor tabs and remote attachments) under the same ACP session ids the

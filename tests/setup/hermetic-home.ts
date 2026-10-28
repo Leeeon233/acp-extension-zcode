@@ -22,11 +22,26 @@
  * the REAL window's process tree (observed live 2026-09-08: the run killed
  * its own host window). Tests that need them re-stub explicitly.
  *
+ * The rest of the serve-bridge birth env is DELETED for the same reason
+ * (observed 2026-10-21, three session/new tests failing only inside a
+ * hub-incubated serve session): ZCODE_ACP_REMOTE_PIN_CWD flips the handlers
+ * into serve mode (session/new pins the cwd to process.cwd() instead of the
+ * client's), ZCODE_ACP_RESUME_SESSION arms the boot-resume (a "lazy create
+ * spawns nothing" test then waits on a backend that never comes), and
+ * ZCODE_ACP_REMOTE + the hub coordinates/token would register the test worker
+ * with the developer's LIVE hub. ZCODE_ACP_SANDBOX_ACTIVE is the sandboxed-
+ * spawn birth mark the hub keys its launchd re-exec on.
+ *
  * XDG_CONFIG_HOME is DELETED for the same reason as HOME is redirected: the
  * user config loader (~/.config/zcode-acp/config.json) prefers it, so a
  * developer with it exported (Linux desktops, dotfile shells) would point the
  * suite's file-config reads at their real config — e.g. a real
  * `sandbox.enabled: true` would flip "sandbox stays off by default" tests.
+ *
+ * ZCODE_DYNAMIC_WORKFLOW_MODE is DELETED for the same reason: it is the
+ * workflow-gate local override, and a developer exporting it (the headless
+ * power-user switch) would flip every workflow-gate test to the override
+ * verdict instead of the pinned remote one.
  *
  * ZCODE_MODEL / ANTHROPIC_API_KEY are DELETED for the same reason: a vitest
  * run started from inside a bridge session (ZCODE_PROVIDER/ZCODE_MODEL pin,
@@ -45,10 +60,18 @@ const home = mkdtempSync(path.join(tmpdir(), "zacp-test-home-"));
 process.env.HOME = home;
 delete process.env.ZCODE_HOME;
 delete process.env.XDG_CONFIG_HOME;
+delete process.env.ZCODE_DYNAMIC_WORKFLOW_MODE;
 delete process.env.ZCODE_MODEL;
 delete process.env.ANTHROPIC_API_KEY;
 delete process.env.ZCODE_ACP_REMOTE_ORIGIN;
 delete process.env.ZCODE_ACP_TUI_CLI_PID;
+delete process.env.ZCODE_ACP_REMOTE_PIN_CWD;
+delete process.env.ZCODE_ACP_RESUME_SESSION;
+delete process.env.ZCODE_ACP_REMOTE;
+delete process.env.ZCODE_ACP_REMOTE_TOKEN;
+delete process.env.ZCODE_ACP_HUB_HOST;
+delete process.env.ZCODE_ACP_HUB_PORT;
+delete process.env.ZCODE_ACP_SANDBOX_ACTIVE;
 
 afterAll(() => {
   // The dir is only used synchronously by store/config reads; by afterAll the

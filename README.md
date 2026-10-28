@@ -23,6 +23,21 @@ In active development. Core bridging, slash commands and ZCode extensions,
 auto-compaction, remote access for mobile/web clients, and the quota APIs are
 in place; see the project board for what's next.
 
+## Prompt attachments
+
+ACP embedded resources preserve the supplied content: text is included in the
+prompt, and PDF/image bytes are forwarded as native attachments even when their
+URI is not a readable local file. Other binary resources are staged privately
+under `$ZCODE_HOME/v2/acp-attachments` (default `~/.zcode/v2/acp-attachments`).
+Resource links remain references; the bridge does not download remote URIs.
+
+Prompts accept at most 100 blocks and 50 MiB of decoded content, with a 10 MiB
+limit per image. Staged files use private permissions and persist for native tool
+reads and session resume; remove files there manually when those sessions no
+longer need them. Invalid conversions roll back files created by that request.
+Pause an active goal loop before sending binary attachments; its queued prompts
+support text only. Audio transcription is not supported.
+
 ## Requirements
 
 - **Node.js ≥ 22** (the bridge uses `node:sqlite` for tasks-index sync; the
@@ -143,23 +158,35 @@ at bridge start just like its env var.
 
 ```jsonc
 {
-  "lang": "zh",                           // user-facing strings: "zh" | "en"
-  "debug": false,                         // verbose diagnostics (ZCODE_ACP_DEBUG=1)
-  "session": { "mode": "yolo" },          // initial mode: plan|build|edit|yolo|auto
+  "lang": "zh", // user-facing strings: "zh" | "en"
+  "debug": false, // verbose diagnostics (ZCODE_ACP_DEBUG=1)
+  "session": {
+    "mode": "yolo", // initial mode: plan|build|edit|guarded|yolo|auto (guarded: 3.15.1+, falls back on older backends)
+    "showCompletionStatus": true, // successful turn-end assistant status (default true)
+  },
   "autoCompact": { "threshold": 240000 }, // compact once N tokens are used (unset = off)
   "goal": {
-    "maxTurns": 100,                      // goal/auto loop round budget
-    "mode": "backend"                     // "backend" restores the legacy /goal routing
+    "maxTurns": 100, // goal/auto loop round budget
+    "mode": "backend", // "backend" restores the legacy /goal routing
   },
-  "interaction": { "timeoutMs": 0 },      // permission wait cap in ms (0 = wait forever)
-  "sandbox": { "enabled": false },        // global Seatbelt switch (per-project: sandbox.json)
-  "remote": { /* see Remote Access */ },
-  "quota": { /* quota card credentials */ }
+  "interaction": { "timeoutMs": 0 }, // permission wait cap in ms (0 = wait forever)
+  "sandbox": { "enabled": false }, // global Seatbelt switch (per-project: sandbox.json)
+  "remote": {/* see Remote Access */},
+  "quota": {
+    "autoResume": true, // wait out usage caps and continue (workflows + /auto)
+    /* quota card credentials */
+  },
 }
 ```
 
 Invalid values are warned about on stderr and dropped — the env fallback
 applies — and the file is never rewritten by the bridge.
+
+For clients such as T3 Code that display the last assistant message as the
+final response, set `session.showCompletionStatus` to `false` (or
+`ZCODE_ACP_SHOW_COMPLETION_STATUS=0`). This omits the successful completion/cache
+status line so the answer stays visible. Error and cancellation warnings still
+appear; structured usage updates and prompt-response usage are unchanged.
 
 Deliberately NOT file-configurable: per-process plumbing
 (`ZCODE_ACP_RESUME_SESSION`, `ZCODE_ACP_REMOTE_ORIGIN`,
@@ -174,34 +201,37 @@ before any config would be readable.
 Every `ZCODE_ACP_*` preference variable in this table has a config-file
 field (see [User config file](#user-config-file)); the file value wins.
 
-| Variable                           | Default             | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
-| ---------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| `ZCODE_BIN`                        | _(auto-discovered)_ | Path to the ZCode CLI binary or its `.cjs` entry. Resolution order: this variable → `zcode` on `PATH` → the desktop-app bundle                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
-| `ZCODE_NODE`                       | _(discovered)_      | Explicit Node binary to run `ZCODE_BIN` with (must support `node:sqlite`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `ZCODE_PROVIDER`                   | _(first enabled)_   | Pin the provider id from `config.json` (e.g. `builtin:zai-coding-plan`). Credentials are read from that provider only, and the model dropdown lists only its models. Unset keeps the default "first enabled provider wins". Set together with `ZCODE_MODEL` to pin the exact model: each new session is switched to `ZCODE_PROVIDER`/`ZCODE_MODEL` right after it is created, and session creation fails if the backend refuses that pair.                                                                                                                                     |
-| `ZCODE_HOME`                       | `~/.zcode`          | Directory that replaces `~/.zcode` as the ZCode data root. Everything the bridge reads from there follows it: credentials/provider config (`<dir>/v2/config.json`), the lazy-session alias store (`<dir>/v2/acp-lazy-sessions.json`), the desktop app's settings and tasks index (`<dir>/v2/setting.json`, `<dir>/v2/tasks-index.sqlite`), user skills (`<dir>/skills`), and the CLI config with plugin/skill/MCP enablement (`<dir>/cli/config.json` + plugin cache). Set it before starting the bridge — the credentials and tasks-index paths are resolved once at startup. |
-| `ZCODE_MODEL`                      | _(from config)_     | Override the active model id                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `ZCODE_DISALLOWED_TOOLS`            | _(Cron tools)_      | Space- or comma-separated tool names passed to the app-server as `--disallowed-tools`, merged with the built-in default that disallows `CronCreate CronList CronUpdate CronDelete` (the bridge cannot serve the backend's `automation/*` client requests, so those tools are advertised-but-broken — see #192). |
-| `ZCODE_ENABLE_AUTOMATION_TOOLS`     | _(unset)_           | Set to `1` to stop disallowing the Cron* tools — only useful for a host that actually implements the backend's `automation/*` port. |
-| `ZCODE_ACP_AUTO_COMPACT_THRESHOLD`  | _(unset)_           | Absolute token count that triggers automatic context compaction. After each successful turn (`end_turn`), if `contextUsed >= threshold`, the server invokes `session/compact` to free up context before the next prompt. Set to `0` or leave unset to disable (default). Example: `240000` triggers compaction at 240K tokens. The compaction target itself is decided by the ZCode backend.                                                                                                                                                                                   |
-| `ZCODE_ACP_MODE`                   | `yolo`              | Mode a newly created session starts in. Values are the backend's own modes — `plan`, `build`, `edit`, `yolo`, `auto`. Unset keeps `yolo` (unrestricted), the bridge's historical default. Only affects session creation; the mode dropdown still switches it per session.                                                                                                                                                                                                                                                                                                      |
-| `ZCODE_ACP_DEBUG`                  | _(unset)_           | Set to `1` to enable verbose diagnostic logs (event flow, probe loops, status updates). Default is quiet — only warnings (backend pipe errors, command/permission failures, lock timeouts) are emitted. Enable this when diagnosing bridge issues; the logs appear in `Zed.log` prefixed with `[zcode-acp]`.                                                                                                                                                                                                                                                                   |
-| `ZCODE_ACP_REMOTE`                 | _(unset)_           | Set to `1` to enable [remote access](#remote-access) — serve the same sessions to additional ACP clients over WebSocket.                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `ZCODE_ACP_REMOTE_TOKEN`           | _(unset)_           | Auth token for remote access. **Mandatory** when `ZCODE_ACP_REMOTE=1`; remote stays disabled without it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
-| `ZCODE_ACP_HUB_PORT`               | `8377`              | Port of the machine-level hub daemon. Map exactly this one port in your tunnel.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `ZCODE_ACP_HUB_HOST`               | `127.0.0.1`         | Hub bind address. `0.0.0.0` exposes a token-only, unencrypted surface — only for a containerized tunnel agent on a private interface (see [Remote Access](#remote-access)).                                                                                                                                                                                                                                                                                                                                                                                                    |
-| `ZCODE_ACP_REMOTE_PORT`            | `8378`              | First loopback port for the bridge's ACP endpoint. Each bridge (each editor window) auto-increments to the next free port.                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `ZCODE_ACP_SANDBOX`                | _(unset)_           | Set to `1` to confine the agent's file writes with a macOS Seatbelt sandbox globally; per-project, set `"enabled": true` in `<workspace>/.zcode/acp/sandbox.json` instead (see [Sandbox](#sandbox)).                                                                                                                                                                                                                                                                                                                                                                           |
-| `ZCODE_ACP_LANG`                   | _(inherited)_       | Language of the bridge's user-facing strings (popups, status/hint lines, command menu descriptions): `zh` or `en`. When unset, the bridge inherits the ZCode app's language (`localePreference`/`locale` in `~/.zcode/v2/setting.json`), then falls back to the `LC_ALL`/`LC_MESSAGES`/`LANG` locale, defaulting to English.                                                                                                                                                                                                                                                   |
+| Variable                           | Default             | Purpose                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
+| ---------------------------------- | ------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `ZCODE_BIN`                        | _(auto-discovered)_ | Path to the ZCode CLI binary or its `.cjs` entry. Resolution order: this variable → `zcode` on `PATH` → the desktop-app bundle                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
+| `ZCODE_NODE`                       | _(discovered)_      | Explicit Node binary to run `ZCODE_BIN` with (must support `node:sqlite`)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `ZCODE_PROVIDER`                   | _(first enabled)_   | Pin the provider id from `config.json` (e.g. `builtin:zai-coding-plan`). Credentials are read from that provider only, and the model dropdown lists only its models. Unset keeps the default "first enabled provider wins". Set together with `ZCODE_MODEL` to pin the exact model: each new session is switched to `ZCODE_PROVIDER`/`ZCODE_MODEL` right after it is created, and session creation fails if the backend refuses that pair.                                                                                                                                                                                                                                                                                                       |
+| `ZCODE_HOME`                       | `~/.zcode`          | Directory that replaces `~/.zcode` as the ZCode data root. Everything the bridge reads from there follows it: credentials/provider config (`<dir>/v2/config.json`), the lazy-session alias store (`<dir>/v2/acp-lazy-sessions.json`), the desktop app's settings and tasks index (`<dir>/v2/setting.json`, `<dir>/v2/tasks-index.sqlite`), user skills (`<dir>/skills`), and the CLI config with plugin/skill/MCP enablement (`<dir>/cli/config.json` + plugin cache). Set it before starting the bridge — the credentials and tasks-index paths are resolved once at startup.                                                                                                                                                                   |
+| `ZCODE_MODEL`                      | _(from config)_     | Override the active model id                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `ZCODE_DISALLOWED_TOOLS`           | _(Cron tools)_      | Space- or comma-separated tool names removed from every session the bridge creates or resumes (sent as the backend's per-session `toolDenylist` — a registry-level removal, so the tools are neither offered to the model nor executable), merged with the built-in default that disallows `CronCreate CronList CronUpdate CronDelete` (the bridge cannot serve the backend's `automation/*` client requests, so those tools are advertised-but-broken — see #192). Rule forms like `Bash(git *)` remove the whole tool. Matching is by exact tool name — no wildcards (`mcp__*` matches nothing); list MCP tools by their full `mcp__<server>__<tool>` name. A backend too old for `toolDenylist` gets one warning and runs without the policy. |
+| `ZCODE_ENABLE_AUTOMATION_TOOLS`    | _(unset)_           | Set to `1` to stop disallowing the Cron* tools — only useful for a host that actually implements the backend's `automation/*` port.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| `ZCODE_ACP_AUTO_COMPACT_THRESHOLD` | _(unset)_           | Absolute token count that triggers automatic context compaction. After each successful turn (`end_turn`), if `contextUsed >= threshold`, the server invokes `session/compact` to free up context before the next prompt. Set to `0` or leave unset to disable (default). Example: `240000` triggers compaction at 240K tokens. The compaction target itself is decided by the ZCode backend.                                                                                                                                                                                                                                                                                                                                                     |
+| `ZCODE_ACP_QUOTA_AUTO_RESUME`      | `1`                 | Wait out GLM usage-cap exhaustion (business codes 1308 …) and continue automatically: a quota-stopped `/auto` goal loop re-enters its rounds after the window reset, and quota-stopped workflow runs are resumed from the journal once the quota card reports the reset. Set `0` to restore pause-for-a-human. The bridge performs the wait (timers + a periodic journal scan), so it works while the editor/app is asleep or detached.                                                                                                                                                                                                                                                                                                          |
+| `ZCODE_ACP_MODE`                   | `yolo`              | Mode a newly created session starts in. Values are the backend's own modes — `plan`, `build`, `edit`, `yolo`, `auto`. Unset keeps `yolo` (unrestricted), the bridge's historical default. Only affects session creation; the mode dropdown still switches it per session.                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `ZCODE_ACP_DEBUG`                  | _(unset)_           | Set to `1` to enable verbose diagnostic logs (event flow, probe loops, status updates). Default is quiet — only warnings (backend pipe errors, command/permission failures, lock timeouts) are emitted. Enable this when diagnosing bridge issues; the logs appear in `Zed.log` prefixed with `[zcode-acp]`.                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `ZCODE_ACP_REMOTE`                 | _(unset)_           | Set to `1` to enable [remote access](#remote-access) — serve the same sessions to additional ACP clients over WebSocket.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `ZCODE_ACP_REMOTE_TOKEN`           | _(unset)_           | Auth token for remote access. **Mandatory** when `ZCODE_ACP_REMOTE=1`; remote stays disabled without it.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `ZCODE_ACP_HUB_PORT`               | `8377`              | Port of the machine-level hub daemon. Map exactly this one port in your tunnel.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `ZCODE_ACP_HUB_HOST`               | `127.0.0.1`         | Hub bind address. `0.0.0.0` exposes a token-only, unencrypted surface — only for a containerized tunnel agent on a private interface (see [Remote Access](#remote-access)).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `ZCODE_ACP_REMOTE_PORT`            | `8378`              | First loopback port for the bridge's ACP endpoint. Each bridge (each editor window) auto-increments to the next free port.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                       |
+| `ZCODE_ACP_SANDBOX`                | _(unset)_           | Set to `1` to confine the agent's file writes with a macOS Seatbelt sandbox globally; per-project, set `"enabled": true` in `<workspace>/.zcode/acp/sandbox.json` instead (see [Sandbox](#sandbox)).                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `ZCODE_ACP_LANG`                   | _(inherited)_       | Language of the bridge's user-facing strings (popups, status/hint lines, command menu descriptions): `zh` or `en`. When unset, the bridge inherits the ZCode app's language (`localePreference`/`locale` in `~/.zcode/v2/setting.json`), then falls back to the `LC_ALL`/`LC_MESSAGES`/`LANG` locale, defaulting to English.                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| `ZCODE_ACP_SHOW_COMPLETION_STATUS` | `1`                 | Emit successful turn-end status as assistant text. Set `0` or `false` to omit it; `session.showCompletionStatus` overrides the env. Error and cancellation warnings remain visible.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 ## Sandbox
 
 Optional macOS Seatbelt confinement for everything the agent writes: dual
-switch (`ZCODE_ACP_SANDBOX=1` globally, or `"enabled": true` in the
-auto-created `<workspace>/.zcode/acp/sandbox.json` per project), allow/reject
-popups for out-of-whitelist writes persisted visibly in that config, and
-automatic backend restart + task continuation after an allow. Full manual:
-[docs/SANDBOX.md](docs/SANDBOX.md).
+switch (`ZCODE_ACP_SANDBOX=1` globally, or `"enabled": true` in
+`<workspace>/.zcode/acp/sandbox.json` per project — auto-created only while
+the sandbox's global switch is on; otherwise the bridge writes nothing into
+the workspace), allow/reject popups for out-of-whitelist writes persisted
+visibly in that config, and automatic backend restart + task continuation
+after an allow. Full manual: [docs/SANDBOX.md](docs/SANDBOX.md).
 
 ## Remote Access
 
@@ -221,9 +251,47 @@ for remote session-create (`... serve`). The interactive Martty TUI and its
 `zcode-acp-martty` dependency were removed; setup details:
 [docs/CLI.md](docs/CLI.md).
 
+## Manual Coding Plan account setup
+
+With a supported ZCode CLI installed, run this command in your own terminal:
+
+```bash
+zcode-acp setup --provider zai       # or: bigmodel
+```
+
+Enter your individual Coding Plan API key at the hidden prompt. Do not put a
+key in command arguments or environment flags. Setup saves an owner-only
+`~/.zcode/v2/acp-accounts.json` file (`ZCODE_HOME` relocates the `.zcode` root),
+using atomic replacement and an exclusive setup lock. It never modifies the
+Desktop's `config.json`, `setting.json`, or `provider_config.json`.
+
+An explicitly configured bridge account overrides that family's Desktop key
+and enablement **in memory**. Other providers and their order are preserved;
+use `ZCODE_PROVIDER=builtin:zai-coding-plan` (or `builtin:bigmodel-coding-plan`)
+to select a specific account for model discovery and quota queries. The
+installed public catalog supplies the plan's models. Runtime account headers,
+model discovery, and quota use the same merged credential source. Saving does
+not verify plan membership or key validity; the first provider request does.
+Restart connected clients after setup. To return to Desktop-only credentials,
+remove the selected family entry from the private account file, preserving
+version `1` and the other account entries.
+
+This is manual terminal setup, not an interactive ACP authentication method.
+T3 Code and other clients can continue using the agent-handled authentication
+already advertised by the bridge. No OAuth/captcha flow or alternative remote
+login mechanism is added.
+
+If setup is killed while saving, it may leave an `acp-accounts.json.lock`
+directory. After confirming no setup process is running, remove that empty
+lock directory and retry. It may also leave an `acp-accounts.json.<id>.tmp`
+file. That file is owner-only but can hold the key, so delete it. Setup refuses a malformed, linked, or broadly
+readable account file and never overwrites it. The bridge ignores such a
+file with a warning and keeps using Desktop credentials. Fix or remove the
+file, then run setup again.
+
 ## ACP Registry
 
-This server is compatible with the [ACP Registry](https://agentclientprotocol.com/get-started/registry). It advertises a single `agent`-type auth method at `initialize` time — the GLM API key is read from `~/.zcode/v2/config.json` by the ZCode backend, so **no editor-side credentials are required**.
+This server is compatible with the [ACP Registry](https://agentclientprotocol.com/get-started/registry). It advertises a single `agent`-type auth method at `initialize` time — credentials come from Desktop configuration or a private bridge account created by manual terminal setup, so **no editor-side credentials are required**.
 
 The registry submission assets live under [`registry/zcode-acp/`](registry/zcode-acp/) (`agent.json` + `icon.svg`). Once the package is published to npm, copy that directory into a fork of [`agentclientprotocol/registry`](https://github.com/agentclientprotocol/registry) and open a PR — the CI validates the `agent.json` schema, icon, and that `initialize` returns a non-empty `authMethods`.
 
@@ -295,7 +363,7 @@ Thanks to everyone who has contributed (updated automatically from the
 <a href="https://github.com/Leeeon233/acp-extension-zcode/graphs/contributors">
   <!-- release-please re-stamps &v= on every release: the new URL busts the
        contrib.rocks and GitHub camo image caches. -->
-  <img src="https://contrib.rocks/image?repo=Leeeon233/acp-extension-zcode&v=0.38.0" alt="Contributors" /> <!-- x-release-please-version -->
+  <img src="https://contrib.rocks/image?repo=Leeeon233/acp-extension-zcode&v=0.78.0" alt="Contributors" /> <!-- x-release-please-version -->
 </a>
 
 ## Related Projects
@@ -320,12 +388,12 @@ ZCode backend over **local pipes**; that data reaches the GLM cloud API only
 because the ZCode backend itself sends it there for inference — this server
 adds no extra destinations.
 
-| Concern     | What & why                                                                                                                                                                                                                        |
-| ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Network     | Only one outbound request in the whole codebase: the quota GET (`open.bigmodel.cn` / `api.z.ai`), carrying just your API key — needed to fetch your usage numbers, sends no user content                                          |
-| Credentials | API key read from `~/.zcode/v2/config.json` to authenticate the ZCode subprocess and quota request. Never logged, never written elsewhere. OAuth handled entirely by the ZCode subprocess                                         |
-| Disk        | No new files created. Writes only to the existing `~/.zcode/v2/tasks-index.sqlite` — this **syncs sessions to the ZCode app** so they appear in its history list and full-text search (stores the session title and first prompt) |
-| Logging     | Diagnostics to stderr for troubleshooting bridge issues. Even with `ZCODE_ACP_DEBUG=1`, no prompts/code/keys are ever logged                                                                                                      |
+| Concern     | What & why                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ----------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Network     | Only one outbound request in the whole codebase: the quota GET (`open.bigmodel.cn` / `api.z.ai`), carrying just your API key — needed to fetch your usage numbers, sends no user content                                                                                                                                                                                                                                                           |
+| Credentials | Desktop credentials or owner-only `~/.zcode/v2/acp-accounts.json` authenticate native requests and quota queries. Manual setup writes only the private bridge file; Desktop settings are preserved. Never logged. OAuth remains handled by ZCode                                                                                                                                                                                                   |
+| Disk        | No new files unless you run `zcode-acp setup`. Setup writes the owner-only (0600) `~/.zcode/v2/acp-accounts.json` by atomic replacement, with a transient `acp-accounts.json.lock` directory and `.tmp` file while it saves. Otherwise writes only to the existing `~/.zcode/v2/tasks-index.sqlite` — this **syncs sessions to the ZCode app** so they appear in its history list and full-text search (stores the session title and first prompt) |
+| Logging     | Diagnostics to stderr for troubleshooting bridge issues. Even with `ZCODE_ACP_DEBUG=1`, no prompts/code/keys are ever logged                                                                                                                                                                                                                                                                                                                       |
 
 ## License
 

@@ -226,20 +226,50 @@ async function saveProviderConfig(
   return normalize(doc);
 }
 
+/** The API protocol types the runtime understands. */
+export const PROVIDER_API_TYPES = [
+  "anthropic-messages",
+  "openai-chat-completions",
+  "openai-responses",
+] as const;
+
 /**
- * Enable or disable a provider, and/or rename it.
+ * Enable or disable a provider, rename it, and/or edit its endpoint.
+ *
+ * `apiKey` is write-only: it is accepted here and NEVER returned by the read
+ * side (the settings snapshot reports only whether one is set). That is not
+ * just defence against a leaked response — the personal config file is
+ * world-readable on many setups, and a client that echoes it back would put
+ * the secret in a second place.
  *
  * @param patch.enabled  `true`/`false` flips the rule's `enabled` flag; omit to
  *                       leave it alone.
  * @param patch.providerName renames the provider; omit to leave it alone.
+ * @param patch.baseUrl  the endpoint URL; `null` clears it.
+ * @param patch.apiType  one of {@link PROVIDER_API_TYPES}; `null` clears it.
+ * @param patch.apiKey   the credential; `null` clears it. Omit to keep it.
  * @throws when the provider has no rule in this file (account-managed
- *         providers and bundled ones cannot be toggled here).
+ *         providers and bundled ones cannot be edited here).
  */
 export async function updateProvider(
   providerId: string,
-  patch: { enabled?: boolean; providerName?: string },
+  patch: {
+    enabled?: boolean;
+    providerName?: string;
+    baseUrl?: string | null;
+    apiType?: string | null;
+    apiKey?: string | null;
+  },
 ): Promise<ProviderConfigFile> {
   assertNotAccountProvider(providerId);
+  if (patch.apiType !== undefined && patch.apiType !== null) {
+    if (!PROVIDER_API_TYPES.includes(patch.apiType as (typeof PROVIDER_API_TYPES)[number])) {
+      throw new Error(`apiType must be one of ${PROVIDER_API_TYPES.join(", ")}`);
+    }
+  }
+  if (patch.baseUrl !== undefined && patch.baseUrl !== null) {
+    validateBaseUrl(patch.baseUrl);
+  }
   return saveProviderConfig((current) => {
     const rule = current.config.providerConfigRules.providerRules.find(
       (r) => r.providerId === providerId,
@@ -251,7 +281,45 @@ export async function updateProvider(
     }
     if (patch.enabled !== undefined) rule.enabled = patch.enabled;
     if (patch.providerName !== undefined) rule.providerName = patch.providerName;
+    const config = { ...(rule.config ?? {}) };
+    if (patch.baseUrl !== undefined || patch.apiType !== undefined) {
+      const api = { ...((config.api as Record<string, unknown> | undefined) ?? {}) };
+      if (patch.baseUrl !== undefined) {
+        if (patch.baseUrl === null || patch.baseUrl === "") delete api.baseUrl;
+        else api.baseUrl = patch.baseUrl;
+      }
+      if (patch.apiType !== undefined) {
+        if (patch.apiType === null || patch.apiType === "") delete api.type;
+        else api.type = patch.apiType;
+      }
+      config.api = api;
+    }
+    if (patch.apiKey !== undefined) {
+      const access = { ...((config.access as Record<string, unknown> | undefined) ?? {}) };
+      if (patch.apiKey === null || patch.apiKey === "") delete access.apiKey;
+      else {
+        access.apiKey = patch.apiKey;
+        // A key means key-based access; leaving a stale type here (say
+        // `zhipu-account`) would make the registry ignore the key.
+        access.type = "api-key";
+      }
+      config.access = access;
+    }
+    rule.config = config;
   });
+}
+
+/** A base URL the runtime can actually dial. */
+function validateBaseUrl(value: string): void {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    throw new Error("baseUrl must be an absolute http(s) URL");
+  }
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    throw new Error("baseUrl must be an absolute http(s) URL");
+  }
 }
 
 /**

@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import process from "node:process";
 
+import { appendDiary } from "./crash-guards.js";
 import { debugEnabled } from "./config/settings.js";
 
 /** ACP protocol version this server speaks. */
@@ -132,8 +133,8 @@ export const SLASH_COMMANDS = [
   { name: "fork", description: "Fork the session at the latest checkpoint" },
   {
     name: "mode",
-    description: "Switch permission mode (plan/build/edit/yolo)",
-    input: { hint: "plan|build|edit|yolo" },
+    description: "Switch permission mode (plan/build/edit/guarded/yolo)",
+    input: { hint: "plan|build|edit|guarded|yolo" },
   },
   {
     name: "model",
@@ -149,6 +150,14 @@ export const SLASH_COMMANDS = [
   { name: "resume", description: "Resume a past session into this thread (picker popup)" },
   { name: "mcp", description: "List available MCP servers" },
   { name: "init", description: "Create or update workspace AGENTS.md instructions" },
+  // Gated commands (dynamic-workflow verdict): advertised only when the gate
+  // is enabled — index.ts filters them out at every send site.
+  {
+    name: "workflow",
+    description: "Describe a dynamic multi-step workflow for the model to run",
+    input: { hint: "<workflow description>" },
+  },
+  { name: "workflows", description: "List saved workflows and recent runs" },
 ] as const;
 
 /** Static metadata for the configOptions selects (model/mode/thought). */
@@ -165,8 +174,8 @@ export const CONFIG_META = {
       { value: "plan", name: "plan" },
       { value: "build", name: "build" },
       { value: "edit", name: "edit" },
+      { value: "guarded", name: "guarded" },
       { value: "yolo", name: "yolo" },
-      { value: "auto", name: "auto" },
     ],
   },
   thought: {
@@ -215,9 +224,12 @@ export function log(msg: string): void {
   process.stderr.write(`[zcode-acp] ${msg}\n`);
 }
 
-/** Warning — always emitted. For perceivable failures. */
+/** Warning — always emitted. For perceivable failures. Also lands in the
+ * daily on-disk diary (`~/.zcode/cli/log/zcode-acp-<date>.log`) so a crash
+ * that takes stderr down still leaves a trace — see crash-guards.ts. */
 export function warn(msg: string): void {
   process.stderr.write(`[zcode-acp] ${msg}\n`);
+  appendDiary(msg);
 }
 
 /**

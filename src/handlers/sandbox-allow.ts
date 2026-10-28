@@ -24,10 +24,13 @@ import {
   readSandboxConfig,
   resolveReal,
 } from "../backend/sandbox.js";
+import { sandboxUnattendedAskTimeoutMs } from "../config/settings.js";
 import { messages } from "../i18n.js";
 import { log, warn } from "../utils.js";
-import type { ZcodeAcpServer } from "../server.js";
+import { hasActiveWorkflowRun } from "../workflow/poller.js";
+import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { sendTextChunk } from "./io.js";
+import { isInteractionInterrupted, requestWithTimeout } from "./server-requests.js";
 
 /** A sandbox write-denial observed in tool output. */
 export interface SandboxDenial {
@@ -95,9 +98,6 @@ export function extractSandboxDenial(text: string): SandboxDenial | null {
   return { path: zsh[1]!, isMkdir: false };
 }
 
-/** How long the allow popup may hang before it counts as a rejection. */
-const ASK_TIMEOUT_MS = 120_000;
-
 /**
  * How long approvals collect into one restart batch (ADR-0011). The old flow
  * restarted the backend on EVERY approval; a second popup still pending on
@@ -117,6 +117,51 @@ export const SANDBOX_RESTART_BATCH_MS = 3000;
  */
 const SANDBOX_ASK_RETRY_MS = 60_000;
 export { SANDBOX_ASK_RETRY_MS };
+
+/**
+ * Asked-map mark for a path an unattended-context ask timed out on. Unlike a
+ * user decision (Infinity) it is NOT permanent: the mark is re-checked
+ * lazily, and once the unattended context is over (goal loop stopped /
+ * workflow run settled) the path may ask again — the pin exists to stop
+ * popup/push storms while nobody can answer, not to decide for the user.
+ */
+export const UNATTENDED_PIN = -1;
+
+/**
+ * Is this session currently in an unattended context — a chain that must not
+ * block on a human answer? Goal-loop rounds (turn.goalLoop) and sessions
+ * with an in-flight workflow run (the parent must stay able to receive
+ * results and steer the run). "No client connected" is NOT this: that is the
+ * hold case, which still waits for the user to come back.
+ */
+export function sessionUnattended(server: ZcodeAcpServer, acpSid: string): boolean {
+  const z = server.resolveSid(acpSid);
+  if (z === undefined) return false;
+  if (server.goalLoops.has(z)) return true;
+  return hasActiveWorkflowRun(z);
+}
+
+/**
+ * End the frozen turn so the task resumes with the denial context instead of
+ * the model free-running past the EPERM it caused. The turn unwinds as
+ * `cancelled`; an ordinary (prompt()-driven) round gets a continuation the
+ * chained round consumes; a goal-loop round gets the sandboxRestart mark so
+ * the driver re-dispatches the ticket instead of pausing like a user ESC.
+ */
+function settleDeniedTurn(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  turn: PendingTurn | undefined,
+  continuationText: string,
+): void {
+  if (!turn) return;
+  turn.cancelled = true;
+  if (turn.goalLoop) {
+    turn.sandboxRestart = true;
+  } else {
+    server.sandboxContinuations.set(acpSid, continuationText);
+  }
+}
 
 /**
  * Collects approved grants and fires ONE flush per batch window. Kept here
@@ -146,6 +191,31 @@ export class SandboxRestartBatcher {
       this.flush(batch);
     }, this.batchMs);
     this.timer.unref?.();
+  }
+
+  /** Does this session still have a grant collecting in the open window? */
+  pendingFor(acpSid: string): boolean {
+    return this.grants.has(acpSid);
+  }
+}
+
+/**
+ * Block until this session's batched grant flushes (the window closes and the
+ * cancel-wave + continuation land). Called by the turn loop right after an
+ * allow settles: the freeze's stop already produced a terminal event in the
+ * backlog, and processing it before the flush would end the round end_turn —
+ * dropping it from pendingTurns so the flush finds no in-flight turn and the
+ * continuation (and with it the whole grant) would be orphaned. Bounded: a
+ * stuck flush degrades to the old behaviour instead of hanging the turn.
+ */
+export async function waitForSandboxBatchFlush(
+  server: ZcodeAcpServer,
+  acpSid: string,
+  maxMs: number = SANDBOX_RESTART_BATCH_MS + 2_000,
+): Promise<void> {
+  const deadline = Date.now() + maxMs;
+  while (server.sandboxRestartBatcher.pendingFor(acpSid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 50));
   }
 }
 
@@ -255,22 +325,6 @@ export function extractPermDeniedPath(text: string): string | null {
   return zsh ? zsh[1]! : null;
 }
 
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
-  return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("sandbox ask timed out")), ms);
-    p.then(
-      (v) => {
-        clearTimeout(timer);
-        resolve(v);
-      },
-      (e) => {
-        clearTimeout(timer);
-        reject(e);
-      },
-    );
-  });
-}
-
 /**
  * Paths that no popup can ever allow: the deny island (config self-edit =
  * self-escalation) and strictGit's .git — their denies are emitted LAST in
@@ -304,7 +358,13 @@ function underAny(target: string, bases: string[]): boolean {
  * Ask the user to allow the directory behind a sandbox denial and, on
  * approval, queue the grant into the batched restart (see
  * SandboxRestartBatcher — one restart per window, not one per approval).
- * Best-effort: any failure keeps the sandbox exactly as it was.
+ * The EPERM tool result has already reached the model, so a REAL ask first
+ * FREEZES the backend's generation (the stop pair — the model must not work
+ * past the denial it caused while the user is being asked); the turn then
+ * unwinds as cancelled and resumes via the continuation machinery on every
+ * outcome (allow → widened-profile respawn; rejection/timeout → same
+ * backend, denial context in the continuation). Best-effort: any failure
+ * keeps the sandbox exactly as it was.
  */
 export async function handleSandboxDenial(
   server: ZcodeAcpServer,
@@ -312,6 +372,8 @@ export async function handleSandboxDenial(
   acpSid: string,
   denial: SandboxDenial,
   toolCallId: string,
+  turn?: PendingTurn,
+  freeze?: (turn: PendingTurn) => Promise<void>,
 ): Promise<void> {
   // Process-level fact, not the config wish: the caller gates on the same
   // flag, so a sandbox armed only via project config (no env) still flows.
@@ -329,17 +391,21 @@ export async function handleSandboxDenial(
   // Debounce: one ask per path per session. The mark carries the ask
   // timestamp — a USER decision pins it forever (Infinity); an ask that died
   // of the environment merely cools down for SANDBOX_ASK_RETRY_MS and may
-  // re-ask afterwards.
+  // re-ask afterwards; an unattended timeout pins for the REST of its
+  // unattended context (lazily re-checked — see UNATTENDED_PIN).
   let asked = server.sandboxAskedPaths.get(acpSid);
   if (!asked) {
     asked = new Map();
     server.sandboxAskedPaths.set(acpSid, asked);
   }
   const prior = asked.get(targetReal);
-  if (
-    prior !== undefined &&
-    (prior === Number.POSITIVE_INFINITY || Date.now() - prior < SANDBOX_ASK_RETRY_MS)
-  ) {
+  if (prior === Number.POSITIVE_INFINITY) {
+    return;
+  }
+  if (prior === UNATTENDED_PIN) {
+    if (sessionUnattended(server, acpSid)) return;
+    // The unattended context ended — the pin expires, ask afresh.
+  } else if (prior !== undefined && Date.now() - prior < SANDBOX_ASK_RETRY_MS) {
     return;
   }
   asked.set(targetReal, Date.now());
@@ -373,6 +439,31 @@ export async function handleSandboxDenial(
     return;
   }
 
+  // A real ask is about to go out: FREEZE the backend's generation first.
+  // The EPERM result already reached the model and it is free-running past
+  // the denial while the user is being asked — the observed "the model kept
+  // working / started the next round before the grant landed". The stop pair
+  // does not touch turn.cancelled (that flag is only set below, once the ask
+  // settles), so the ask's own cancel-poll racer stays quiet. Frozen output
+  // after the stop is residue for the turn-attribution gate, same as a user
+  // ESC.
+  if (turn && freeze) {
+    try {
+      await freeze(turn);
+    } catch (e) {
+      warn(
+        `sandbox: freeze before ask failed (asking anyway): ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+  }
+
+  // Unattended contexts (goal-loop round, workflow-run parent) must not block
+  // on a human: their asks get a finite timeout and end no-decision — pin the
+  // path for the rest of the context and resume with denial context. 0 (or
+  // the file/env knob set to 0) = wait forever even unattended.
+  const unattended = sessionUnattended(server, acpSid);
+  const timeoutMs = unattended ? sandboxUnattendedAskTimeoutMs() : 0;
+
   const options = [
     {
       optionId: "sandbox_allow_always",
@@ -392,49 +483,81 @@ export async function handleSandboxDenial(
     },
   ];
   let decision: "always" | "once" | "reject_once" | "reject_always" | "deny" = "deny";
-  try {
-    // Wire name is session/request_permission (snake_case — the camelCase
-    // form is silently method-not-found on real clients). The schema has no
-    // top-level title: the popup's DETAILS live on the toolCall update — its
-    // title names the denied path and the text content explains the stakes.
-    // No `as never`: tsc validates the wire shape against the SDK schema.
-    const resp = (await withTimeout(
-      cx.request("session/request_permission", {
-        sessionId: acpSid,
-        toolCall: {
-          toolCallId,
-          title: m.sandboxPopupTitle(targetReal),
-          content: [
-            {
-              type: "content",
-              content: {
-                type: "text",
-                text: m.sandboxPopupDetails(targetReal),
-              },
+  // §6 funnel (requestWithTimeout), not a bare cx.request with a 120s cap:
+  // the ask must HOLD while nobody can answer (zero clients at fire time, or
+  // every connection dying mid-wait — the phone-sleep case) and
+  // resendPendingInteractions re-fires it at the next client attach; the
+  // watchdog/ask_settled bookkeeping comes with the funnel. Attended asks
+  // have NO finite timeout — the escapes are the answer and the turn being
+  // cancelled; unattended asks add the configured timeout (timeoutMs above).
+  // Wire name is session/request_permission (snake_case — the camelCase
+  // form is silently method-not-found on real clients). The schema has no
+  // top-level title: the popup's DETAILS live on the toolCall update — its
+  // title names the denied path and the text content explains the stakes.
+  const resp = await requestWithTimeout(
+    server,
+    cx,
+    "session/request_permission",
+    {
+      sessionId: acpSid,
+      toolCall: {
+        toolCallId,
+        title: m.sandboxPopupTitle(targetReal),
+        content: [
+          {
+            type: "content",
+            content: {
+              type: "text",
+              text: m.sandboxPopupDetails(targetReal),
             },
-          ],
-          rawInput: { path: targetReal },
-        },
-        options,
-      }),
-      ASK_TIMEOUT_MS,
-    )) as { outcome?: { optionId?: string } } | undefined;
-    const oid = resp?.outcome?.optionId ?? "";
-    if (oid === "sandbox_allow_always") decision = "always";
-    else if (oid === "sandbox_allow_once") decision = "once";
-    else if (oid === "sandbox_reject_always") decision = "reject_always";
-    else if (oid === "sandbox_reject_once") decision = "reject_once";
-  } catch (e) {
-    // Popup failed/timed out or the client channel died — including a kill
-    // by ANOTHER grant's batched restart. This ask never got a user
-    // decision; the timestamp stays as-is, so the path merely cools down
-    // (SANDBOX_ASK_RETRY_MS) and may re-ask afterwards — never permanently
-    // muted, never free to storm.
-    warn(
-      `sandbox: allow ask for ${targetReal} failed: ${e instanceof Error ? e.message : String(e)}`,
-    );
+          },
+        ],
+        rawInput: { path: targetReal },
+      },
+      options,
+    },
+    `sandbox allow ${targetReal}`,
+    timeoutMs,
+    turn,
+  );
+  if (resp === null || isInteractionInterrupted(resp)) {
+    if (turn?.cancelled) {
+      // The turn was cancelled out from under the ask (user stop/preempt, or
+      // ANOTHER grant's batched restart): the turn loop unwinds on its own
+      // and prompt()/the driver consume the flush's continuation — settle
+      // nothing here, a denial continuation would overwrite that grant's.
+      warn(`sandbox: allow ask for ${targetReal} aborted (turn cancelled)`);
+      return;
+    }
+    if (isInteractionInterrupted(resp) && unattended) {
+      // Unattended timeout: no-decision, but the chain must keep moving —
+      // pin the path for the rest of this context (no popup/push storm) and
+      // resume the frozen turn with the denial context.
+      asked.set(targetReal, UNATTENDED_PIN);
+      settleDeniedTurn(server, acpSid, turn, m.sandboxUnattendedTimeoutContinuation(targetReal));
+      await sendTextChunk(cx, acpSid, m.sandboxUnattendedTimeoutHint(targetReal), randomUUID());
+      log(`sandbox: unattended ask for ${targetReal} timed out — denied for this context`);
+      return;
+    }
+    // No user decision (client error / dead attempt with other clients
+    // around). A frozen turn must still settle here: the stop already killed
+    // the generation and nothing will re-trigger the EPERM, so without a
+    // continuation the round would strand on the stop's half reply. This is
+    // NOT a rejection — nothing is persisted or pinned; the asked-mark keeps
+    // its timestamp, so the path merely cools down (SANDBOX_ASK_RETRY_MS) and
+    // may re-ask afterwards — never permanently muted, never free to storm.
+    if (turn) {
+      settleDeniedTurn(server, acpSid, turn, m.sandboxAskUndeliveredContinuation(targetReal));
+      await sendTextChunk(cx, acpSid, m.sandboxAskUndeliveredHint(targetReal), randomUUID());
+    }
+    warn(`sandbox: allow ask for ${targetReal} ended without a decision — may re-ask later`);
     return;
   }
+  const oid = (resp as { outcome?: { optionId?: string } } | undefined)?.outcome?.optionId ?? "";
+  if (oid === "sandbox_allow_always") decision = "always";
+  else if (oid === "sandbox_allow_once") decision = "once";
+  else if (oid === "sandbox_reject_always") decision = "reject_always";
+  else if (oid === "sandbox_reject_once") decision = "reject_once";
 
   // A real outcome reached the client and came back (including an unknown
   // optionId the user picked): the user SAW this ask — pin the debounce
@@ -446,6 +569,10 @@ export async function handleSandboxDenial(
     // silently remembered in bridge memory. If the config can't be written,
     // nothing is stored: the ask simply resurfaces next time.
     const persisted = wsRoot ? appendSandboxDeny(wsRoot, targetReal) : false;
+    // The turn was frozen for this ask — resume it with the denial context
+    // (the model only saw a bare EPERM; without this it free-runs into
+    // retrying the same path).
+    settleDeniedTurn(server, acpSid, turn, m.sandboxRejectContinuation(targetReal));
     await sendTextChunk(
       cx,
       acpSid,
@@ -458,6 +585,7 @@ export async function handleSandboxDenial(
   }
 
   if (decision === "reject_once" || decision === "deny") {
+    settleDeniedTurn(server, acpSid, turn, m.sandboxRejectContinuation(targetReal));
     await sendTextChunk(cx, acpSid, m.sandboxRejectOnceHint(targetReal), randomUUID());
     return;
   }

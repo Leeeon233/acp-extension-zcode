@@ -6,9 +6,10 @@
  */
 
 import { EventEmitter } from "node:events";
+import { realpathSync } from "node:fs";
 import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { createServer, type Server } from "node:http";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 
 import { WebSocket, WebSocketServer } from "ws";
@@ -17,19 +18,25 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 // The session-create endpoints read the known-project whitelist from
 // tasks-index; mock the module so no real sqlite/App store is touched.
-const { listKnownWorkspacesMock } = vi.hoisted(() => ({
+// isTaskDeleted (resume tombstone guard) defaults to false — resume paths
+// must behave exactly as before unless a test opts into a tombstone.
+const { isTaskDeletedMock, listKnownWorkspacesMock } = vi.hoisted(() => ({
   listKnownWorkspacesMock: vi.fn(),
+  isTaskDeletedMock: vi.fn(async () => false),
 }));
 vi.mock("../src/tasks-index.js", () => ({
   listKnownWorkspaces: listKnownWorkspacesMock,
+  isTaskDeleted: isTaskDeletedMock,
 }));
 
 import {
+  DESKTOP_CLIENT_NAME,
   resolveTerminalLaunch,
   sanitizeTabTitle,
   startHub,
   terminalTuiScript,
   ghosttyTabAppleScript,
+  initializeClientName,
   type HubHandle,
 } from "../src/remote/hub-server.js";
 import { BOOT_RESUME_TRIGGER } from "../src/handlers/session.js";
@@ -193,19 +200,90 @@ describe("hub WS proxy", () => {
 
   it("refuses WS upgrades with a bad token or unknown instance", async () => {
     const hub = await startTestHub();
-    const cases = [
-      `ws://127.0.0.1:${hub.port}/acp?instance=inst-1&token=wrong`,
-      `ws://127.0.0.1:${hub.port}/acp?instance=unknown&token=${TOKEN}`,
-    ];
-    for (const url of cases) {
-      const client = new WebSocket(url);
-      const closed = new Promise<void>((resolve) => {
-        client.once("error", () => resolve());
-        client.once("close", () => resolve());
-      });
-      await withTimeout(closed, 3000, "ws reject");
-      expect(client.readyState).not.toBe(WebSocket.OPEN);
+    // A registered instance, so the unknown-instance rejection has something
+    // to list under "known:" — that list is what tells an operator whether the
+    // client held a stale id or the bridge itself was pruned.
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody()),
+    });
+    // The rejection log must NAME the instance: diagnosing a live outage
+    // (2026-10-21) meant guessing which instance a client was attached to,
+    // because both rejections logged without an id.
+    const stderr: string[] = [];
+    const write = process.stderr.write.bind(process.stderr);
+    process.stderr.write = ((chunk: string | Uint8Array) => {
+      stderr.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString("utf8"));
+      return true;
+    }) as typeof process.stderr.write;
+    try {
+      const cases = [
+        `ws://127.0.0.1:${hub.port}/acp?instance=inst-1&token=wrong`,
+        `ws://127.0.0.1:${hub.port}/acp?instance=unknown&token=${TOKEN}`,
+      ];
+      for (const url of cases) {
+        const client = new WebSocket(url);
+        const closed = new Promise<void>((resolve) => {
+          client.once("error", () => resolve());
+          client.once("close", () => resolve());
+        });
+        await withTimeout(closed, 3000, "ws reject");
+        expect(client.readyState).not.toBe(WebSocket.OPEN);
+      }
+    } finally {
+      process.stderr.write = write;
     }
+    const log = stderr.join("");
+    // Unauthorized: names the requested instance.
+    expect(log).toContain("unauthorized WS upgrade rejected");
+    expect(log).toContain("instance=inst-1");
+    // Unknown instance: names the requested id AND what IS registered.
+    expect(log).toContain("unknown instance rejected");
+    expect(log).toContain("id=unknown");
+    expect(log).toMatch(/known: .*inst-1/);
+  });
+
+  it("a corpse instance: dial failure answers 502 and prunes the registration", async () => {
+    // Regression (observed 2026-10-20): a serve bridge self-exits ~1.5s
+    // after its last session closes, but the registration lives until the
+    // heartbeat TTL — every attach in that window dialed the corpse, and
+    // Bun's WebSocket reported the failed connect through a second dispatch
+    // path that landed as an unhandled 'error' (uncaught exception in the
+    // diary). The dial must fail cleanly (502, no throw) AND prune so the
+    // client's next attempt reads "unknown instance" and re-incubates
+    // instead of retrying the corpse for the whole TTL.
+    const hub = await startTestHub();
+    // A definitely-closed port: bind ephemeral, then release.
+    const probe = createServer();
+    const closedPort = await new Promise<number>((resolve) => {
+      probe.listen(0, "127.0.0.1", () => {
+        const addr = probe.address();
+        const port = typeof addr === "object" && addr ? addr.port : 0;
+        probe.close(() => resolve(port));
+      });
+    });
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: closedPort })),
+    });
+    const before = (await (await listInstances(hub)).json()) as Array<{ id: string }>;
+    expect(before.map((i) => i.id)).toContain("inst-1");
+
+    const client = new WebSocket(`ws://127.0.0.1:${hub.port}/acp?instance=inst-1&token=${TOKEN}`);
+    const failed = new Promise<void>((resolve, reject) => {
+      client.once("error", (e: Error) => {
+        // ws surfaces the written 502 as an unexpected server response.
+        if (!e.message.includes("502")) reject(new Error(`expected 502, got: ${e.message}`));
+        else resolve();
+      });
+    });
+    await withTimeout(failed, 3000, "corpse dial 502");
+
+    // The registration is gone — the next attempt reads "unknown instance".
+    const after = (await (await listInstances(hub)).json()) as Array<{ id: string }>;
+    expect(after.map((i) => i.id)).not.toContain("inst-1");
   });
 });
 
@@ -829,6 +907,184 @@ describe("hub terminal-TUI session resume (ADR-0017)", () => {
     expect(await res.json()).toEqual({ id: "resume-repl", reused: false });
   });
 
+  it("refuses an AUTO resume of a remotely closed session (409) but lets a user resume through", async () => {
+    // The resurrection bug (ADR-0006 follow-up): the phone closes a session,
+    // the desktop tab's reconnect ladder finds its bridge gone and POSTs a
+    // resume for the same sid seconds later — re-incubating what was just
+    // closed. The hub records the proxied close: the cached entry drops the
+    // sid at once (not one heartbeat later), AUTO resumes are refused, and a
+    // user-intent resume (a human picking the session) passes and clears
+    // the stone — close retires, it never deletes.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const bridge = createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end('{"ok":true}');
+    });
+    const bridgePort = await new Promise<number>((resolve) => {
+      bridge.listen(0, "127.0.0.1", () => {
+        const addr = bridge.address();
+        resolve(typeof addr === "object" && addr ? addr.port : 0);
+      });
+    });
+    track(bridge, (s) => new Promise<void>((resolve) => s.close(() => resolve())));
+    const advertise = () =>
+      fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          registerBody({
+            id: "holder",
+            workspace: PROJECT,
+            origin: "serve",
+            port: bridgePort,
+            sessions: [{ sessionId: "sess_closed", title: "t", updatedAt: 1 }],
+          }),
+        ),
+      });
+    expect((await advertise()).ok).toBe(true);
+    const sidsOf = async () => {
+      const list = (await (await listInstances(hub)).json()) as Array<{
+        id: string;
+        sessions: Array<{ sessionId: string }>;
+      }>;
+      return list.find((e) => e.id === "holder")!.sessions.map((s) => s.sessionId);
+    };
+    expect(await sidsOf()).toEqual(["sess_closed"]);
+
+    const closed = await fetch(
+      `http://127.0.0.1:${hub.port}/api/instances/holder/sessions/sess_closed/close`,
+      { method: "POST", headers: auth },
+    );
+    expect(closed.status).toBe(200);
+    // Immediate: the listing no longer offers the sid before any heartbeat.
+    expect(await sidsOf()).toEqual([]);
+
+    const auto = await post(hub, {
+      workspacePath: PROJECT,
+      sessionId: "sess_closed",
+      intent: "auto",
+    });
+    expect(auto.status).toBe(409);
+    expect(await auto.text()).toBe("session closed");
+    expect(spawnCalls).toHaveLength(0);
+
+    // A heartbeat already in flight when the close landed still carries the
+    // sid from its pre-close snapshot; it must not clear the fresh stone.
+    expect((await advertise()).ok).toBe(true);
+    const autoAgain = await post(hub, {
+      workspacePath: PROJECT,
+      sessionId: "sess_closed",
+      intent: "auto",
+    });
+    expect(autoAgain.status).toBe(409);
+
+    // User intent (the default — older clients send none) passes the gate
+    // and incubates the resume as before.
+    const user = post(hub, { workspacePath: PROJECT, sessionId: "sess_closed" });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.env.ZCODE_ACP_RESUME_SESSION).toBe("sess_closed");
+    await registerServeBridge(hub, "resume-repl", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await user).status).toBe(200);
+
+    // The stone is gone: an AUTO resume is honest again (the ladder may
+    // re-incubate a session the user reopened on purpose).
+    const afterReopen = post(hub, {
+      workspacePath: PROJECT,
+      sessionId: "sess_closed",
+      intent: "auto",
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(spawnCalls).toHaveLength(2);
+    await registerServeBridge(hub, "resume-repl-2", spawnCalls[1]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await afterReopen).status).toBe(200);
+  });
+
+  it("tombstones EVERY spelling of the closed conversation, not just the URL's", async () => {
+    // The sid-alias hole (review of the close-tombstone feature): the same
+    // conversation is addressable under different spellings — discovery
+    // shows the editor alias, a reconnect ladder may quote the backend
+    // sess_ id. The close answer carries the bridge-resolved spelling set,
+    // and the tombstone, the cached-entry drop, and every clear path operate
+    // on the whole GROUP: autos are refused whichever id they quote, and a
+    // user resume under ONE spelling revives them all.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const bridge = createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end('{"ok":true,"sessionIds":["acp-alias-1","sess_backend_1"]}');
+    });
+    const bridgePort = await new Promise<number>((resolve) => {
+      bridge.listen(0, "127.0.0.1", () => {
+        const addr = bridge.address();
+        resolve(typeof addr === "object" && addr ? addr.port : 0);
+      });
+    });
+    track(bridge, (s) => new Promise<void>((resolve) => s.close(() => resolve())));
+    const advertise = (sessionId: string) =>
+      fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          registerBody({
+            id: "holder",
+            workspace: PROJECT,
+            origin: "serve",
+            port: bridgePort,
+            sessions: [{ sessionId, title: "t", updatedAt: 1 }],
+          }),
+        ),
+      });
+    expect((await advertise("acp-alias-1")).ok).toBe(true);
+    const sidsOf = async () => {
+      const list = (await (await listInstances(hub)).json()) as Array<{
+        id: string;
+        sessions: Array<{ sessionId: string }>;
+      }>;
+      return list.find((e) => e.id === "holder")!.sessions.map((s) => s.sessionId);
+    };
+    expect(await sidsOf()).toEqual(["acp-alias-1"]);
+
+    // Close by the ALIAS spelling (what the listing offered); the bridge's
+    // 200 answer names the backend spelling too.
+    const closed = await fetch(
+      `http://127.0.0.1:${hub.port}/api/instances/holder/sessions/acp-alias-1/close`,
+      { method: "POST", headers: auth },
+    );
+    expect(closed.status).toBe(200);
+    expect(await sidsOf()).toEqual([]);
+
+    // The ladder quoting the OTHER spelling is still refused — the single-
+    // key tombstone used to let exactly this through.
+    expect(
+      (await post(hub, { workspacePath: PROJECT, sessionId: "sess_backend_1", intent: "auto" }))
+        .status,
+    ).toBe(409);
+    expect(
+      (await post(hub, { workspacePath: PROJECT, sessionId: "acp-alias-1", intent: "auto" }))
+        .status,
+    ).toBe(409);
+    expect(spawnCalls).toHaveLength(0);
+
+    // A user resume under the alias revives the whole group: the backend
+    // spelling is honest again for autos too.
+    const user = post(hub, { workspacePath: PROJECT, sessionId: "acp-alias-1" });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    await registerServeBridge(hub, "resume-repl", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await user).status).toBe(200);
+    const auto = post(hub, {
+      workspacePath: PROJECT,
+      sessionId: "sess_backend_1",
+      intent: "auto",
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(spawnCalls).toHaveLength(2);
+    await registerServeBridge(hub, "resume-repl-2", spawnCalls[1]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await auto).status).toBe(200);
+  });
+
   it("carries the resume env into the .command script so the terminal shell boots into the session", () => {
     // terminalTuiScript exports every ZCODE_ACP_* var; the resume id rides
     // the same channel (hub-server adds it to the incubation env). The
@@ -1180,6 +1436,464 @@ describe("hub terminal-TUI session create (session binding + slow-window fallbac
   });
 });
 
+describe("hub Desktop Presence (ADR-0016 amendment)", () => {
+  const PROJECT = "/Users/dev/Develop/demo";
+  const auth = { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" };
+  const post = (
+    hub: HubHandle,
+    body: Record<string, unknown>,
+    headers: Record<string, string> = {},
+  ): Promise<Response> =>
+    fetch(`http://127.0.0.1:${hub.port}/api/instances`, {
+      method: "POST",
+      headers: { ...auth, ...headers },
+      body: JSON.stringify(body),
+    });
+  /** A POST stamped the way every desktop-client hub call is (header identity). */
+  const postDesktop = (hub: HubHandle, body: Record<string, unknown>): Promise<Response> =>
+    post(hub, body, { "x-zcode-client": DESKTOP_CLIENT_NAME });
+
+  let fakeChild: EventEmitter & { pid: number; exitCode: number | null; signalCode: string | null };
+  let spawnCalls: Array<{
+    cwd: string;
+    env: NodeJS.ProcessEnv;
+    kind: "tui" | "serve";
+    launch?: unknown;
+  }>;
+
+  beforeEach(() => {
+    listKnownWorkspacesMock.mockReset();
+    listKnownWorkspacesMock.mockResolvedValue([
+      { workspacePath: PROJECT, sessions: 3, lastActive: 1234 },
+    ]);
+    fakeChild = new EventEmitter() as typeof fakeChild;
+    fakeChild.pid = 4242;
+    fakeChild.exitCode = null;
+    fakeChild.signalCode = null;
+    spawnCalls = [];
+  });
+
+  function spawnServeSpy() {
+    return (opts: {
+      cwd: string;
+      env: NodeJS.ProcessEnv;
+      kind: "tui" | "serve";
+      launch?: unknown;
+    }) => {
+      spawnCalls.push(opts);
+      return fakeChild as unknown as import("node:child_process").ChildProcess;
+    };
+  }
+
+  async function registerServeBridge(hub: HubHandle, id: string, nonce?: string): Promise<void> {
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        registerBody({
+          id,
+          workspace: PROJECT,
+          origin: "serve",
+          port: BASE_PORT + 50,
+          pid: 4242,
+          ...(nonce ? { nonce } : {}),
+        }),
+      ),
+    });
+    expect(res.ok).toBe(true);
+  }
+
+  /** Echo bridge as the attach target — the hub dials it on every WS upgrade. */
+  function startEchoBridge(): Promise<{ server: WebSocketServer; port: number }> {
+    return new Promise((resolve) => {
+      const server = new WebSocketServer({ port: 0, host: "127.0.0.1" }, () => {
+        const addr = server.address();
+        resolve({ server, port: typeof addr === "object" && addr ? addr.port : 0 });
+      });
+      server.on("connection", (ws) => {
+        ws.on("message", (data) => ws.send(data));
+      });
+    });
+  }
+
+  /**
+   * Attach a hub WS client and run its `initialize` — the frame the presence
+   * watcher peeks at. Resolves once the initialize made the full round trip
+   * (the echo bridge returns it), which guarantees the hub has seen it.
+   */
+  async function connectClient(hub: HubHandle, clientInfo?: { name: string }): Promise<WebSocket> {
+    const client = track(
+      new WebSocket(`ws://127.0.0.1:${hub.port}/acp?instance=inst-1&token=${TOKEN}`),
+      (ws) =>
+        new Promise<void>((resolve) => {
+          if (ws.readyState === WebSocket.CLOSED) {
+            resolve();
+            return;
+          }
+          ws.close();
+          ws.once("close", () => resolve());
+        }),
+    );
+    await withTimeout(
+      new Promise<void>((resolve, reject) => {
+        client.once("open", () => resolve());
+        client.once("error", (e) => reject(e));
+      }),
+      3000,
+      "ws open",
+    );
+    const echoed = withTimeout(
+      new Promise<void>((resolve) => client.once("message", () => resolve())),
+      3000,
+      "initialize echo",
+    );
+    client.send(
+      JSON.stringify({
+        jsonrpc: "2.0",
+        id: 1,
+        method: "initialize",
+        params: {
+          protocolVersion: 1,
+          clientCapabilities: {},
+          ...(clientInfo ? { clientInfo } : {}),
+        },
+      }),
+    );
+    await echoed;
+    return client;
+  }
+
+  it("incubates session-create headlessly while a desktop client is connected", async () => {
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const echo = track(
+      await startEchoBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: echo.port })),
+    });
+    await connectClient(hub, { name: DESKTOP_CLIENT_NAME });
+
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    // Desktop Presence: no terminal attempt at all — the FIRST spawn is the
+    // detached headless serve form (the exhausted-preference-list fallback
+    // shape, same as ZCODE_ACP_HUB_TERMINAL=0).
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    expect(spawnCalls[0]!.launch).toBeUndefined();
+    // The create session bind rides the env unchanged: the attaching client
+    // and the headless bridge still share the hub-pre-generated session id.
+    expect(spawnCalls[0]!.env.ZCODE_ACP_BOOT_CREATE_SESSION).toBe("1");
+    expect(spawnCalls[0]!.env.ZCODE_ACP_RESUME_SESSION).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/,
+    );
+    await registerServeBridge(hub, "serve-headless", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "serve-headless", reused: false });
+  });
+
+  it("keeps the visible TUI for clients that are not the desktop app", async () => {
+    // The mobile App sends no clientInfo and other named clients (editors,
+    // martty) are not the desktop workbench — both keep ADR-0016's window.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const echo = track(
+      await startEchoBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: echo.port })),
+    });
+    await connectClient(hub); // no clientInfo — the mobile App
+    await connectClient(hub, { name: "Paseo iOS" });
+
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("tui");
+    await registerServeBridge(hub, "window", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "window", reused: false });
+  });
+
+  it("restores the visible TUI once the desktop client disconnects", async () => {
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const echo = track(
+      await startEchoBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: echo.port })),
+    });
+    const desktop = await connectClient(hub, { name: DESKTOP_CLIENT_NAME });
+
+    // Create under presence: headless.
+    const first = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    await registerServeBridge(hub, "h1", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await first).status).toBe(200);
+
+    // The desktop app goes away — presence ends with the connection.
+    await new Promise<void>((resolve) => {
+      desktop.close();
+      desktop.once("close", () => resolve());
+    });
+    await new Promise((r) => setTimeout(r, 100)); // hub-side teardown
+
+    const second = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(2);
+    expect(spawnCalls[1]!.kind).toBe("tui");
+    await registerServeBridge(hub, "w2", spawnCalls[1]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await second).status).toBe(200);
+  });
+
+  it("resume incubates headless while a desktop client is connected (ADR-0010)", async () => {
+    // ADR-0010's Desktop Presence gates every NEW incubation — a resume of a
+    // closed session included: the desktop app loads the session itself
+    // after attach, so a terminal window would re-render the stream for
+    // nobody. Mobile-originated resumes keep the ADR-0017 window (next test).
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const echo = track(
+      await startEchoBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: echo.port })),
+    });
+    await connectClient(hub, { name: DESKTOP_CLIENT_NAME });
+
+    const pending = post(hub, { workspacePath: PROJECT, sessionId: "sess_closed" });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    expect(spawnCalls[0]!.launch).toBeUndefined();
+    // The resume id still rides the env (a serve bridge ignores it; the
+    // attaching desktop's session/load is what resumes the conversation).
+    expect(spawnCalls[0]!.env.ZCODE_ACP_RESUME_SESSION).toBe("sess_closed");
+    await registerServeBridge(hub, "resume-headless", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "resume-headless", reused: false });
+  });
+
+  it("a resume without any desktop signal keeps its visible TUI (ADR-0017)", async () => {
+    // No desktop connection, no desktop header — the mobile resume's window
+    // is ADR-0017's own surface and stays.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const echo = track(
+      await startEchoBridge(),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port: echo.port })),
+    });
+    await connectClient(hub); // the mobile App — no clientInfo
+
+    const pending = post(hub, { workspacePath: PROJECT, sessionId: "sess_closed" });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("tui");
+    expect(spawnCalls[0]!.env.ZCODE_ACP_RESUME_SESSION).toBe("sess_closed");
+    await registerServeBridge(hub, "resume-tui", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "resume-tui", reused: false });
+  });
+
+  it("the request identity header alone incubates create headless (cold hub)", async () => {
+    // The cold-start gap: a fresh hub has instances 0 — nothing to proxy, so
+    // connection presence cannot exist yet and the FIRST create used to open
+    // a terminal. The desktop client stamps every hub HTTP call with its
+    // clientInfo name; the request itself is presence.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const pending = postDesktop(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    expect(spawnCalls[0]!.launch).toBeUndefined();
+    // The create-session bind env rides along unchanged (a serve bridge
+    // ignores it; the attaching client's session/new is what mints the id).
+    expect(spawnCalls[0]!.env.ZCODE_ACP_BOOT_CREATE_SESSION).toBe("1");
+    await registerServeBridge(hub, "cold-headless", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "cold-headless", reused: false });
+  });
+
+  it("the request identity header makes a cold resume headless too", async () => {
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const pending = postDesktop(hub, { workspacePath: PROJECT, sessionId: "sess_closed" });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    expect(spawnCalls[0]!.env.ZCODE_ACP_RESUME_SESSION).toBe("sess_closed");
+    await registerServeBridge(hub, "cold-resume", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "cold-resume", reused: false });
+  });
+
+  /** The desktop app's discovery poll: GET /api/instances stamped with its identity. */
+  const desktopPoll = (hub: HubHandle, token = TOKEN): Promise<Response> =>
+    fetch(`http://127.0.0.1:${hub.port}/api/instances`, {
+      headers: { Authorization: `Bearer ${token}`, "x-zcode-client": DESKTOP_CLIENT_NAME },
+    });
+
+  it("a recent desktop poll keeps a phone create headless with no desktop connection at all", async () => {
+    // The idle-desktop gap: a serve bridge self-exits with its last session
+    // and connection presence ends with that proxied pair — but the running
+    // app still polls every 15s with its identity header. A create from the
+    // phone inside the TTL must not open a window next to the app.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    expect((await desktopPoll(hub)).status).toBe(200);
+
+    const pending = post(hub, { workspacePath: PROJECT }); // the phone: no header, no pair
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("serve");
+    expect(spawnCalls[0]!.launch).toBeUndefined();
+    await registerServeBridge(hub, "recent-headless", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "recent-headless", reused: false });
+  });
+
+  it("recent-request presence lapses after the TTL (the app quit)", async () => {
+    const hub = await startTestHub({ spawnServe: spawnServeSpy(), desktopPresenceTtlMs: 150 });
+    expect((await desktopPoll(hub)).status).toBe(200);
+    await new Promise((r) => setTimeout(r, 300)); // past the TTL — no poll came
+
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("tui");
+    await registerServeBridge(hub, "w-lapsed", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await pending).status).toBe(200);
+  });
+
+  it("an unauthorized stamped call is not presence", async () => {
+    // The header is a UX hint, the token is the boundary: a bare header on
+    // the network must not be able to suppress the user's windows.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    expect((await desktopPoll(hub, "wrong-token")).status).toBe(401);
+
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("tui");
+    await registerServeBridge(hub, "w-unauth", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await pending).status).toBe(200);
+  });
+
+  it("under presence a create reuses the workspace's live serve bridge instead of spawning", async () => {
+    // No window is coming, so one bridge (one backend process) per project
+    // hosts every session — the pre-ADR-0016 reuse, right again here. The
+    // client attaches with noAttach and session/new-s there.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    await registerServeBridge(hub, "live-serve");
+    const res = await postDesktop(hub, { workspacePath: PROJECT });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "live-serve", reused: true });
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("under presence a phone resume reuses the live serve bridge too (no window, no spawn)", async () => {
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    await registerServeBridge(hub, "live-serve");
+    expect((await desktopPoll(hub)).status).toBe(200); // the idle desktop app
+    const res = await post(hub, { workspacePath: PROJECT, sessionId: "sess_closed" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "live-serve", reused: true });
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("under presence a resume lands on the bridge already holding the session live", async () => {
+    // Two bridges must never load one conversation: the holder wins over the
+    // workspace's (older) serve bridge, whatever the holder's origin.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    await registerServeBridge(hub, "serve-older");
+    const holder = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        registerBody({
+          id: "editor-holder",
+          workspace: PROJECT,
+          port: BASE_PORT + 60,
+          pid: 4343,
+          sessions: [{ sessionId: "sess_live", title: "live", updatedAt: 5 }],
+        }),
+      ),
+    });
+    expect(holder.ok).toBe(true);
+    const res = await postDesktop(hub, { workspacePath: PROJECT, sessionId: "sess_live" });
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "editor-holder", reused: true });
+    expect(spawnCalls).toHaveLength(0);
+  });
+
+  it("without any desktop signal a live serve bridge never pre-empts the window", async () => {
+    // The ADR-0016 contract, untouched: the phone alone still gets its TUI
+    // even though the listing's headless bridge is live.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    await registerServeBridge(hub, "listing-serve");
+    const pending = post(hub, { workspacePath: PROJECT });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    expect(spawnCalls[0]!.kind).toBe("tui");
+    await registerServeBridge(hub, "window", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "window", reused: false });
+  });
+
+  it("initializeClientName reads the identity off the wire frame", () => {
+    const frame = (params: Record<string, unknown>) =>
+      Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize", params }));
+    expect(initializeClientName(frame({ clientInfo: { name: DESKTOP_CLIENT_NAME } }))).toBe(
+      DESKTOP_CLIENT_NAME,
+    );
+    // ACP v2 single-entry batch.
+    expect(
+      initializeClientName(
+        Buffer.from(
+          `[${JSON.stringify({
+            jsonrpc: "2.0",
+            id: 1,
+            method: "initialize",
+            params: { clientInfo: { name: "Zed" } },
+          })}]`,
+        ),
+      ),
+    ).toBe("Zed");
+    // No clientInfo (the mobile App) reads as "" — initialize seen, unnamed.
+    expect(initializeClientName(frame({}))).toBe("");
+    // A decodable non-initialize frame: no identity is coming.
+    expect(
+      initializeClientName(
+        Buffer.from(JSON.stringify({ jsonrpc: "2.0", id: 2, method: "session/prompt" })),
+      ),
+    ).toBeNull();
+    // Undecodable frames keep the watcher waiting.
+    expect(initializeClientName(Buffer.from("not json"))).toBeUndefined();
+  });
+});
+
 describe("tab title sanitization", () => {
   it("strips control chars (no OSC/CSI injection), collapses whitespace, caps length", () => {
     // An ESC in a model-generated summary would otherwise inject terminal
@@ -1268,8 +1982,12 @@ describe("terminal launch resolution (ADR-0016)", () => {
     });
   });
 
-  it("ghostty rides AppleScript: new tab in the front window, prompt-free command", () => {
-    const src = ghosttyTabAppleScript("Ghostty", '/ws/.zcode/tmp/tui-ab12"cd.command');
+  it("ghostty rides AppleScript: new tab in the front window, auto-closing typed input", () => {
+    const src = ghosttyTabAppleScript(
+      "Ghostty",
+      '/ws/.zcode/tmp/tui-ab12"cd.command',
+      "/Users/me/proj",
+    );
     expect(src).toContain('tell application "Ghostty"');
     // activate is best-effort (try): on a LOCKED screen it fails with a
     // permission violation and would otherwise abort the whole tell block.
@@ -1277,10 +1995,19 @@ describe("terminal launch resolution (ADR-0016)", () => {
     // No windows → a fresh one; otherwise reuse the front window (no -n spawn).
     expect(src).toContain("if (count of windows) = 0 then");
     expect(src).toContain("set tgt to front window");
-    // The script runs via a surface configuration command — never `-e`, which
-    // trips Ghostty's per-launch "Allow Ghostty to Execute" gate.
+    // The tab's shell starts IN the project — the in-script `cd` only moves
+    // the child `sh`, never the terminal itself (prompt, OSC 7, inherited cwd).
+    expect(src).toContain('set initial working directory of cfg to "/Users/me/proj"');
+    // The script is TYPED into the default shell via surface configuration
+    // initial input — never `-e` (per-launch "Allow Ghostty to Execute" gate)
+    // and never `command` (force-enables wait-after-command one-way, so the
+    // tab would sit on "Press any key to close" and windows would pile up).
     expect(src).not.toContain("-e ");
-    expect(src).toContain('set command of cfg to "/bin/sh " &');
+    expect(src).not.toContain("set command of cfg");
+    expect(src).toContain('set initial input of cfg to "/bin/sh ');
+    // `; exit` + linefeed: the shell quits with the CLI tree, and the surface
+    // then closes itself (Ghostty's own open-a-script pattern).
+    expect(src).toContain("'; exit\" & linefeed");
     // AppleScript string escaping: backslash and double-quote survive.
     expect(src).toContain('\\"cd.command');
   });
@@ -1300,5 +2027,159 @@ describe("terminal TUI script (ADR-0016)", () => {
     expect(body).toContain("export ZCODE_ACP_REMOTE_ORIGIN='serve'");
     expect(body).toContain("exec '");
     expect(body).not.toContain("PATH=");
+  });
+});
+
+describe("remote projectRoots widening + GET /api/fs/list (browse-and-create)", () => {
+  const auth = { Authorization: `Bearer ${TOKEN}` };
+  // Real temp dirs; the hub's startable-dir gate only requires an existing
+  // directory (the temp-tree exclusions guard the AUTO-discovered known
+  // list, not explicitly configured roots), so tmpdir works fine here.
+  // Assertions compare against realpathSync spellings: /api/fs/list answers
+  // with the RESOLVED path (/var → /private/var on macOS).
+  let roots: string;
+  let outside: string;
+  const savedEnv: Record<string, string | undefined> = {};
+
+  beforeEach(async () => {
+    roots = await mkdtemp(path.join(tmpdir(), "zacp-hub-roots-"));
+    outside = await mkdtemp(path.join(tmpdir(), "zacp-hub-outside-"));
+    savedEnv.ZCODE_ACP_PROJECT_ROOTS = process.env.ZCODE_ACP_PROJECT_ROOTS;
+    // The hermetic HOME has no config.json → the env var decides.
+    process.env.ZCODE_ACP_PROJECT_ROOTS = roots;
+    listKnownWorkspacesMock.mockReset();
+    listKnownWorkspacesMock.mockResolvedValue([]);
+  });
+
+  afterEach(async () => {
+    if (savedEnv.ZCODE_ACP_PROJECT_ROOTS === undefined) delete process.env.ZCODE_ACP_PROJECT_ROOTS;
+    else process.env.ZCODE_ACP_PROJECT_ROOTS = savedEnv.ZCODE_ACP_PROJECT_ROOTS;
+    await Promise.all([roots, outside].map((d) => rm(d, { recursive: true, force: true })));
+  });
+
+  it("POST /api/instances accepts a NEW subdirectory under a configured root", async () => {
+    const target = path.join(roots, "fresh-project");
+    await mkdir(target);
+    const fakeChild = new EventEmitter() as EventEmitter & {
+      pid: number;
+      exitCode: number | null;
+      signalCode: string | null;
+    };
+    fakeChild.pid = 4242;
+    fakeChild.exitCode = null;
+    fakeChild.signalCode = null;
+    const spawns: Array<{ cwd: string; kind: string; env: NodeJS.ProcessEnv }> = [];
+    const hub = await startTestHub({
+      spawnServe: (opts) => {
+        spawns.push(opts as { cwd: string; kind: string; env: NodeJS.ProcessEnv });
+        return fakeChild as unknown as import("node:child_process").ChildProcess;
+      },
+    });
+    const pending = fetch(`http://127.0.0.1:${hub.port}/api/instances`, {
+      method: "POST",
+      headers: { ...auth, "Content-Type": "application/json" },
+      body: JSON.stringify({ workspacePath: target }),
+    });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawns).toHaveLength(1);
+    expect(spawns[0]!.cwd).toBe(target);
+    expect(spawns[0]!.kind).toBe("tui");
+    const reg = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(
+        registerBody({
+          id: "serve-window",
+          workspace: target,
+          origin: "serve",
+          nonce: spawns[0]!.env.ZCODE_ACP_SPAWN_NONCE,
+        }),
+      ),
+    });
+    expect(reg.ok).toBe(true);
+    const res = await pending;
+    expect(res.status).toBe(200);
+    expect(await res.json()).toEqual({ id: "serve-window", reused: false });
+  });
+
+  it("POST still refuses existing dirs outside every root and vanished paths under one", async () => {
+    let spawnCount = 0;
+    const hub = await startTestHub({
+      spawnServe: () => {
+        spawnCount++;
+        return null;
+      },
+    });
+    const url = `http://127.0.0.1:${hub.port}/api/instances`;
+    for (const workspacePath of [outside, path.join(roots, "never-created")]) {
+      const res = await fetch(url, {
+        method: "POST",
+        headers: { ...auth, "Content-Type": "application/json" },
+        body: JSON.stringify({ workspacePath }),
+      });
+      expect(res.status).toBe(403);
+      expect(await res.text()).toBe("unknown project");
+    }
+    expect(spawnCount).toBe(0);
+  });
+
+  it("GET /api/fs/list requires auth and lists home by default", async () => {
+    const hub = await startTestHub();
+    expect((await fetch(`http://127.0.0.1:${hub.port}/api/fs/list`)).status).toBe(401);
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/fs/list`, { headers: auth });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { path: string };
+    expect(body.path).toBe(realpathSync(homedir()));
+  });
+
+  it("GET /api/fs/list rejects relative and missing paths", async () => {
+    const hub = await startTestHub();
+    const rel = await fetch(`http://127.0.0.1:${hub.port}/api/fs/list?path=relative`, {
+      headers: auth,
+    });
+    expect(rel.status).toBe(400);
+    expect(await rel.text()).toBe("absolute path required");
+    const gone = await fetch(
+      `http://127.0.0.1:${hub.port}/api/fs/list?path=${path.join(roots, "nope")}`,
+      { headers: auth },
+    );
+    expect(gone.status).toBe(404);
+  });
+
+  it("GET /api/fs/list lists only subdirectories, flags creatable under a root", async () => {
+    await mkdir(path.join(roots, "b-proj"));
+    await mkdir(path.join(roots, "a-proj"));
+    await writeFile(path.join(roots, "file.txt"), "not a directory");
+    const hub = await startTestHub();
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/fs/list?path=${roots}`, {
+      headers: auth,
+    });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      path: string;
+      parent: string;
+      creatable: boolean;
+      entries: Array<{ name: string }>;
+      truncated: boolean;
+    };
+    const realRoots = realpathSync(roots);
+    expect(body.path).toBe(realRoots);
+    expect(body.parent).toBe(path.dirname(realRoots));
+    expect(body.creatable).toBe(true); // the root itself is under a root
+    expect(body.entries).toEqual([{ name: "a-proj" }, { name: "b-proj" }]);
+    expect(body.truncated).toBe(false);
+    // Outside every root and unknown → listed fine (browse is unscoped) but
+    // NOT creatable; becoming a known project flips it without any root.
+    const outsideRes = await fetch(`http://127.0.0.1:${hub.port}/api/fs/list?path=${outside}`, {
+      headers: auth,
+    });
+    expect(((await outsideRes.json()) as { creatable: boolean }).creatable).toBe(false);
+    listKnownWorkspacesMock.mockResolvedValue([
+      { workspacePath: outside, sessions: 1, lastActive: 1 },
+    ]);
+    const knownRes = await fetch(`http://127.0.0.1:${hub.port}/api/fs/list?path=${outside}`, {
+      headers: auth,
+    });
+    expect(((await knownRes.json()) as { creatable: boolean }).creatable).toBe(true);
   });
 });

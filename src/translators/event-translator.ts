@@ -213,7 +213,7 @@ export class EventTranslator {
         this.turnResultType = (payload["resultType"] as string) ?? "success";
         this.turnUsage = (payload["usage"] as Record<string, unknown>) ?? null;
         this.turnCacheStats = parseCacheStats(payload["cacheStats"]);
-        results.push(...this.translateTurnDone(payload));
+        results.push(...this.translateTurnDone());
         log(`  [event] turn.completed (resultType=${this.turnResultType})`);
       } else {
         this.turnDone = true;
@@ -235,6 +235,19 @@ export class EventTranslator {
       const size = (payload["contextWindow"] as number) ?? 0;
       if (typeof used === "number") {
         results.push({ kind: "UsageDelta", used, size });
+      }
+      // SessionModeChanged rides the generic session.updated with its RAW
+      // payload (the v3 mapper has no dedicated wire type). Discriminator:
+      // both `mode` and `planEnabled` present (background-task payloads carry
+      // taskId instead). `mode` is the UNDERLYING session mode — the runtime's
+      // plan tools flip only `planEnabled` — so fold the effective display
+      // mode here and let the dispatcher track the flag for the read paths.
+      if (typeof payload["mode"] === "string" && typeof payload["planEnabled"] === "boolean") {
+        results.push({
+          kind: "ConfigChanged",
+          mode: payload["planEnabled"] ? "plan" : (payload["mode"] as string),
+          planEnabled: payload["planEnabled"] === true,
+        });
       }
     } else if (etype === "state.updated") {
       // Session settings changed (model/mode/thoughtLevel switch, incl.
@@ -448,18 +461,19 @@ export class EventTranslator {
     return newEv;
   }
 
-  private translateTurnDone(payload: Record<string, unknown>): InternalEvent[] {
-    const usage = (payload["usage"] as Record<string, unknown>) ?? {};
-    // Use || (not ??) to match Python's `or` semantics: a falsy totalTokens
-    // (0 / undefined) falls back to tokenCount, then to 0. With ?? a 0 would
-    // be kept as-is and never fall back, diverging from the Python reference.
-    const used = (usage["totalTokens"] as number) || (payload["tokenCount"] as number) || 0;
-    const size = (usage["contextWindow"] as number) || 0;
-    // Terminal info line: resultType verbatim (success / cancelled /
-    // error_*) plus the prompt-cache stats when the backend sent them.
+  private translateTurnDone(): InternalEvent[] {
+    // Terminal info line ONLY — no UsageDelta. turn.completed's usage block
+    // is the turn's CUMULATIVE consumption (billing-grade, summed across
+    // every model request of the turn); reporting it as the context meter
+    // made a multi-request turn read >100% of the window (#228). The
+    // authoritative occupancy (projection.contextUsed) reaches clients via
+    // the turn-completion reconciliation diff and the mid-turn watermark
+    // forwarder, both of which read session/read's projection; the per-turn
+    // consumption itself still surfaces through PromptResponse.usage
+    // (turnResult ← this.turnUsage) — a different, per-turn field.
     const info: InternalEvent = { kind: "TurnInfo", resultType: this.turnResultType ?? "success" };
     if (this.turnCacheStats) info.cacheStats = this.turnCacheStats;
-    return [{ kind: "UsageDelta", used, size }, info];
+    return [info];
   }
 }
 

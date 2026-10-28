@@ -27,10 +27,13 @@ import {
   SandboxRestartBatcher,
   SANDBOX_ASK_RETRY_MS,
   SANDBOX_RESTART_BATCH_MS,
+  UNATTENDED_PIN,
+  waitForSandboxBatchFlush,
 } from "../src/handlers/sandbox-allow.js";
 import {
   readSandboxConfig,
   resetSandboxDecisionForTest,
+  resolveReal,
   sandboxConfigPath,
 } from "../src/backend/sandbox.js";
 import type { PendingTurn, ZcodeAcpServer } from "../src/server.js";
@@ -180,6 +183,11 @@ function makeStubs(decisionOptionId: string) {
     sandboxRoots() {
       return new Set(this.sessionCwds.values());
     },
+    // One "connected" client so a failed ask rejects (null) instead of
+    // holding for reconnect; no sid mapping and no goal loops — attended.
+    clients: { size: 1 },
+    resolveSid: () => undefined,
+    goalLoops: new Map(),
     cancelAllPendingTurns: vi.fn(),
     sandboxOnceAllows: new Set<string>(),
     sandboxAskedPaths: new Map<string, Map<string, number>>(),
@@ -535,7 +543,131 @@ describe("handleSandboxDenial", () => {
     expect(request).toHaveBeenCalledTimes(1);
   });
 
-  it("a failed ask keeps the sandbox unchanged; the path re-asks after a cooldown", async () => {
+  it("freezes the turn before the ask; a rejection settles it into a continuation", async () => {
+    const { server, cx, request } = makeStubs("sandbox_reject_once");
+    server.sessionCwds.set("acp_a", wsRoot);
+    const turn: PendingTurn = { zcodeSid: "sess_z", cancelled: false };
+    const freeze = vi.fn().mockResolvedValue(undefined);
+
+    await handleSandboxDenial(
+      server,
+      cx,
+      "acp_a",
+      { path: path.join(wsRoot, "..", "outside", "f.txt"), isMkdir: false },
+      "tc_frz",
+      turn,
+      freeze,
+    );
+
+    // The generation was frozen for the ask, and the frozen turn unwinds
+    // cancelled with the denial context queued for prompt()'s chained round —
+    // the model must not free-run past the EPERM it caused.
+    expect(freeze).toHaveBeenCalledTimes(1);
+    expect(request).toHaveBeenCalledTimes(1);
+    expect(turn.cancelled).toBe(true);
+    const cont = server.sandboxContinuations.get("acp_a");
+    expect(typeof cont).toBe("string");
+    expect(cont).toContain("拒绝");
+  });
+
+  it("structural early-returns (island paths) never freeze the turn", async () => {
+    const { server, cx, request } = makeStubs("sandbox_allow_always");
+    server.sessionCwds.set("acp_a", wsRoot);
+    const freeze = vi.fn().mockResolvedValue(undefined);
+
+    await handleSandboxDenial(
+      server,
+      cx,
+      "acp_a",
+      { path: path.join(wsRoot, ".zcode", "acp", "sandbox.json"), isMkdir: false },
+      "tc_island",
+      { zcodeSid: "sess_z", cancelled: false },
+      freeze,
+    );
+
+    expect(freeze).not.toHaveBeenCalled();
+    expect(request).not.toHaveBeenCalled();
+  });
+
+  it("unattended timeout pins the path, settles the round for re-dispatch", async () => {
+    const { server, cx, request } = makeStubs("sandbox_allow_once");
+    server.sessionCwds.set("acp_a", wsRoot);
+    // Live goal loop behind the sid mapping → unattended context.
+    (server as unknown as { resolveSid: () => string }).resolveSid = () => "sess_z";
+    (server as unknown as { goalLoops: Map<string, unknown> }).goalLoops = new Map([
+      ["sess_z", {}],
+    ]);
+    // The ask never resolves — only the unattended timeout can end it.
+    request.mockReturnValue(new Promise(() => {}));
+    const turn: PendingTurn = { zcodeSid: "sess_z", cancelled: false, goalLoop: true };
+    const freeze = vi.fn().mockResolvedValue(undefined);
+
+    const wait = handleSandboxDenial(
+      server,
+      cx,
+      "acp_a",
+      { path: path.join(wsRoot, "..", "outside", "f.txt"), isMkdir: false },
+      "tc_unatt",
+      turn,
+      freeze,
+    );
+    await vi.advanceTimersByTimeAsync(60_000); // default unattended timeout
+    await wait;
+
+    expect(freeze).toHaveBeenCalledTimes(1);
+    expect(turn.cancelled).toBe(true);
+    expect(turn.sandboxRestart).toBe(true); // driver re-dispatches, no pause
+    expect(server.sandboxContinuations.size).toBe(0); // goal rounds take no continuation
+    const marks = server.sandboxAskedPaths.get("acp_a")!;
+    const pinned = resolveReal(path.dirname(path.join(wsRoot, "..", "outside", "f.txt")));
+    expect(marks.get(pinned)).toBe(UNATTENDED_PIN);
+
+    // Pinned for the REST of the context: a repeat denial does not re-ask…
+    await handleSandboxDenial(
+      server,
+      cx,
+      "acp_a",
+      { path: path.join(wsRoot, "..", "outside", "g.txt"), isMkdir: false },
+      "tc_unatt2",
+      { zcodeSid: "sess_z", cancelled: false, goalLoop: true },
+    );
+    expect(request).toHaveBeenCalledTimes(1);
+    // …and the pin expires with the context (loop gone → asks afresh).
+    (server as unknown as { goalLoops: Map<string, unknown> }).goalLoops = new Map();
+    // Back to attended: the ask must answer (no timeout racer) — restore the
+    // resolving mock so the third ask settles instead of hanging forever.
+    request.mockResolvedValue({ outcome: { optionId: "sandbox_allow_once" } });
+    await handleSandboxDenial(
+      server,
+      cx,
+      "acp_a",
+      { path: path.join(wsRoot, "..", "outside", "h.txt"), isMkdir: false },
+      "tc_unatt3",
+    );
+    expect(request).toHaveBeenCalledTimes(2);
+  });
+
+  it("waitForSandboxBatchFlush blocks until the window flushes", async () => {
+    let flushed = 0;
+    const batcher = new SandboxRestartBatcher(() => {
+      flushed++;
+    });
+    batcher.add("acp_a", "/opt/data");
+    expect(batcher.pendingFor("acp_a")).toBe(true);
+    expect(batcher.pendingFor("acp_b")).toBe(false);
+
+    const wait = waitForSandboxBatchFlush(
+      { sandboxRestartBatcher: batcher } as unknown as ZcodeAcpServer,
+      "acp_a",
+    );
+    await vi.advanceTimersByTimeAsync(SANDBOX_RESTART_BATCH_MS + 200);
+    await wait;
+
+    expect(flushed).toBe(1);
+    expect(batcher.pendingFor("acp_a")).toBe(false);
+  });
+
+  it("a failed ask settles the frozen turn (undelivered) and re-asks after a cooldown", async () => {
     const closed = vi.fn().mockResolvedValue(undefined);
     const batchFlush = vi.fn();
     const server = {
@@ -545,6 +677,11 @@ describe("handleSandboxDenial", () => {
       sandboxRoots() {
         return new Set(this.sessionCwds.values());
       },
+      // One "connected" client so the failed ask rejects (null) instead of
+      // holding for reconnect; attended (no sid mapping, no goal loops).
+      clients: { size: 1 },
+      resolveSid: () => undefined,
+      goalLoops: new Map(),
       cancelAllPendingTurns: vi.fn(),
       sandboxOnceAllows: new Set<string>(),
       sandboxAskedPaths: new Map<string, Map<string, number>>(),
@@ -557,26 +694,35 @@ describe("handleSandboxDenial", () => {
       notify: vi.fn().mockResolvedValue(undefined),
     } as unknown as acp.AgentContext;
     const turn: PendingTurn = { zcodeSid: "sess_z", cancelled: false };
+    const freeze = vi.fn();
 
     const denial = { path: "/opt/data/file.txt", isMkdir: false } as const;
-    await handleSandboxDenial(server, cx, "acp_a", denial, "tc_1");
+    await handleSandboxDenial(server, cx, "acp_a", denial, "tc_1", turn, freeze);
 
-    expect(turn.cancelled).toBe(false);
+    // The generation was frozen for this ask; an ask that dies undelivered
+    // (clients around, every attempt failed) must still settle the turn —
+    // nothing will re-trigger the EPERM, so without a continuation the round
+    // would strand on the stop's half reply.
+    expect(freeze).toHaveBeenCalledTimes(1);
+    expect(turn.cancelled).toBe(true);
+    expect(server.sandboxContinuations.get("acp_a")).toContain("/opt/data");
     expect(closed).not.toHaveBeenCalled();
-    // The mark is a FINITE timestamp (a cooldown), not Infinity: the ask died
-    // of the environment (timeout, dead channel, or another grant's batched
-    // restart killing it), never a user decision — a permanent mute would
-    // leave the model hitting a bare EPERM with no way out.
+    // The mark is a FINITE timestamp (a cooldown), not Infinity and not the
+    // unattended pin: the ask died of the environment (client error / dead
+    // channel), never a user decision and never an unattended timeout — a
+    // permanent mute would leave the model hitting a bare EPERM with no way
+    // out.
     const mark = server.sandboxAskedPaths.get("acp_a")?.get("/opt/data");
     expect(mark).toBeDefined();
     expect(mark).not.toBe(Number.POSITIVE_INFINITY);
+    expect(mark).not.toBe(UNATTENDED_PIN);
 
     // Inside the cooldown an instantly-rejecting client is NOT re-asked (no
     // popup storm); after it, the same denial may ask again.
-    await handleSandboxDenial(server, cx, "acp_a", denial, "tc_2");
+    await handleSandboxDenial(server, cx, "acp_a", denial, "tc_2", turn, freeze);
     expect(request).toHaveBeenCalledTimes(1);
     vi.advanceTimersByTime(SANDBOX_ASK_RETRY_MS + 1);
-    await handleSandboxDenial(server, cx, "acp_a", denial, "tc_3");
+    await handleSandboxDenial(server, cx, "acp_a", denial, "tc_3", turn, freeze);
     expect(request).toHaveBeenCalledTimes(2);
   });
 

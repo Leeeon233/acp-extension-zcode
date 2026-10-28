@@ -37,6 +37,16 @@ export interface ReplayMeta {
   totalMessages: number;
   totalTurns: number;
   /**
+   * Id of the newest message at or below this slice's end anchor — for a
+   * tail/metadata-only attach that is history's newest message. Clients use
+   * it as the "did anything happen while we were gone" reconcile key: a
+   * watched-live turn moves the tail id but leaves a client's cached count
+   * stale (counts only refresh on replay), so comparing counts alone forces a
+   * redundant full replay on every re-entry. Null when the store is empty or
+   * the tail message carries no id.
+   */
+  lastMessageId: string | null;
+  /**
    * True when a turn for this session is still in flight on the bridge.
    * Re-attaching clients (mobile reconnect, second editor) restore their
    * "running" UI from this; they did not send the prompt, so only this flag
@@ -132,6 +142,7 @@ function buildSlice(
       replayedTurns: turnsInRange(starts, start, end),
       totalMessages: messages.length,
       totalTurns,
+      lastMessageId: messages[end - 1]?.info?.id ?? null,
     },
   };
 }
@@ -205,6 +216,19 @@ export function readTailLimit(params: acp.LoadSessionRequest): number | null {
   const raw = zcode?.limit;
   if (typeof raw !== "number" || !Number.isFinite(raw)) return null;
   return clampLimit(raw);
+}
+
+/**
+ * Read the load intent from `session/load`'s `_meta.zcode.intent`:
+ * "auto" marks a CLIENT-AUTOMATIC replay (a reconnect ladder re-attaching its
+ * own tab after it missed the remote-close broadcast); "user" — the default
+ * when the field is absent or misspelled, so old clients need no change — is
+ * a human picking the session. An auto load of a remotely closed conversation
+ * must not resurrect it (see loadSession's retirement gate).
+ */
+export function readLoadIntent(params: acp.LoadSessionRequest): "auto" | "user" {
+  const zcode = (params._meta as { zcode?: { intent?: unknown } } | undefined)?.zcode;
+  return zcode?.intent === "auto" ? "auto" : "user";
 }
 
 /**
@@ -301,7 +325,7 @@ export async function fetchMessages(
   zcodeSid: string,
   opts: FetchMessagesOptions = {},
 ): Promise<ZcodeMessage[]> {
-  const backend = server.ensureBackend();
+  const backend = await server.ensureBackend();
   const timeoutMs = opts.timeoutMs ?? 45_000;
   const params: { sessionId: string; afterMessageId?: string; limit?: number } = {
     sessionId: zcodeSid,
@@ -524,6 +548,11 @@ export async function replayMessages(
     const info = m.info ?? {};
     const role = info.role;
     const mid = info.id ?? `hist_${randomUUID().slice(0, 12)}`;
+    // Only a message that also emits a text chunk under `mid` should key its
+    // tool cards to that id (see the tool branch below).
+    const carriesText = (m.parts ?? []).some(
+      (p) => p?.type === "text" && Boolean((p as { text?: string }).text),
+    );
     for (const p of m.parts ?? []) {
       if (!p || typeof p !== "object") continue;
       const ptype = (p as { type?: string }).type;
@@ -618,6 +647,19 @@ export async function replayMessages(
             status: (st.status as acp.ToolCallStatus) ?? "completed",
             ...(content.length > 0 ? { content } : {}),
             ...(histToolName ? { _meta: { claudeCode: { toolName: histToolName } } } : {}),
+            // Key the card to its history message ONLY when that message also
+            // carries text: clients then group the card with the text they
+            // build under the same id. A prose-less tool-only step message
+            // (the common shape — the backend stores one tool part per
+            // message) must stay id-less: stamping `mid` makes clients mint one
+            // bare card message per backend message, un-merging a run of
+            // adjacent calls into one-by-one cards, while the same calls live
+            // (no messageId on live tool_calls) coalesce into one run card.
+            // Id-less replayed cards ride that live fallback — appended to a
+            // trailing run of cards — so replay matches the live rendering.
+            // The SDK's ToolCall type predates the field (upstream ACP added
+            // messageId to tool_call); the spread keeps the literal checked.
+            ...(carriesText ? ({ messageId: mid } as { messageId: string }) : {}),
           }),
         });
       }

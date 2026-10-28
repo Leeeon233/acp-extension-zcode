@@ -14,8 +14,9 @@
  *
  * Arming is dual-switch (see sandboxActive): ZCODE_ACP_SANDBOX=1 forces it
  * globally, or a workspace opts in via `enabled: true` in its own
- * .zcode/acp/sandbox.json — the template is auto-created with enabled:false,
- * so opting in is always an explicit user edit.
+ * .zcode/acp/sandbox.json — the template is auto-created with enabled:false
+ * only while the sandbox is globally armed (an unarmed bridge leaves the
+ * workspace untouched), so opting in is always an explicit user edit.
  *
  * Whitelist (frozen at spawn, rebuilt on backend restart):
  * - workspace roots of all live sessions (union of server.sessionCwds)
@@ -143,10 +144,13 @@ function configIntegrityOk(workspaceRoot: string, file: string): boolean {
 }
 
 /**
- * Read the project sandbox config, auto-creating the template (enabled:
- * false) on first touch so the user finds the file and can flip the switch —
- * the PRESENCE of the file is never the switch, only `enabled` is, so the
- * auto-create cannot arm anything by itself. A malformed or non-object file
+ * Read the project sandbox config. While the sandbox is globally armed, a
+ * missing config is auto-created as the discovery template (enabled: false)
+ * so the user finds the file and can flip the switch — the PRESENCE of the
+ * file is never the switch, only `enabled` is, so the auto-create cannot arm
+ * anything by itself. An unarmed bridge writes NOTHING: headless per-task
+ * runs must not leave an untracked .zcode/ in every workspace they touch
+ * (#332). A malformed or non-object file
  * falls back to enabled:true WITHOUT rewriting it: corruption must fail
  * CLOSED (the user opted in; losing that to a half-saved file would silently
  * disarm), and clobbering the user's mid-edit bytes with a template would be
@@ -175,9 +179,15 @@ export function readSandboxConfig(workspaceRoot: string): SandboxConfig {
     // Everything else — EACCES/ENOTDIR (agent tampered with `.zcode`), or a
     // miss on a config this bridge already read as armed — fails closed.
     if (code === "ENOENT" && lastEnabledSeen.get(file) !== true) {
-      // Write the discovery template (best-effort; a read-only workspace
-      // just never gets one — the sandbox can still be env-armed).
-      if (!templateFailedRoots.has(workspaceRoot)) {
+      // The discovery template is written ONLY while the sandbox is globally
+      // armed (user config sandbox.enabled or ZCODE_ACP_SANDBOX=1): a
+      // headless client that starts a bridge per task must not litter every
+      // workspace with an untracked .zcode/ the user never opted into
+      // (#332). The project switch cannot be on while the file is missing,
+      // so the global arm is the only one that can license the write.
+      // Best-effort either way; a read-only workspace just never gets one —
+      // the sandbox can still be env-armed.
+      if (globalWanted() && !templateFailedRoots.has(workspaceRoot)) {
         try {
           mkdirSync(path.dirname(file), { recursive: true });
           writeFileSync(file, JSON.stringify(defaultConfig(false), null, 2) + "\n");
@@ -465,9 +475,10 @@ function globalWanted(): boolean {
 
 /**
  * The project-level switch: `enabled: true` inside the workspace's sandbox
- * config (auto-created on first touch, template ships false). Reading also
- * materializes the template for discovery. Once the sandbox is armed the
- * deny island keeps the agent from flipping the switch back off.
+ * config. Reading also materializes the template for discovery — but only
+ * while the sandbox is globally armed (see readSandboxConfig). Once the
+ * sandbox is armed the deny island keeps the agent from flipping the switch
+ * back off.
  */
 export function projectSandboxEnabled(workspaceRoot: string): boolean {
   return readSandboxConfig(workspaceRoot).enabled;

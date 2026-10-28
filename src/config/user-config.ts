@@ -38,6 +38,18 @@ function warn(msg: string): void {
   process.stderr.write(`[zcode-acp] ${msg}\n`);
 }
 
+/**
+ * Expand a leading `~`/`~/` to the user's home dir. Users naturally write
+ * paths in shell terms; `~` is home-relative (cwd-independent), unlike other
+ * relative spellings, so it is unambiguous to accept. `~otheruser/…` stays
+ * untouched (only the current user's home is knowable without a lookup).
+ */
+export function expandHomePath(p: string): string {
+  if (p === "~") return homedir();
+  if (p.startsWith("~/")) return path.join(homedir(), p.slice(2));
+  return p;
+}
+
 /** Terminal incubation preferences for remote session-create (ADR-0016). */
 export interface TerminalPrefs {
   /** false → remote session-create stays headless (no visible window). */
@@ -61,26 +73,61 @@ export interface RemoteUserConfig {
   hubPort?: number;
   hubHost?: string;
   bridgePort?: number;
+  /**
+   * Absolute path of a web-client build (`dist/`) for the hub to serve
+   * same-origin (empty/unset = static hosting off). A leading `~`/`~/` is
+   * expanded to the home dir; anything else relative is rejected — the hub
+   * daemon's cwd is unpredictable, so it would resolve differently per spawn.
+   */
+  webDir?: string;
+  /**
+   * Directory roots under which remote clients may start NEW sessions in any
+   * subdirectory (union with the known-project list). Empty/unset = the known
+   * list alone stays the whitelist. Same `~` expansion and absolute-only
+   * rules as webDir.
+   */
+  projectRoots?: string[];
   terminal?: TerminalPrefs;
 }
 
 /** The `quota` section of the user config file. */
 export interface QuotaUserConfig {
+  /**
+   * Wait out quota exhaustion and continue automatically (default true):
+   * /auto goal loops re-enter rounds after the usage cap resets, and
+   * quota-stopped workflow runs are resumed from the journal. Set false to
+   * restore the old pause-and-wait-for-a-human behavior.
+   */
+  autoResume?: boolean;
   /** Ollama Cloud API key for the `zcode-acp quota` card (cloud.ollama.ai). */
   ollamaApiKey?: string;
+  /** CLIProxyAPI management base URL (`https://host:port`) — the remote proxy
+   *  fronting Gemini/Codex/… OAuth accounts. No trailing path: the management
+   *  route prefix is appended per request. */
+  cliproxyUrl?: string;
+  /** CLIProxyAPI management key (`remote-management.secret-key` in the
+   *  server's config.yaml) — MUST go over HTTPS; the key can drive
+   *  credential-bearing upstream calls (`/api-call`). */
+  cliproxyManagementKey?: string;
   /** Opencode Go workspace id (`wrk_…`) — see the quota CLI docs. */
   opencodeGoWorkspaceId?: string;
   /** Opencode Go `auth` cookie value (`Fe26.2**…`). */
   opencodeGoAuthCookie?: string;
   /** Opencode Go `__Host-console_session` cookie value (`st_…`) — required
-   * since the 2026-09 console migration (the API 401s the auth cookie alone). */
+   *  since the 2026-09 console migration (the API 401s the auth cookie alone). */
   opencodeGoSessionToken?: string;
+  /** Opencode Go API key (`oc_sk_…`, opencode.ai Console → Keys) — the
+   *  cookie-free fallback source: used when the cookie triple is absent or
+   *  rejected (integer-percent precision via `/zen/go/v1/usage`). */
+  opencodeGoApiKey?: string;
 }
 
-/** The `session` section: defaults for newly created sessions. */
+/** The `session` section: session defaults and output preferences. */
 export interface SessionUserConfig {
-  /** Mode a new session starts in (plan/build/edit/yolo/auto — the backend's own modes). */
+  /** Mode a new session starts in (plan/build/edit/guarded/yolo/auto — the backend's own modes). */
   mode?: string;
+  /** Show successful turn-end status as assistant text (default true). */
+  showCompletionStatus?: boolean;
 }
 
 /** The `autoCompact` section: threshold-based context compaction. */
@@ -121,6 +168,67 @@ export interface TuiUserConfig {
 export interface SandboxUserConfig {
   /** true = arm the sandbox globally (same as ZCODE_ACP_SANDBOX=1). */
   enabled?: boolean;
+  /**
+   * Milliseconds a sandbox ask waits inside an unattended context (goal-loop
+   * round, workflow-run parent session) before ending no-decision so the
+   * chain keeps moving. 0 = wait forever even unattended. Per-project
+   * allow/deny content stays in sandbox.json — this is pacing, not content.
+   */
+  unattendedAskTimeoutMs?: number;
+}
+
+/** The `relay` sub-section of `push`: static-IP proxy for the WeCom API. */
+export interface PushRelayUserConfig {
+  /** Base URL — the push client calls `${url}/cgi-bin/…` through it. */
+  url?: string;
+  /** Shared secret sent as `x-relay-token` on every relayed call. */
+  token?: string;
+}
+
+/** The `notify` sub-section of `push`: per-kind settled-event switches. */
+export interface PushNotifyUserConfig {
+  turn?: boolean;
+  goal?: boolean;
+  run?: boolean;
+  task?: boolean;
+  compact?: boolean;
+  /** Pending interaction asks (permission/question): zero-client push + unanswered watchdog. */
+  ask?: boolean;
+  /** Workflow stage transitions (phase entered / node failed): mid-run digest push. */
+  workflowStage?: boolean;
+  /** Quota threshold warnings (5h/weekly windows at 60/80/90/95/98/exhausted). */
+  quota?: boolean;
+}
+
+/** The `push` section: offline WeCom notifications (push-backend-requirements §8). */
+export interface PushUserConfig {
+  /** true = push ACTIVE once credentials are complete (default false). */
+  enabled?: boolean;
+  corpId?: string;
+  agentId?: number;
+  secret?: string;
+  /** WeCom message recipient (user id, "@all", or a |-joined list). Default "@all". */
+  toUser?: string;
+  /** "minimal" strips business strings from bodies (content transits Tencent). */
+  contentDetail?: "full" | "minimal";
+  /** Settled-push quiet window in ms after a user prompt/cancel (0 = always push). */
+  quietMs?: number;
+  /** Unanswered-ask watchdog delay in ms (0 = push at dispatch time; default 120s). */
+  askDelayMs?: number;
+  /** Same watchdog for permission asks — a blocked tool call (default 15s). */
+  permissionAskDelayMs?: number;
+  relay?: PushRelayUserConfig;
+  notify?: PushNotifyUserConfig;
+}
+
+/** The `workflow` section: dynamic-workflow gate override (the App settings toggle). */
+export interface WorkflowUserConfig {
+  /**
+   * Local override of the dynamic-workflow remote gate. Domain mirrors upstream
+   * `ZCODE_DYNAMIC_WORKFLOW_MODE` (shared/dynamic-workflow-feature.ts); absent
+   * = follow the remote verdict. Written via PUT /settings/workflow-gate.
+   */
+  mode?: "disabled" | "onDemand" | "alwaysOn";
 }
 
 export interface UserConfig {
@@ -136,6 +244,8 @@ export interface UserConfig {
   interaction?: InteractionUserConfig;
   sandbox?: SandboxUserConfig;
   tui?: TuiUserConfig;
+  push?: PushUserConfig;
+  workflow?: WorkflowUserConfig;
 }
 
 /** Resolve the config file path: $XDG_CONFIG_HOME/zcode-acp or ~/.config/zcode-acp. */
@@ -148,8 +258,18 @@ function isPlainObject(v: unknown): v is Record<string, unknown> {
   return typeof v === "object" && v !== null && !Array.isArray(v);
 }
 
-/** The session modes the backend's own mode select offers (mirrors CONFIG_META). */
-const SESSION_MODES = new Set(["plan", "build", "edit", "yolo", "auto"]);
+/** The session modes the backend's own mode select offers (mirrors CONFIG_META).
+ * `guarded` is new in 3.15.1; `auto` stays accepted (wire-valid) though the
+ * dropdown no longer advertises it. */
+const SESSION_MODES = new Set(["plan", "build", "edit", "guarded", "yolo", "auto"]);
+
+/**
+ * Dynamic-workflow gate override domain — mirrors upstream DYNAMIC_WORKFLOW_MODES
+ * (config/workflow-gate.ts). Duplicated instead of imported: user-config must
+ * not import utils-adjacent modules (see the warn() note above — the import
+ * graph stays acyclic by hand).
+ */
+const WORKFLOW_MODES = new Set(["disabled", "onDemand", "alwaysOn"]);
 
 /** Normalized language pick: "zh*"/"en*" prefixes accepted, else undefined. */
 function parseLang(v: unknown): "zh" | "en" | undefined {
@@ -214,13 +334,17 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
       const q: QuotaUserConfig = {};
       for (const [jsonKey, prop] of [
         ["ollamaApiKey", "ollamaApiKey"],
+        ["cliproxyUrl", "cliproxyUrl"],
+        ["cliproxyManagementKey", "cliproxyManagementKey"],
         ["opencodeGoWorkspaceId", "opencodeGoWorkspaceId"],
         ["opencodeGoAuthCookie", "opencodeGoAuthCookie"],
         ["opencodeGoSessionToken", "opencodeGoSessionToken"],
+        ["opencodeGoApiKey", "opencodeGoApiKey"],
       ] as const) {
         const v = quota[jsonKey];
         if (typeof v === "string" && v.trim()) q[prop] = v.trim();
       }
+      if (typeof quota["autoResume"] === "boolean") q.autoResume = quota["autoResume"];
       if (Object.keys(q).length > 0) result.quota = q;
     }
   }
@@ -247,6 +371,11 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
       const m = typeof mode === "string" ? mode.trim() : "";
       if (m && SESSION_MODES.has(m)) s.mode = m;
       else warn(`config: ${label}.mode=${JSON.stringify(mode)} is not a session mode — ignoring`);
+    }
+    const showCompletionStatus = body["showCompletionStatus"];
+    if (showCompletionStatus !== undefined) {
+      if (typeof showCompletionStatus === "boolean") s.showCompletionStatus = showCompletionStatus;
+      else warn(`config: ${label}.showCompletionStatus is not a boolean — ignoring`);
     }
     return s;
   });
@@ -277,13 +406,22 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
   });
 
   result.sandbox = parseSection(parsed, "sandbox", file, (body, label) => {
+    const out: SandboxUserConfig = {};
     const enabled = body["enabled"];
-    if (enabled === undefined) return {};
-    if (typeof enabled === "boolean") return { enabled };
-    warn(
-      `config: ${label}.enabled=${JSON.stringify(enabled)} in ${file} is not a boolean — ignoring`,
-    );
-    return {};
+    if (enabled !== undefined) {
+      if (typeof enabled === "boolean") out.enabled = enabled;
+      else warn(`config: ${label}.enabled=${JSON.stringify(enabled)} is not a boolean — ignoring`);
+    }
+    const timeout = body["unattendedAskTimeoutMs"];
+    if (timeout !== undefined) {
+      if (typeof timeout === "number" && Number.isFinite(timeout) && timeout >= 0)
+        out.unattendedAskTimeoutMs = Math.floor(timeout);
+      else
+        warn(
+          `config: ${label}.unattendedAskTimeoutMs=${JSON.stringify(timeout)} is not a non-negative number — ignoring`,
+        );
+    }
+    return out;
   });
 
   // An empty string is a VALID value here (martty reads it as "hide every
@@ -292,8 +430,96 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
     const stats = body["stats"];
     if (stats === undefined) return {};
     if (typeof stats === "string") return { stats };
-    warn(`config: ${label}.stats=${JSON.stringify(stats)} in ${file} is not a string — ignoring`);
+    warn(`config: ${label}.stats=${JSON.stringify(stats)} is not a string — ignoring`);
     return {};
+  });
+
+  result.workflow = parseSection(parsed, "workflow", file, (body, label) => {
+    const w: WorkflowUserConfig = {};
+    const mode = body["mode"];
+    if (mode !== undefined) {
+      const m = typeof mode === "string" ? mode.trim() : "";
+      if (WORKFLOW_MODES.has(m)) w.mode = m as WorkflowUserConfig["mode"];
+      else warn(`config: ${label}.mode=${JSON.stringify(mode)} is not a workflow mode — ignoring`);
+    }
+    return w;
+  });
+
+  result.push = parseSection(parsed, "push", file, (body, label) => {
+    const p: PushUserConfig = {};
+    if (body["enabled"] === undefined) {
+      // absent — fine
+    } else if (typeof body["enabled"] === "boolean") {
+      p.enabled = body["enabled"];
+    } else {
+      warn(
+        `config: ${label}.enabled=${JSON.stringify(body["enabled"])} is not a boolean — ignoring`,
+      );
+    }
+    for (const key of ["corpId", "secret", "toUser"] as const) {
+      const v = body[key];
+      if (typeof v === "string" && v.trim()) p[key] = v.trim();
+    }
+    const agentId = parseIntField(body["agentId"], 1, `${label}.agentId`, file);
+    if (agentId !== undefined) p.agentId = agentId;
+    const detail = body["contentDetail"];
+    if (detail !== undefined) {
+      if (detail === "full" || detail === "minimal") p.contentDetail = detail;
+      else
+        warn(
+          `config: ${label}.contentDetail=${JSON.stringify(detail)} is not "full"/"minimal" — ignoring`,
+        );
+    }
+    const quietMs = parseIntField(body["quietMs"], 0, `${label}.quietMs`, file);
+    if (quietMs !== undefined) p.quietMs = quietMs;
+    const askDelayMs = parseIntField(body["askDelayMs"], 0, `${label}.askDelayMs`, file);
+    if (askDelayMs !== undefined) p.askDelayMs = askDelayMs;
+    const permissionAskDelayMs = parseIntField(
+      body["permissionAskDelayMs"],
+      0,
+      `${label}.permissionAskDelayMs`,
+      file,
+    );
+    if (permissionAskDelayMs !== undefined) p.permissionAskDelayMs = permissionAskDelayMs;
+    const relay = body["relay"];
+    if (relay !== undefined) {
+      if (!isPlainObject(relay)) {
+        warn(`config: ${label}.relay in ${file} is not an object — ignoring`);
+      } else {
+        const r: PushRelayUserConfig = {};
+        for (const key of ["url", "token"] as const) {
+          const v = relay[key];
+          if (typeof v === "string" && v.trim()) r[key] = v.trim();
+        }
+        if (Object.keys(r).length > 0) p.relay = r;
+      }
+    }
+    const notify = body["notify"];
+    if (notify !== undefined) {
+      if (!isPlainObject(notify)) {
+        warn(`config: ${label}.notify in ${file} is not an object — ignoring`);
+      } else {
+        const n: PushNotifyUserConfig = {};
+        for (const key of [
+          "turn",
+          "goal",
+          "run",
+          "task",
+          "compact",
+          "ask",
+          "workflowStage",
+          "quota",
+        ] as const) {
+          const v = notify[key];
+          if (v === undefined) continue;
+          if (typeof v === "boolean") n[key] = v;
+          else
+            warn(`config: ${label}.notify.${key}=${JSON.stringify(v)} is not a boolean — ignoring`);
+        }
+        if (Object.keys(n).length > 0) p.notify = n;
+      }
+    }
+    return p;
   });
 
   // Drop the empty section shells so consumers' `??` fallbacks stay honest.
@@ -342,6 +568,34 @@ function parseRemoteSection(remote: Record<string, unknown>, file: string): Remo
   }
   if (typeof remote["hubHost"] === "string" && remote["hubHost"].trim()) {
     out.hubHost = remote["hubHost"].trim();
+  }
+  if (typeof remote["webDir"] === "string" && remote["webDir"].trim()) {
+    const webDir = expandHomePath(remote["webDir"].trim());
+    if (path.isAbsolute(webDir)) {
+      out.webDir = webDir;
+    } else {
+      warn(`config: remote.webDir=${JSON.stringify(webDir)} is not an absolute path — ignoring`);
+    }
+  }
+  if (Array.isArray(remote["projectRoots"])) {
+    const roots: string[] = [];
+    for (const v of remote["projectRoots"]) {
+      if (typeof v !== "string" || !v.trim()) {
+        warn(
+          `config: remote.projectRoots entry ${JSON.stringify(v)} is not a non-empty string — ignoring`,
+        );
+        continue;
+      }
+      const root = expandHomePath(v.trim());
+      if (path.isAbsolute(root)) roots.push(root);
+      else
+        warn(
+          `config: remote.projectRoots entry ${JSON.stringify(root)} is not an absolute path — ignoring`,
+        );
+    }
+    if (roots.length > 0) out.projectRoots = roots;
+  } else if (remote["projectRoots"] !== undefined) {
+    warn(`config: remote.projectRoots in ${file} is not an array of paths — ignoring`);
   }
   const terminal = remote["terminal"];
   if (isPlainObject(terminal)) {

@@ -71,50 +71,53 @@ node dist/cli.js quota -w
 
 ## Opencode Go setup
 
-Opencode Go has no JSON API for subscription usage — the CLI scrapes the
-authenticated dashboard at `opencode.ai/workspace/<id>/go`, so it needs your
-browser `auth` cookie. Credentials are read from three sources, **merged
-field-by-field, highest precedence first**:
+Two credential sources drive the Go usage card — **picked automatically,
+cookies preferred** (they report usage in 0.1-percent steps; the API key
+reports integer percents but never expires and needs no browser):
 
-- **Our config file** (`~/.config/zcode-acp/config.json`, `quota` section —
-  the preferred home):
+- **API key** (recommended, cookie-free): at
+  [opencode.ai/console](https://opencode.ai/console) → **Keys** → Add Service
+  Account → Add API Key (query permissions suffice), then either:
+  - config file (`~/.config/zcode-acp/config.json`, `quota` section):
+    ```json
+    { "quota": { "opencodeGoApiKey": "oc_sk_your_key" } }
+    ```
+  - or environment variable:
+    ```bash
+    export OPENCODE_GO_API_KEY="oc_sk_your_key"
+    ```
+- **Console cookies** (higher precision, expires with the browser session):
+  `opencode.ai` console login → browser DevTools (F12) → Application →
+  Cookies → copy the `auth` cookie value and the `__Host-console_session`
+  value, plus the `wrk_…` workspace id from the console URL, into any of the
+  three merged sources (highest precedence first):
   ```json
   { "quota": {
       "opencodeGoWorkspaceId": "wrk_your_workspace_id",
-      "opencodeGoAuthCookie": "Fe26.2**your_cookie_value"
-  } }
+      "opencodeGoAuthCookie": "Fe26.2**your_cookie_value",
+      "opencodeGoSessionToken": "st_your_session_token" } }
   ```
-- **Environment variables** (override the legacy file below):
   ```bash
   export OPENCODE_GO_WORKSPACE_ID="wrk_your_workspace_id"
   export OPENCODE_GO_AUTH_COOKIE="Fe26.2**your_cookie_value"
+  export OPENCODE_GO_SESSION_TOKEN="st_your_session_token"
   ```
-- **Legacy config file**: `~/.pi/agent/opencode-go.json` — same convention as
-  the `@beyona/pi-zai-usage` Pi extension, kept so existing setups keep
-  working unchanged.
-  ```json
-  { "workspaceId": "wrk_your_workspace_id", "authCookie": "Fe26.2**your_cookie_value" }
-  ```
+  The legacy `~/.pi/agent/opencode-go.json` file
+  (`{ workspaceId, authCookie, sessionToken }`, the `@beyona/pi-zai-usage`
+  convention) still works as the lowest-precedence source.
 
-How to get the values:
-
-1. **Workspace ID** — open `https://opencode.ai`, navigate to your Go
-   workspace, and copy the `wrk_…` id from the URL
-   (`https://opencode.ai/workspace/<wrk_…>/go`).
-2. **Auth cookie** — open browser DevTools (F12) → Application → Cookies →
-   `opencode.ai` → copy the value of the cookie named `auth` (it starts with
-   `Fe26.2**`).
-
-Without credentials, the default multi-provider mode silently shows GLM only
-(no error). Running `zcode-acp quota go` without credentials prints a setup hint.
+When both are configured and the cookies expire (the console API answers
+400/401/403), the card seamlessly falls back to the API key. Without any
+credentials, the default multi-provider mode silently shows GLM only (no
+error); `zcode-acp quota go` without credentials prints a setup hint.
 
 ## Ollama Cloud setup
 
 Ollama Cloud exposes an (undocumented) usage endpoint at
-`ollama.com/api/usage` that the CLI queries with your API key. Create a key
-at [cloud.ollama.ai](https://cloud.ollama.ai) → API keys. The key comes from
-two sources, with the **config file taking precedence** over the environment
-variable:
+`ollama.com/api/usage` that the CLI queries with your API key (the rolling
+`30d` window). Create a key at [cloud.ollama.ai](https://cloud.ollama.ai) →
+API keys. The key comes from two sources, with the **config file taking
+precedence** over the environment variable:
 
 - **Config file** (`~/.config/zcode-acp/config.json`, `quota` section):
   ```json
@@ -125,14 +128,17 @@ variable:
   export OLLAMA_API_KEY="your_ollama_api_key"
   ```
 
-The card shows whatever usage windows the account's plan exposes — legacy
-plans get `5h` + `Week` bars, current credit plans get a `Month` bar. The
-server returns fractions only, so reset moments are derived client-side
-(epoch-aligned 5h buckets, Monday 00:00 UTC weeks, and for monthly the
-`/api/me` billing period end or — on new credit plans, which return only a
-`CreatedAt` — the next subscription-day anniversary). Without a key, the
-default mode silently skips the Ollama section; `zcode-acp quota oc` without
-a key prints a setup hint.
+The API was rewritten upstream (2026-10): it now reports **spend analytics**
+(`usage_usd`, request/token counts) and no longer exposes usage fractions or
+plan limits. The card therefore derives the `Month` percent from the 30d
+spend ÷ the plan's monthly credit (`/api/me` → `Plan`; credits from
+ollama.com/pricing: Pro $60, Max $300, Team $1000 — unknown plans show the
+spend line only, no bar) and shows a spend detail line
+(`$1.57 of $60 · 246 req (30d)`) under the bars. The monthly reset is derived
+from the `/api/me` billing period end or — on new credit plans, which return
+only a `CreatedAt` — the next subscription-day anniversary. Without a key,
+the default mode silently skips the Ollama section; `zcode-acp quota oc`
+without a key prints a setup hint.
 
 ## Hub and server subcommands
 

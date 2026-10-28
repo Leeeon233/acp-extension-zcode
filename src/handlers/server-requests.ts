@@ -34,10 +34,13 @@ import {
   buildAskUserAcpParams,
   buildAskUserElicitationForm,
   buildPlanApprovalElicitationForm,
+  enrichPermissionOptions,
   exitPlanModeToAcpPermission,
   isAskUserQuestion,
   isExitPlanMode,
   isPermissionRequest,
+  isSessionAlwaysTool,
+  isSessionAllowPick,
   parseAskUserElicitationResponse,
   parseAskUserResponse,
   parsePlanApprovalElicitationResponse,
@@ -49,7 +52,13 @@ import { buildConfigOptions, buildModes } from "../config/options.js";
 import { interactionTimeoutMs } from "../config/settings.js";
 import { messages } from "../i18n.js";
 import { withLodyToolName } from "../lody.js";
-import type { ClientLike } from "../remote/broadcast.js";
+import {
+  armAskWatchdog,
+  clearAskWatchdog,
+  pushInteractionIfOffline,
+  pushSourceLabel,
+} from "../push/push.js";
+import { type ClientLike } from "../remote/broadcast.js";
 import { clientConnectionRoot, log, warn } from "../utils.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { sendSessionUpdate } from "./io.js";
@@ -177,10 +186,12 @@ function createActiveInteraction(
  * connected clients); later attempts are targeted re-sends at clients that
  * attached mid-wait. The first attempt to answer resolves the race and aborts
  * every other attempt's controller; when all in-flight attempts fail instead,
- * the race rejects with the first error (surfaces like a single-client failure).
+ * the race rejects with the first error (surfaces like a single-client failure)
+ * — UNLESS nobody is left to answer, in which case it HOLDS.
  */
 function fireInteractionAttempt(
   entry: ActiveInteraction,
+  server: ZcodeAcpServer,
   send: (options: acp.SendRequestOptions) => Promise<unknown>,
 ): void {
   const ctrl = new AbortController();
@@ -210,6 +221,20 @@ function fireInteractionAttempt(
       entry.controllers.delete(ctrl);
       if (entry.firstError === undefined) entry.firstError = err;
       if (!entry.settled && entry.inFlight === 0) {
+        // Hold whenever NO client can answer, regardless of WHY the attempts
+        // died: the ask may have been fired at zero clients (typed
+        // NoClientsError), or at a phone whose socket then died with the ask
+        // in flight (ordinary connection error — observed 2026-10-13 as the
+        // sandbox ask "expiring" into an auto-decline while the phone slept).
+        // The push config only decides whether a notification goes out
+        // (armAskWatchdog + the zero-clients observer), never the ask's
+        // lifetime; the escapes stay the answer, the turn cancel, and an
+        // explicit timeoutMs (requestWithTimeout's cleanup still deregisters
+        // the entry if one of those wins).
+        if (server.clients.size === 0) {
+          log(`  ⏸ ${entry.label} unanswered with no clients — holding for reconnect`);
+          return;
+        }
         entry.settled = true;
         entry.reject(entry.firstError);
       }
@@ -247,7 +272,7 @@ export function resendPendingInteractions(
     log(`  ⟳ ${entry.label} still unanswered, re-sending to reconnected client (sid=${acpSid})`);
     const timer = setTimeout(() => {
       if (entry.settled) return;
-      fireInteractionAttempt(entry, (options) =>
+      fireInteractionAttempt(entry, server, (options) =>
         client.request(entry.method, entry.params, options),
       );
     }, RESEND_DELAY_MS);
@@ -436,6 +461,109 @@ async function handleOne(
   }
 }
 
+// ---------- orphaned-ask sweep (workflow background interactions) ----------
+
+/**
+ * Claim interaction requests no turn loop will ever poll.
+ *
+ * `handleServerRequests` runs ONLY inside a session's turn loop and claims
+ * only that turn's session (everything else is requeued) — an ask from any
+ * OTHER session, above all a background workflow run's execution, used to sit
+ * in the arrival queue forever: never forwarded, never pushed, until the
+ * backend's ask timeout killed the run (observed 2026-09-30: app-launched
+ * runs died on an unanswered CreateWorkflow permission with no notification
+ * at all — the "errored" rows in the run list).
+ *
+ * Armed on a 2s interval in the server constructor. Per queued request:
+ *   - owned by a running turn (or sid-less while any turn runs — a turn
+ *     claims sid-less asks) → requeued untouched, the turn keeps its claim;
+ *   - session maps to an ACP alias → forwarded through the full ask path
+ *     (client popup + offline hold + watchdog push) under ITS acpSid;
+ *   - unmappable — an internal run session no client can ever answer:
+ *     the workflow-graph tools auto-allow (launch consent covers building
+ *     the run's own graph; there is no human channel to ask), anything
+ *     else is declined fast with an offline push, so the run fails LOUD
+ *     instead of hanging silently.
+ */
+export async function sweepOrphanedServerRequests(server: ZcodeAcpServer): Promise<void> {
+  const backend = server.backend;
+  if (!backend || backend.isDead) return;
+  const all = backend.pollServerRequests();
+  if (all.length === 0) return;
+  // Phase 1 — SYNCHRONOUS classification. Turn-owned requests go back BEFORE
+  // any await: a forwarded ask can hold for as long as nobody answers (§6
+  // offline hold), and an owned request stranded in a local array through
+  // that window would vanish from its turn loop's view — past the dedup
+  // entry's lifetime a requeued reannounce then re-prompts an already
+  // answered ask. Orphans are dispatched INDEPENDENTLY (not sequentially)
+  // for the same reason: one held ask must not queue every later orphan.
+  const owned: ServerRequest[] = [];
+  const orphans: ServerRequest[] = [];
+  for (const req of all) {
+    const sid = ((req.params ?? {}) as Record<string, unknown>)["sessionId"];
+    if (turnOwnsSession(server, sid)) owned.push(req);
+    else orphans.push(req);
+  }
+  if (owned.length > 0) backend.requeueServerRequests(owned);
+  // Phase 2 — settle the orphans; awaiting the sweep (tests) sees them all.
+  await Promise.all(orphans.map((req) => settleOrphan(server, backend, req)));
+}
+
+/** One ownerless request: forward, auto-allow, or decline — never re-queued. */
+async function settleOrphan(
+  server: ZcodeAcpServer,
+  backend: ZcodeBackend,
+  req: ServerRequest,
+): Promise<void> {
+  const params = (req.params ?? {}) as Record<string, unknown>;
+  const sid = params["sessionId"];
+  try {
+    const acpSid = typeof sid === "string" ? server.resolveAcpSid(sid) : undefined;
+    if (acpSid) {
+      log(`  ⟳ orphaned ${req.method}: forwarding under acp sid ${acpSid}`);
+      await handleOne(
+        server,
+        backend,
+        server.clients.broadcast(),
+        acpSid,
+        req,
+        getPendingInteractions(server),
+      );
+      return;
+    }
+    if (isProviderRuntimeHeadersRequest(req.method)) {
+      answerProviderRuntimeHeaders(backend, req.id, req.method, params);
+      return;
+    }
+    if (isPermissionRequest(req.method) && isSessionAlwaysTool(`${params["toolName"] ?? ""}`)) {
+      log(`  ⟳ orphaned ${params["toolName"]} ask (internal run session): auto-allow`);
+      backend.sendReply(req.id, { decision: "allow", reason: "Approved for this session" });
+      return;
+    }
+    warn(`  ⚠ orphaned ${req.method} with no answerable session — declining with offline push`);
+    pushInteractionIfOffline(server, req.method, params);
+    backend.sendReply(req.id, { action: "decline", reason: "no client session to ask" });
+  } catch (e) {
+    // The turn loop wraps handleOne the same way — the sweep must never
+    // throw into the interval callback.
+    warn(`orphaned ${req.method} sweep threw: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+/**
+ * Whether a running turn owns this ask: its own session, or (matching the
+ * turn loop's claim rule) any turn at all when the ask carries no sessionId.
+ */
+function turnOwnsSession(server: ZcodeAcpServer, sid: unknown): boolean {
+  if (server.pendingTurns.size === 0) return false;
+  if (sid === undefined) return true;
+  if (typeof sid !== "string") return false;
+  for (const turn of server.pendingTurns.values()) {
+    if (turn.zcodeSid === sid) return true;
+  }
+  return false;
+}
+
 /** Single requestPermission (tool auth / ExitPlanMode). */
 async function handleSinglePermission(
   server: ZcodeAcpServer,
@@ -448,6 +576,24 @@ async function handleSinglePermission(
   turn?: PendingTurn,
 ): Promise<ZcodeInteractionResponse> {
   const p = params as ZcodeInteractionPermissionParams & ZcodeInteractionUserInputParams;
+  // Session-scoped auto-allow for the workflow approval tools (the bridge
+  // mirror of upstream's grantSessionPermission — the v3 wire cannot carry
+  // the backend's own session tier): an ask for a tool this session already
+  // granted answers here, before any card or client popup.
+  if (perm && !epm) {
+    const grantedTool = p.toolName ?? "";
+    const grantSid = server.resolveSid(acpSid);
+    if (grantedTool && grantSid && server.sessionAutoAllows.get(grantSid)?.has(grantedTool)) {
+      log(`  ⟳ ${grantedTool} auto-allowed (session grant)`);
+      return { decision: "allow", reason: "Approved for this session" };
+    }
+  }
+  // Re-offer the "always allow in this session" tier the v3 projection
+  // cropped (workflow tools only — enrichPermissionOptions is a no-op
+  // otherwise), so the response mapping below sees the injected option.
+  const permParams = perm
+    ? enrichPermissionOptions(p as ZcodeInteractionPermissionParams)
+    : (p as ZcodeInteractionPermissionParams);
   // Emit a tool_call first so Zed renders the popup (it requires the toolCallId
   // to have been emitted before request_permission).
   const toolCallId = p.toolCallId ?? "";
@@ -506,7 +652,7 @@ async function handleSinglePermission(
     if (elicited !== null) return elicited;
   }
   const acpParams = perm
-    ? zcodePermissionToAcp(p as ZcodeInteractionPermissionParams, acpSid)!
+    ? zcodePermissionToAcp(permParams, acpSid)!
     : exitPlanModeToAcpPermission(p as ZcodeInteractionUserInputParams, acpSid);
 
   const acpReqId = server.nextId();
@@ -528,8 +674,20 @@ async function handleSinglePermission(
   if (acpResp === null) {
     return { action: "decline", reason: "declined or cancelled" };
   }
+  // The injected session-always pick (bridge-side tier, adapter.ts): record
+  // the grant so the NEXT ask for this tool in this session auto-allows.
+  if (perm && isSessionAllowPick(acpResp)) {
+    const grantedTool = p.toolName ?? "";
+    const grantSid = server.resolveSid(acpSid);
+    if (grantedTool && grantSid) {
+      const set = server.sessionAutoAllows.get(grantSid) ?? new Set<string>();
+      set.add(grantedTool);
+      server.sessionAutoAllows.set(grantSid, set);
+      log(`  ⟳ ${grantedTool} granted for session (auto-allow armed)`);
+    }
+  }
   return perm
-    ? acpPermissionResponseToZcode(acpResp, (p as ZcodeInteractionPermissionParams).options)
+    ? acpPermissionResponseToZcode(acpResp, permParams.options)
     : acpPermissionResponseToExitPlanMode(acpResp);
 }
 
@@ -886,6 +1044,16 @@ const INTERRUPTED = Symbol("interactionInterrupted");
 type InteractionResult = unknown | typeof INTERRUPTED;
 
 /**
+ * Interruption test for external {@link requestWithTimeout} callers
+ * (sandbox-allow): distinguishes "wait broke" (connection close / turn
+ * cancel) from a client response, so a no-decision outcome is not mistaken
+ * for a user rejection.
+ */
+export function isInteractionInterrupted(value: unknown): boolean {
+  return value === INTERRUPTED;
+}
+
+/**
  * Send a client-side request and wait for the response. By default waits
  * indefinitely (see {@link INTERACTION_TIMEOUT_MS}). Resolves to the client
  * response, `null` if the client returned null/errored, or {@link INTERRUPTED}
@@ -901,7 +1069,9 @@ type InteractionResult = unknown | typeof INTERRUPTED;
  * dismiss them (the SDK ignores cancellationSignal, so the abort alone never
  * reaches the wire).
  */
-async function requestWithTimeout(
+// Exported for the offline-push hold tests (§6); production callers are all
+// in this module.
+export async function requestWithTimeout(
   server: ZcodeAcpServer,
   cx: acp.AgentContext,
   method: string,
@@ -930,7 +1100,7 @@ async function requestWithTimeout(
       return null;
     }),
   ];
-  fireInteractionAttempt(entry, (options) => cx.request(method, params as never, options));
+  fireInteractionAttempt(entry, server, (options) => cx.request(method, params as never, options));
 
   // Connection-close detection: replaces the old finite timeout as the crash
   // guard. `cx.signal` is an AbortSignal that fires when the stream closes;
@@ -988,6 +1158,19 @@ async function requestWithTimeout(
     );
   }
 
+  // Unanswered-ask watchdog (§5.1 v1.3): one slot for this ask — pushes after
+  // push.askDelayMs when nobody answers (clients connected or not; the
+  // zero-clients push only judges at dispatch). Cleared when the race settles
+  // below; setup code above cannot throw past an un-armed slot. The label
+  // (project / session title) is captured NOW — the timer fires with no
+  // request context of its own; the ACP session id rides the request params,
+  // same extraction as pushInteractionIfOffline.
+  const askSid = (params as { sessionId?: unknown } | undefined)?.sessionId;
+  armAskWatchdog(
+    method,
+    params,
+    pushSourceLabel(server, typeof askSid === "string" ? askSid : undefined),
+  );
   const winner = await Promise.race(racers);
   // Mark settled BEFORE disposing: a non-primary racer can win while the
   // interaction race is still open, and a later `closed.then(fire)` would
@@ -1015,6 +1198,7 @@ async function requestWithTimeout(
     entry.controllers.clear();
   }
   emitAskSettled(server, method, params);
+  clearAskWatchdog();
   return winner;
 }
 
@@ -1170,7 +1354,7 @@ export function answerProviderRuntimeHeaders(
     sel ?? (params as { providerId?: string }).providerId,
   );
   if (requestAuth) {
-    log("  provider runtime headers: serving the coding-plan API key (config.json)");
+    log("  provider runtime headers: serving the coding-plan API key (config.json or store)");
     sendZcodeReply(backend, reqId, { headersApplied: true, requestAuth });
     return true;
   }

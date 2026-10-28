@@ -23,6 +23,160 @@ version). Full audit detail with `file:line` evidence:
 `.zcode/scratch/alignment-protocol.md` (protocol surface) and
 `.zcode/scratch/alignment-hacks.md` (Gotchas verification).
 
+**3.14.3 audit (2026-09-24, commit `328c1a0` — no bridge impact)**: the single
+upstream release commit is entirely the dynamic-workflow subsystem (runtime
+concurrency adjustment, modify/restart reuse, large-run status rendering,
+script-submit token cost) plus bot delivery (`botDeliveryTarget` on
+`session/send` and `automation/create` — both OPTIONAL fields the bridge
+never sends — and the bots providers: feishu/telegram/weixin/webhook).
+app-server stays `0.16.9`; `server-operations.ts` touches only the
+botDeliveryTarget passthrough (stop's `activeAbortController` and compact's
+`state.updated` swallow unchanged); provider bootstrap / runtime headers /
+setModel / goal / fork untouched. `bundled-skills.ts` is the DWF skill pack's
+own distribution channel (explicitly not in the settings page or `$` panel)
+— no overlap with the bridge's filesystem skill discovery.
+
+**3.15.1 sync (2026-10-12, commit `aac47556` — checkout synced, targeted audit,
+alignment items 1/2/4 DONE 2026-10-12; 3 is enum-only, 5 needs nothing by design)**: single upstream release commit (11,736 files).
+app-server still self-reports `0.16.9`; the desktop app on this machine is at
+3.14.5 and its bundle contains NONE of the 3.15.1 protocol surface except the
+`highspeed` account-mode schema strings — no live breakage today. Verified
+unchanged (zero diff): provider bootstrap (`provider-runtime-env.ts`,
+`runtime-paths.ts`, `zcode-builtin-provider-config-source.ts`,
+`registry-service.ts`), `model-catalog-port.ts`, `session-mode-port.ts`,
+`workflow-model-failure-policy.ts`; `server-operations.ts` moved 107 lines but
+its hunks touch MCP plugin UI, `session/read` `contentProfile`, and the DWF
+gate — the stop/compact/setModel/send-busy turn loop has no hunk. The
+runtime-headers request reason enum is still `["model-request"]` (the new
+`request-security-edition/verification-policy.ts` is an all-stub placeholder).
+New in 3.15.1, bridge-relevant:
+
+1. **Guarded permission mode** (UI: "Autonomous mode / 自主模式") — runs like
+   yolo but pauses ONCE for AST-recognized dangerous shell commands
+   (`docs/dangerous-command-approval-v1-plan.md`, matcher → PermissionService
+   → broker; sub-agent yolo derivations tighten to guarded). Ships with
+   `permission_full_access` persisted receipts (yolo escalation covering
+   queued items) and `approvalMode:"user-once"` on `permission_requested`.
+   **ALIGNED (2026-10-12)**: `guarded` added to the bridge's mode vocabulary
+   (`availableModes`, `CONFIG_META`, `SESSION_MODES`, `/mode` hint);
+   `auto` dropped from the advertised dropdowns (internal-only upstream, still
+   wire-valid and accepted by user config). Pre-3.15 resilience: a backend
+   whose mode enum rejects `guarded` gets `session/create` retried once
+   WITHOUT the mode key (the dropdown leads the rollout, config
+   `ZCODE_ACP_MODE=guarded` cannot brick session/new); interactive `setMode`
+   failures surface the backend's own enum error. `approvalMode` on
+   permission requests is an optional passthrough field — no handler change.
+2. **Dynamic-workflow mode (onDemand)** — optional param on `session/create`,
+   `session/resume` (key: `dynamicWorkflowMode`) and on
+   `workspace/updateDynamicWorkflowPolicy` (key: `mode` — the surfaces spell
+   it DIFFERENTLY); absent mode = act on the boolean (alwaysOn) for old hosts.
+   Pairs with the bridge's workflow-gate local override, which already models
+   `onDemand`. **ALIGNED (2026-10-12, push key FIXED same day)**: an
+   `onDemand` verdict now carries the mode on BOTH channels — the policy push
+   attaches it under its own `mode` key (`alwaysOn` is the boolean's implied
+   default upstream and stays implicit), and create/resume attach
+   `dynamicWorkflowMode` once the generation's mode-carrying push was
+   ACCEPTED (`server.workflowModeOnWire`; 0.16.9 and 3.15.1 both self-report
+   0.16.9, so the probe outcome is the only discriminator). The first cut
+   shipped the push as `dynamicWorkflowMode` — this audit note itself had
+   mis-transcribed the key, the strict schema silently bounced it into the
+   boolean-only compat retry (onDemand never reached the backend; mock tests
+   cannot catch a wire-key mismatch — always re-read the zod schema, not the
+   audit summary). An unrecognized-key rejection retries the push
+   boolean-only (upstream-host compat, launch.md DWG-02). A mode-shape change
+   (alwaysOn ↔ onDemand flip) re-arms the once-per-generation push guard.
+3. **`highspeed` provider account-access mode** (加速卡) — enum extension only;
+   the builtin table carries no modes, coding-plan snapshots unaffected.
+4. **Session event-store retention** — sealed-turn eviction in the in-memory
+   event store (memory-leak fix; `session-mapper.ts` now tolerates
+   `messageCount` in place of `messages`). **AUDITED (2026-10-12, no bridge
+   action)**: eviction runs at APPEND time (`in-memory-session-event-store.ts`
+   — transient buckets by turnId are dropped one turn AFTER seal, when the
+   next `TurnStarted` arrives), so the live `session/event` stream has already
+   delivered everything the bridge consumes before anything is evicted; the
+   slimming (`model_request` payload `messages` → `messageCount`) touches a
+   payload the bridge never reads. The bridge uses neither `session/events`
+   nor `session/subscribe {afterSeq}` (the two surfaces where eviction would
+   create gaps), and replay reads `session/messages` from the persistent
+   store, not the in-memory one — the hydration-watermark guards are
+   unaffected. Revisit only if the bridge adopts pull-mode event history
+   (the `session/events` candidate above).
+5. **Host-capability methods** — `mcp/ui*` family (plugin UI), `workflows/save`
+   - `workflows/forRun`, `topic/resource/*` (bot remote history),
+     `bot/channel/reply`, `subagents/readRuntimeConfig` (only armed when the
+     host reports `subagentRuntimeConfigEnabled` in requestRuntimePreferences —
+     the bridge doesn't). All land in the unhandled-request path by design.
+     v3 payloads gained only OPTIONAL fields (`turn.started.executionStartedAt`,
+     permission `approvalMode`, `session/read` `contentProfile`).
+
+**3.16.1 sync (2026-10-19, commit `0a1fc56d` — checkout synced, protocol
+surface audited, no bridge action)**: first CLI bump since 3.14 — app-server
+`0.16.9` → `0.17.0` (source root 3.15.1 → 3.16.1; 4,502 files, mostly desktop
+E2E/UI). The desktop on this machine is 3.15.3 (still bundles the 0.16.9-era
+`zcode.cjs`) — nothing changes for a running bridge today; this note covers the
+next desktop update. Protocol drift is small and additive except ONE param
+removal: `session/list` dropped `includeArchived` and now filters `deleted`
+rows itself (plus parent-chain ownership proofs for explicit `sessionIds`
+queries — `listSessions` rewrite). The bridge never sends `includeArchived`
+and applies its own tasks-index tombstone filter, so both are no-ops here.
+Additive surface: `additionalDirectories` (optional) on `session/create` +
+`session/resume`; `toolSearchMode` (default `"off"`) + `additionalDirectories`
+on the `session/requestRuntimePreferences` RESULT schema — the bridge's
+three-field auto-reply (`src/backend/client.ts`) still validates: the schema
+stays `.strict()`, every sent key is known, new fields carry defaults; new
+`provider/refreshRegistry` method (worker rebuilds its in-process registry
+from the Environment's config store — a host-side companion to
+`provider/updateAccountConfig`, which is unchanged); MCP server `alwaysLoad`;
+runtime capability `historyFirst`. Verified zero-diff on every Gotchas-cited
+behavior file: the provider bootstrap quartet (`provider-runtime-env.ts`,
+`runtime-paths.ts`, `zcode-builtin-provider-config-source.ts`,
+`registry-service.ts`), `model-catalog-port.ts` (the `values.at(-1)`
+default-level rule), `session-mode-port.ts`, `execution-state.ts`, the
+setModel/resume schemas, and the runtime-headers path. `server-operations.ts`
+moved 238 lines but no hunk touches the stop/compact/send-busy turn loop
+(`sendPrompt`'s `activeAbortController`, compact's `state.updated` swallow,
+the `-32010` window) — hunks are listSessions, createWithProjection,
+activateSessionForResume, background-turn allowlist, runtime-prefs resolution.
+`session-flow.ts` (+31/−9) is Highspeed selection queueing (queue items keep
+only the ordinary selection; execution bundles stay in-memory) — internal v4
+queue mechanics, the v4 stop path is untouched. Model-selection persistence
+semantics unchanged (`ensureSessionPersisted` / `restorePersistedModelSelection`;
+`turn-model.ts` adds Highspeed/off-peak capture, not persistence).
+**3.16.2 follow-up sync (2026-10-20, commit `3c5b2276` — re-audited, no
+bridge action)**: 263 files, web/desktop tests + architecture snapshots
+dominate. Protocol schema ZERO diff; the only Gotchas-file change is 10
+lines in `server-operations.ts` generalizing the listSessions parent-chain
+ownership check from `subagent_child` to the auxiliary-session-kind set
+(`isAuxiliarySessionKind` / `isReadonlyAgentSessionKind`) — same family as
+the 3.16.1 listSessions rewrite, still irrelevant to the bridge (it never
+sends `sessionIds` explicit queries). CLI stays `0.17.0`.
+Postscript (2026-10-20): the machine's desktop moved 3.14.5 → 3.15.3 without a
+per-version audit (no source-sync commits exist for 3.15.2/3.15.3 — the
+sync bot snapshots, so their changes are folded into the 3.16.1 cumulative
+diff already audited above). Bundle dated the 3.15.3 install by marker
+strings: every 3.16-era protocol token (`toolSearchMode`, `refreshRegistry`,
+`additionalDirectories`, `alwaysLoad`, `historyFirst`) is ABSENT from its
+`zcode.cjs` while the 3.15-era tokens (`guarded` mode, `dynamicWorkflowMode`)
+and the pre-3.16 `includeArchived` are present — the running backend's
+protocol surface is exactly the 3.15.1-audited one, and the bridge has been
+running it without incident.
+Postscript (2026-10-26): the desktop is now 3.16.3 and its `zcode.cjs`
+self-reports CLI `0.17.0` — the checkout's CLI, so the 3.16.1/3.16.2 audits
+above now describe the RUNNING backend (the 3.16.2→3.16.3 desktop delta is
+not in the public tree: `origin/main` is `3c5b2276`). Bundle re-proof done
+for #340: all six `toolDenylist` sites in the binary match the source
+verbatim — the create/resume/send zod objects, the send→prompt-turn
+forwarding, `resolveSessionToolDenylist` (minified `Jhc`, wired as
+`toolDisallowlist:Jhc(t,c)` in createRecord's runtimeConfig) and
+`buildPromptTurnToolDisallowlist`. One 3.16.2 shared-contract change the
+2026-10-20 entry did not call out, relevant to ADR-0029:
+`dynamic-workflow-feature.ts` flipped the UI tier from "a server-offered
+`disabled` makes the user's choice ineffective" to "the feature is GA, the
+server only sets the DEFAULT, a valid user choice always wins" — which is
+exactly the bridge's existing override-over-verdict rule (local
+`workflow.mode` > remote verdict, unset = follow the verdict), so upstream
+moved toward the bridge; nothing to change.
+
 **3.14.0 audit (2026-09-20, app-server 0.16.9 — live-probed end to end)**: the
 dynamic-workflow family (ten model tools led by `CreateWorkflow`) is OFF by
 default headless and enabled per PROCESS via
@@ -88,29 +242,29 @@ Available in the backend but with no ACP-side counterpart yet. Pick them up
 when a concrete ACP/editor need appears. Ranked shortlist in
 "Alignment opportunities" below.
 
-| Method                                                                                                                                                                                                                                                                                                                                                          | Purpose                                                                                                                                                   | Current bridge behavior                                                                                                                                                                                                                                                                                         |
-| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `session/subagents` (`index.ts:1520-1618`)                                                                                                                                                                                                                                                                                                                      | Sub-agent states: `running{status: running\|waiting\|blocked}`, `ended{total, items[{status: success\|failed\|cancelled\|lost}], nextCursor}`             | Sub-agent info is parsed from the `Agent` tool result (`_meta.subagent`); the RPC adds waiting/blocked/lost states for stuck-subagent detection (pairs with the watermark liveness logic in `runEventTurn`)                                                                                                     |
-| `session/events` (`{sessionId, afterSeq?, limit?}`, `index.ts:1667-1674`)                                                                                                                                                                                                                                                                                       | Pull-mode event history                                                                                                                                   | Not used; gap-fill after the drain gate's close-escalation reload (re-subscribe + replay only the missed window), durable audit for `/debug`                                                                                                                                                                    |
-| `session/subscribe` `afterSeq` + `includeSnapshot` (`index.ts:1496-1513`)                                                                                                                                                                                                                                                                                       | Resume the event stream from a seq watermark, optionally with a full state snapshot                                                                       | Not used; crash-safe resubscribe instead of full replay                                                                                                                                                                                                                                                         |
-| `session/usage` / `v4/conversation/usage`                                                                                                                                                                                                                                                                                                                       | Per-session cumulative usage: input/output/reasoning/cache tokens, `modelRequestCount`, `modelErrorCount` (`index.ts:1627-1646`)                          | Per-turn billing usage is now carried on the ACP `session/prompt` result (`usage` + `_meta.zcode.usage`), sourced from `turn.completed`; this RPC remains a candidate for session-cumulative reconciliation (deprecated upstream, see table above)                                                              |
-| `session/compact` `instructions` + `result.compact` (`index.ts:1829-1853`)                                                                                                                                                                                                                                                                                      | Custom compact instructions; result acks `{state: accepted\|already_running, inputId?, operationId?}`                                                     | Not forwarded — `/compact <focus>` could pass instructions; the backend's own `already_running` ack can backstop the bridge's `autoCompactInFlight` single-flight                                                                                                                                               |
-| `session/debug` (`index.ts:3571`, `bootstrap/src/zcode-protocol/session-debug.ts`)                                                                                                                                                                                                                                                                              | Per-session debug snapshot accumulated from the live event stream                                                                                         | Not used; `zcode-acp` diagnostics command / `/debug` extension                                                                                                                                                                                                                                                  |
-| `session/list` rich params (`sessionIds` incl. hidden, `includeArchived`, `limit`, `index.ts:1600-1609`)                                                                                                                                                                                                                                                        | Explicit identity lookup, archived sessions                                                                                                               | Not used                                                                                                                                                                                                                                                                                                        |
-| `session/create` extras: `toolAllowlist`/`toolDenylist` (per-session tool face — could move Cron* hiding off process-wide `--disallowed-tools`), `importedHistory` (claudeCode / sharedContext+sha256 provenance), `persistence:"immediate"\|"deferred"`, `titleGenerationEnabled:false` (bridge sets its own titles), `parentSessionId` (`index.ts:1558-1580`) | Session-creation knobs                                                                                                                                    | Not forwarded; `session/resume` also takes `toolAllowlist`/`toolDenylist` — a resume WITHOUT them drops the tool face on cold recovery (`index.ts:1589-1595`)                                                                                                                                                   |
-| `mcp/list` `mode:"status"` (`index.ts:686-723`)                                                                                                                                                                                                                                                                                                                 | Status without connecting: per-server `{status, transport, toolCount, failureKind(19-value enum), authorization{authorizationUrl}}`                       | Not used; editor MCP health panel + OAuth start URL without new transport                                                                                                                                                                                                                                       |
-| `process/childProcesses` (3.12.3)                                                                                                                                                                                                                                                                                                                               | List a session's child processes (`{pid, serverName, mcpSource, pluginName?}`, pure memory)                                                               | Not used; potentially useful for background-task diagnostics                                                                                                                                                                                                                                                    |
-| `skills/referenceCatalog`, `plugins/referenceCatalog[WithCategory]` (categorized variant new in 0.16.9)                                                                                                                                                                                                                                                         | Session-scoped FROZEN catalogs — the authoritative per-session view vs the bridge's live disk reads                                                       | Not used; fixes the stale-catalog class of bug (backend freezes discovery at session start)                                                                                                                                                                                                                     |
-| `workspace/readPresentation` (3.12.3)                                                                                                                                                                                                                                                                                                                           | The backend's own view of workspace mode + slash-command list                                                                                             | Not used; cross-check the bridge's disk-based slash discovery for drift                                                                                                                                                                                                                                         |
-| `workflows/*` family (NEW 0.16.9: `list/get/updateMeta/delete/runs/move`, `index.ts:2685-2937, 3618-3625`)                                                                                                                                                                                                                                                      | Session-less management of saved dynamic workflows (`<cwd>/.zcode/workflows/`, project+global scopes), run history with `artifacts`, cross-cwd runs query | Not used; pairs with v4 commands `startSavedWorkflow` / `resumeWorkflowRun`                                                                                                                                                                                                                                     |
-| `provider/testModelConnectivity` (3.12.3)                                                                                                                                                                                                                                                                                                                       | Probe a provider/model endpoint                                                                                                                           | Not used; model availability comes from the `session/create` response                                                                                                                                                                                                                                           |
-| `runtime/capabilities` (3.12.3; returns `{independentPlanState:true}`)                                                                                                                                                                                                                                                                                          | Trivial capability handshake                                                                                                                              | Not used; cheap preflight for a `zcode-acp doctor` command                                                                                                                                                                                                                                                      |
-| `interaction/providerRuntimeHeadersCancelled` notification (`index.ts:336, 2396-2406`)                                                                                                                                                                                                                                                                          | Backend cancels a pending runtime-headers refresh (workspace/session/requestId scoped)                                                                    | Not handled; drop pending answerers immediately on turn cancel instead of waiting them out                                                                                                                                                                                                                      |
-| `workspace/generateText` / `workspace/cancelGenerateText` (0.16.5)                                                                                                                                                                                                                                                                                              | Workspace-scoped one-shot text generation                                                                                                                 | Not used; no ACP counterpart                                                                                                                                                                                                                                                                                    |
-| `workspace/updateInteractionPreferences` / `workspace/updateModelIoPreferences`                                                                                                                                                                                                                                                                                 | Client preference updates                                                                                                                                 | Not used                                                                                                                                                                                                                                                                                                        |
-| `offPeak/{create,list}`, `workspace/updateOffPeakToolPolicy` (3.12.3)                                                                                                                                                                                                                                                                                           | Off-peak (discounted-hours) task family                                                                                                                   | Not used; `session/send` carries the matching `offPeakTaskId`/`offPeakRunType` params — candidate if a client wants to schedule discounted-hours runs. Off-peak tools are fail-closed at the protocol layer with three unlock channels (per-session param OR'd, process policy method, `offPeakPort` injection) |
-| `automation/{create,update,list,delete,checkTaskBinding}` (3.12.3)                                                                                                                                                                                                                                                                                              | Scheduled (cron) task family — served by the host over `automation/*` requests                                                                            | Not planned (see below)                                                                                                                                                                                                                                                                                         |
-| `plugins/{list,setEnabled,overview,install,uninstall,update,cancelOperation,restoreBuiltin,configure,resetConfig,validate,describe}` + `plugins/marketplace/{add,remove,update}` (3.12.3)                                                                                                                                                                       | Full plugin management + marketplace family                                                                                                               | Not used — **compat watchpoint**: if upstream moves plugin distribution to the marketplace, the bridge's disk-based discovery (`config/plugin-commands.ts`) may go stale                                                                                                                                        |
+| Method                                                                                                                                                                                                                                                                                                                                                          | Purpose                                                                                                                                                   | Current bridge behavior                                                                                                                                                                                                                                                                                                                |
+| --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `session/subagents` (`index.ts:1520-1618`)                                                                                                                                                                                                                                                                                                                      | Sub-agent states: `running{status: running\|waiting\|blocked}`, `ended{total, items[{status: success\|failed\|cancelled\|lost}], nextCursor}`             | Sub-agent info is parsed from the `Agent` tool result (`_meta.subagent`); the RPC adds waiting/blocked/lost states for stuck-subagent detection (pairs with the watermark liveness logic in `runEventTurn`)                                                                                                                            |
+| `session/events` (`{sessionId, afterSeq?, limit?}`, `index.ts:1667-1674`)                                                                                                                                                                                                                                                                                       | Pull-mode event history                                                                                                                                   | Not used; gap-fill after the drain gate's close-escalation reload (re-subscribe + replay only the missed window), durable audit for `/debug`                                                                                                                                                                                           |
+| `session/subscribe` `afterSeq` + `includeSnapshot` (`index.ts:1496-1513`)                                                                                                                                                                                                                                                                                       | Resume the event stream from a seq watermark, optionally with a full state snapshot                                                                       | Not used; crash-safe resubscribe instead of full replay                                                                                                                                                                                                                                                                                |
+| `session/usage` / `v4/conversation/usage`                                                                                                                                                                                                                                                                                                                       | Per-session cumulative usage: input/output/reasoning/cache tokens, `modelRequestCount`, `modelErrorCount` (`index.ts:1627-1646`)                          | Per-turn billing usage is now carried on the ACP `session/prompt` result (`usage` + `_meta.zcode.usage`), sourced from `turn.completed`; this RPC remains a candidate for session-cumulative reconciliation (deprecated upstream, see table above)                                                                                     |
+| `session/compact` `instructions` + `result.compact` (`index.ts:1829-1853`)                                                                                                                                                                                                                                                                                      | Custom compact instructions; result acks `{state: accepted\|already_running, inputId?, operationId?}`                                                     | Not forwarded — `/compact <focus>` could pass instructions; the backend's own `already_running` ack can backstop the bridge's `autoCompactInFlight` single-flight                                                                                                                                                                      |
+| `session/debug` (`index.ts:3571`, `bootstrap/src/zcode-protocol/session-debug.ts`)                                                                                                                                                                                                                                                                              | Per-session debug snapshot accumulated from the live event stream                                                                                         | Not used; `zcode-acp` diagnostics command / `/debug` extension                                                                                                                                                                                                                                                                         |
+| `session/list` rich params (`sessionIds` incl. hidden, `includeArchived`, `limit`, `index.ts:1600-1609`)                                                                                                                                                                                                                                                        | Explicit identity lookup, archived sessions                                                                                                               | Not used                                                                                                                                                                                                                                                                                                                               |
+| `session/create` extras: `toolAllowlist`/`toolDenylist` (per-session tool face — could move Cron* hiding off process-wide `--disallowed-tools`), `importedHistory` (claudeCode / sharedContext+sha256 provenance), `persistence:"immediate"\|"deferred"`, `titleGenerationEnabled:false` (bridge sets its own titles), `parentSessionId` (`index.ts:1558-1580`) | Session-creation knobs                                                                                                                                    | `toolDenylist` **WIRED (2026-10-26, #340)** on create AND every resume site (`toolDenylistParam`, handlers/session.ts) — see alignment item 10 below. `toolAllowlist`, `importedHistory`, `persistence`, `titleGenerationEnabled`, `parentSessionId` still not forwarded                                                               |
+| `mcp/list` `mode:"status"` (`index.ts:686-723`)                                                                                                                                                                                                                                                                                                                 | Status without connecting: per-server `{status, transport, toolCount, failureKind(19-value enum), authorization{authorizationUrl}}`                       | Not used; editor MCP health panel + OAuth start URL without new transport                                                                                                                                                                                                                                                              |
+| `process/childProcesses` (3.12.3)                                                                                                                                                                                                                                                                                                                               | List a session's child processes (`{pid, serverName, mcpSource, pluginName?}`, pure memory)                                                               | Not used; potentially useful for background-task diagnostics                                                                                                                                                                                                                                                                           |
+| `skills/referenceCatalog`, `plugins/referenceCatalog[WithCategory]` (categorized variant new in 0.16.9)                                                                                                                                                                                                                                                         | Session-scoped FROZEN catalogs — the authoritative per-session view vs the bridge's live disk reads                                                       | Not used; fixes the stale-catalog class of bug (backend freezes discovery at session start)                                                                                                                                                                                                                                            |
+| `workspace/readPresentation` (3.12.3)                                                                                                                                                                                                                                                                                                                           | The backend's own view of workspace mode + slash-command list                                                                                             | Not used; cross-check the bridge's disk-based slash discovery for drift                                                                                                                                                                                                                                                                |
+| `workflows/*` family (NEW 0.16.9: `list/get/updateMeta/delete/runs/move`, `index.ts:2685-2937, 3618-3625`)                                                                                                                                                                                                                                                      | Session-less management of saved dynamic workflows (`<cwd>/.zcode/workflows/`, project+global scopes), run history with `artifacts`, cross-cwd runs query | **WIRED (2026-09-24, ADR-0029)**: proxied under `/settings/workflows*` + the local `/workflows` slash listing; availability is the remote `/client/configs` verdict (`src/config/workflow-gate.ts`), and `v4/command startSavedWorkflow`/`resumeWorkflowRun` + the `workflowRun*` queries are wired with it (see the v4 section below) |
+| `provider/testModelConnectivity` (3.12.3)                                                                                                                                                                                                                                                                                                                       | Probe a provider/model endpoint                                                                                                                           | Not used; model availability comes from the `session/create` response                                                                                                                                                                                                                                                                  |
+| `runtime/capabilities` (3.12.3; returns `{independentPlanState:true}`)                                                                                                                                                                                                                                                                                          | Trivial capability handshake                                                                                                                              | Not used; cheap preflight for a `zcode-acp doctor` command                                                                                                                                                                                                                                                                             |
+| `interaction/providerRuntimeHeadersCancelled` notification (`index.ts:336, 2396-2406`)                                                                                                                                                                                                                                                                          | Backend cancels a pending runtime-headers refresh (workspace/session/requestId scoped)                                                                    | Not handled; drop pending answerers immediately on turn cancel instead of waiting them out                                                                                                                                                                                                                                             |
+| `workspace/generateText` / `workspace/cancelGenerateText` (0.16.5)                                                                                                                                                                                                                                                                                              | Workspace-scoped one-shot text generation                                                                                                                 | Not used; no ACP counterpart                                                                                                                                                                                                                                                                                                           |
+| `workspace/updateInteractionPreferences` / `workspace/updateModelIoPreferences`                                                                                                                                                                                                                                                                                 | Client preference updates                                                                                                                                 | Not used                                                                                                                                                                                                                                                                                                                               |
+| `offPeak/{create,list}`, `workspace/updateOffPeakToolPolicy` (3.12.3)                                                                                                                                                                                                                                                                                           | Off-peak (discounted-hours) task family                                                                                                                   | Not used; `session/send` carries the matching `offPeakTaskId`/`offPeakRunType` params — candidate if a client wants to schedule discounted-hours runs. Off-peak tools are fail-closed at the protocol layer with three unlock channels (per-session param OR'd, process policy method, `offPeakPort` injection)                        |
+| `automation/{create,update,list,delete,checkTaskBinding}` (3.12.3)                                                                                                                                                                                                                                                                                              | Scheduled (cron) task family — served by the host over `automation/*` requests                                                                            | Not planned (see below)                                                                                                                                                                                                                                                                                                                |
+| `plugins/{list,setEnabled,overview,install,uninstall,update,cancelOperation,restoreBuiltin,configure,resetConfig,validate,describe}` + `plugins/marketplace/{add,remove,update}` (3.12.3)                                                                                                                                                                       | Full plugin management + marketplace family                                                                                                               | Not used — **compat watchpoint**: if upstream moves plugin distribution to the marketplace, the bridge's disk-based discovery (`config/plugin-commands.ts`) may go stale                                                                                                                                                               |
 
 ### `session/send` params (0.16.9-verified, `index.ts:1730-1768`)
 
@@ -212,7 +366,12 @@ Topic model (`transport.ts:83-161`): subscribe with
 toSeq]` deltas — the watermark/CAS vocabulary row-targeting commands require
 (`baseRevision` + `baseLogEpoch`, `command.ts:293-317`).
 
-The bridge already speaks `v4/command` (the dual stop). Its payload union
+The bridge already speaks `v4/command` (the dual stop), and since 2026-09-24
+also `startSavedWorkflow` / `resumeWorkflowRun` (Settings API launch routes,
+ADR-0029 — the ack is terminal, awaited via `request()`) plus the seven
+`v4/conversation/workflowRun*` read queries (run progress poller + run-detail
+routes). The launch consent is the API call itself (upstream skips the
+permission popup for hub clicks). Its payload union
 (`command.ts:43-244`) is a single-method stepping stone to
 rewind/edit-turn/feedback/queue UX over ACP without implementing the v4
 subscription mesh: `sendText (requestedDelivery startNow|queue|guide,
@@ -251,8 +410,9 @@ CronUpdate/CronDelete` whenever an `automationPort` is injected
 (`core/src/runtime/helpers/runtime-tools.ts:66`), and the legacy protocol
 server injects one for every session create
 (`server-operations.ts:3370`) — so the backend ALWAYS registers them in
-app-server mode. Opting out is entirely the bridge's `--disallowed-tools`
-(or per-session `toolDenylist`). Bonus:
+app-server mode. Opting out is entirely the bridge's per-session
+`toolDenylist` on create/resume (the `--disallowed-tools` argv flag is parsed
+but NOT consumed on the app-server path — #340, alignment item 10). Bonus:
 `AUTOMATION_MUTATION_TOOL_NAMES = [CronCreate, CronUpdate, CronDelete]` gets
 special turn-loop treatment (`turn-loop-state.ts:23`).
 
@@ -318,9 +478,31 @@ failureKind`, OAuth `authorizationUrl` indented beneath its server; any
    messageId): success renders prompt-cache stats (`cache N/M messages ·
 cache-read tokens`), non-success resultTypes surface verbatim as a
    warning line. Regression tests: `tests/turn-info-line.test.ts`.
-10. **Per-session `toolDenylist` at create/resume** — move Cron* hiding off
-    process-wide `--disallowed-tools`; note a resume WITHOUT the lists drops
-    the tool face on cold recovery. PENDING.
+10. ~~**Per-session `toolDenylist` at create/resume**~~ **WIRED (2026-10-26,
+    #340)** — the merged `ZCODE_DISALLOWED_TOOLS` + Cron* default list rides
+    session/create and every session/resume site as `toolDenylist`
+    (`toolDenylistParam`, handlers/session.ts; the array form is
+    `disallowedToolList` in backend/resolve.ts). Root cause from source: the
+    app-server command path PARSES `--disallowed-tools` but never consumes it
+    (`cli/src/run.ts` hands `toolDisallowlist` to `runPrompt`/`runTuiCommand`
+    only; `runZCodeProtocolCommand` takes none), so the argv flag the bridge
+    had passed since #190 was a no-op and every "disallowed" tool reached the
+    model. The backend projects the param onto
+    `runtimeConfig.toolDisallowlist` (`server-operations.ts` createRecord,
+    shared by create and resume — a registry-level removal). Compat: a
+    pre-toolDenylist strict schema rejects the key → drop + one retry, verdict
+    pinned per backend generation (`server.toolDenylistRejected`, reset on
+    respawn), warned once. The argv flag stays (harmless; a future CLI may
+    wire it). NOT sent on session/send: the per-turn list is a
+    provider-visibility hint only, and a turn list holding every Cron
+    mutation tool is upstream's "automation turn" signal
+    (`isAutomationMutationRestrictedTurn`) which ordinary prompts must not
+    spoof. Residual: `session/fork` has no tool-face field and
+    `registerForkedSession`'s `inherit` copies memory/toolSearch/shell but
+    NOT the tool lists, so a fork runs without the policy until its next
+    resume (upstream gap, also hits the desktop). `toolAllowlist` (an
+    allow-list env var) is a reasonable follow-up — same two sites,
+    `session/send` rejects it. Regression tests: `tests/tool-denylist.test.ts`.
 11. **v4/command channel** as the single implementation surface for
     rewind/edit/feedback/queue UX later. PENDING.
 

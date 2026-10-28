@@ -16,6 +16,7 @@
 import { basename } from "node:path";
 import process from "node:process";
 
+import { runAccountSetup } from "./account-setup.js";
 import { main as runHub } from "./bin/hub.js";
 import { main as runQuota } from "./bin/quota.js";
 import { main as runServer, runHeadless } from "./index.js";
@@ -29,6 +30,7 @@ export type Invocation =
   | { kind: "serve" }
   | { kind: "hub" }
   | { kind: "quota"; args: string[] }
+  | { kind: "setup"; args: string[] }
   | { kind: "unknown"; sub: string };
 
 /**
@@ -40,7 +42,16 @@ export type Invocation =
  * `zcode-acp`/`cli.js` entrypoint, bare invocation starts the same stdio
  * server so editor shims and direct CLI runs keep working.
  */
-const SERVER_BIN_SUBCOMMANDS = new Set(["server", "serve", "hub", "quota", "-h", "--help", "help"]);
+const SERVER_BIN_SUBCOMMANDS = new Set([
+  "server",
+  "serve",
+  "hub",
+  "quota",
+  "setup",
+  "-h",
+  "--help",
+  "help",
+]);
 
 export function resolveInvocation(invokedAs: string, argv: readonly string[]): Invocation {
   if (invokedAs === "zcode-acp-server") {
@@ -61,6 +72,8 @@ export function resolveInvocation(invokedAs: string, argv: readonly string[]): I
       return { kind: "serve" };
     case "hub":
       return { kind: "hub" };
+    case "setup":
+      return { kind: "setup", args: argv.slice(1) };
     case "quota":
       return { kind: "quota", args: argv.slice(1) };
     default:
@@ -77,6 +90,8 @@ Commands:
   (none) | server    The editor-facing ACP bridge over stdio (was
                       zcode-acp-server; editors normally launch it via the
                       acp-extension-zcode bin without this subcommand).
+  setup --provider zai|bigmodel
+                    Save an individual Coding Plan API key (hidden terminal input).
   quota [args...]   Plan usage cards (was the zcode-quota bin): -w watch,
                     -i <sec>, -d detail, -p plain, provider glm|go.
   hub               Run the remote-access hub daemon (was zcode-acp-hub;
@@ -102,7 +117,7 @@ async function main(): Promise<void> {
   // Long-running surfaces hand over to `bun --smol` when available (idle RSS
   // ~47 MB vs ~81 MB on Node); the instant paths (help/version/unknown) skip
   // the re-exec hop entirely.
-  if (invocation.kind !== "help" && invocation.kind !== "unknown") {
+  if (invocation.kind !== "help" && invocation.kind !== "unknown" && invocation.kind !== "setup") {
     if (await reexecToBunIfEligible(process.argv[1] ?? "", process.argv.slice(2))) return;
   }
   switch (invocation.kind) {
@@ -117,6 +132,9 @@ async function main(): Promise<void> {
       return;
     case "hub":
       await runHub();
+      return;
+    case "setup":
+      await runAccountSetup(invocation.args);
       return;
     case "quota":
       await runQuota(invocation.args);

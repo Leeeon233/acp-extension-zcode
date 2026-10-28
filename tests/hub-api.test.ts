@@ -28,6 +28,34 @@ vi.mock("../src/quota/index.js", () => ({ queryQuota: queryQuotaMock }));
 const { queryOcUsageMock } = vi.hoisted(() => ({ queryOcUsageMock: vi.fn() }));
 vi.mock("../src/quota/ollama-cloud/index.js", () => ({ queryOcUsage: queryOcUsageMock }));
 
+// CLIProxy dock segment — same isolation: an inherited config or env pair
+// must not reach the remote relay from tests.
+const { queryCpUsageMock } = vi.hoisted(() => ({ queryCpUsageMock: vi.fn() }));
+vi.mock("../src/quota/cliproxy/index.js", () => ({ queryCpUsage: queryCpUsageMock }));
+
+// tasks-index surface the delete routes consult. Defaults mirror the real
+// module under a hermetic HOME (no index): no known workspaces, nothing
+// deleted — existing tests behave exactly as before.
+const tasksIndexMock = vi.hoisted(() => ({
+  workspaces: [] as Array<{ workspacePath: string; sessions: number; lastActive: number }>,
+  deletedSids: new Set<string>(),
+  workspaceDeletes: [] as Array<{ workspacePath: string; dbPath?: string }>,
+}));
+vi.mock("../src/tasks-index.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../src/tasks-index.js")>();
+  return {
+    ...actual,
+    listKnownWorkspaces: async () => tasksIndexMock.workspaces,
+    isTaskDeleted: async (taskId: string) => tasksIndexMock.deletedSids.has(taskId),
+    softDeleteWorkspaceTasks: async (workspacePath: string, dbPath?: string) => {
+      tasksIndexMock.workspaceDeletes.push({ workspacePath, dbPath });
+      return tasksIndexMock.workspaces
+        .filter((w) => w.workspacePath === workspacePath)
+        .reduce((n, w) => n + w.sessions, 0);
+    },
+  };
+});
+
 import {
   resetDockCacheForTest,
   resetQuotaCacheForTest,
@@ -37,6 +65,16 @@ import {
 
 const TOKEN = "test-hub-token";
 const BASE_PORT = 18400; // bridge ports start here; ephemeral hub uses port 0
+
+// This file spawns real child processes and binds real ports, and the shutdown
+// tests wait on SIGTERM'd children to actually exit. Under full-suite parallel
+// load that scheduling can outrun vitest's 5s default, and an inner withTimeout
+// equal to the outer budget can never win against it — the failure then blames
+// the inner step instead of the load.
+vi.setConfig({ testTimeout: 20_000 });
+
+/** Inner wait budget: the same 20s as the file timeout, so it can fire first. */
+const STEP_MS = 20_000;
 
 const cleanups: Array<() => Promise<void> | void> = [];
 
@@ -174,6 +212,37 @@ describe("hub discovery API", () => {
     });
     expect(badPayload.status).toBe(400);
     expect((await listInstances(hub)).status === 200).toBe(true);
+  });
+
+  it("takes the registrant's own startedAt over its own clock", async () => {
+    // The tie-break that decides which bridge wins a shared session ranks by
+    // start time. Stamping the hub's `Date.now()` at first register instead
+    // would rank by when the register ARRIVED, and a bridge whose cold start
+    // was slow (provider sync) would beat one that really started later — the
+    // wrong bridge wins and clients attach where nothing is live.
+    const hub = await startTestHub();
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ startedAt: 1_700_000_000_000 })),
+    });
+    expect(res.status).toBe(200);
+    const list = (await (await listInstances(hub)).json()) as Array<{ startedAt: number }>;
+    expect(list[0]!.startedAt).toBe(1_700_000_000_000);
+  });
+
+  it("falls back to its own clock when the register omits startedAt", async () => {
+    // Older bridges never sent it; the entry still needs a usable timestamp.
+    const hub = await startTestHub();
+    const before = Date.now();
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody()),
+    });
+    expect(res.status).toBe(200);
+    const list = (await (await listInstances(hub)).json()) as Array<{ startedAt: number }>;
+    expect(list[0]!.startedAt).toBeGreaterThanOrEqual(before);
   });
 
   it("preserves startedAt across heartbeats and removes on unregister", async () => {
@@ -374,6 +443,8 @@ describe("hub quota dock endpoint", () => {
     queryQuotaMock.mockReset();
     queryOcUsageMock.mockReset();
     queryOcUsageMock.mockResolvedValue({ kind: "not_configured" });
+    queryCpUsageMock.mockReset();
+    queryCpUsageMock.mockResolvedValue({ result: { kind: "not_configured" }, otherCount: 0 });
     resetDockCacheForTest();
   });
 
@@ -399,6 +470,38 @@ describe("hub quota dock endpoint", () => {
     const body = (await res.json()) as { formatted: string | null; fetchedAt: number };
     expect(body.formatted).toBe("45% · 12%");
     expect(body.fetchedAt).toBeGreaterThan(0);
+  });
+
+  it("appends the CLIProxy segment (tightest model) to the dock", async () => {
+    const hub = await startTestHub();
+    queryQuotaMock.mockResolvedValueOnce({
+      kind: "success",
+      level: "pro",
+      items: [{ key: "token_5h", label: "5h", usedPercent: 45, leftPercent: 55 }],
+    });
+    const resetAt = Date.now() + 3_600_000;
+    queryCpUsageMock.mockResolvedValueOnce({
+      result: {
+        kind: "success",
+        fetchedAt: Date.now(),
+        accounts: [
+          {
+            label: "will",
+            provider: "antigravity",
+            models: [
+              { name: "Gemini Models", windows: [{ window: "week", used: 0.634, resetAt }] },
+            ],
+          },
+        ],
+      },
+      otherCount: 1,
+    });
+    const res = await fetch(dockUrl(hub), { headers: { Authorization: `Bearer ${TOKEN}` } });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { formatted: string | null };
+    const d = new Date(resetAt);
+    const date = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+    expect(body.formatted).toBe(`45% · cp 63.4% ${date}`);
   });
 
   it("serves the cached copy within the TTL", async () => {
@@ -662,6 +765,112 @@ describe("hub session rename proxy", () => {
   });
 });
 
+describe("hub project/session delete", () => {
+  /** Register a bridge under the canonical test instance id. */
+  async function registerBridge(hub: HubHandle, port: number): Promise<void> {
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(registerBody({ port })),
+    });
+    expect(res.status).toBe(200);
+  }
+
+  beforeEach(() => {
+    tasksIndexMock.workspaces = [];
+    tasksIndexMock.deletedSids = new Set();
+    tasksIndexMock.workspaceDeletes = [];
+  });
+
+  describe("POST /api/projects/delete", () => {
+    it("tombstones the workspace's rows and reports the flipped count", async () => {
+      tasksIndexMock.workspaces = [
+        { workspacePath: "/proj/a", sessions: 3, lastActive: 900 },
+        { workspacePath: "/proj/b", sessions: 1, lastActive: 100 },
+      ];
+      const hub = await startTestHub();
+      const res = await fetch(`http://127.0.0.1:${hub.port}/api/projects/delete`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ workspacePath: "/proj/a" }),
+      });
+      expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toEqual({ ok: true, deletedTasks: 3 });
+      expect(tasksIndexMock.workspaceDeletes).toEqual([
+        { workspacePath: "/proj/a", dbPath: undefined },
+      ]);
+    });
+
+    it("is idempotent — an unknown/already-deleted project still answers ok", async () => {
+      const hub = await startTestHub();
+      const res = await fetch(`http://127.0.0.1:${hub.port}/api/projects/delete`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ workspacePath: "/proj/never" }),
+      });
+      expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toEqual({ ok: true, deletedTasks: 0 });
+    });
+
+    it("guards auth and body shape", async () => {
+      const hub = await startTestHub();
+      const call = (token: string | null, body?: unknown) =>
+        fetch(`http://127.0.0.1:${hub.port}/api/projects/delete`, {
+          method: "POST",
+          ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
+          ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+        });
+      expect((await call(null)).status).toBe(401);
+      expect((await call("wrong")).status).toBe(401);
+      expect((await call(TOKEN)).status).toBe(400); // no body
+      expect((await call(TOKEN, {})).status).toBe(400); // no workspacePath
+      expect(tasksIndexMock.workspaceDeletes).toEqual([]);
+    });
+  });
+
+  it("refuses to resume a tombstoned session (404, before any incubation)", async () => {
+    tasksIndexMock.workspaces = [{ workspacePath: "/proj/a", sessions: 1, lastActive: 1 }];
+    tasksIndexMock.deletedSids.add("sess_deleted");
+    const hub = await startTestHub();
+    const res = await fetch(`http://127.0.0.1:${hub.port}/api/instances`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ workspacePath: "/proj/a", sessionId: "sess_deleted" }),
+    });
+    expect(res.status).toBe(404);
+    expect(await res.text()).toBe("session deleted");
+  });
+
+  it("relays the session delete POST to the bridge's loopback route", async () => {
+    const seen: string[] = [];
+    const bridge = track(
+      await new Promise<{ server: Server; port: number }>((resolve) => {
+        const server = createServer((req, res) => {
+          seen.push(`${req.method} ${req.url ?? ""}`);
+          req.resume();
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end('{"ok":true,"deleted":true}');
+        });
+        server.listen(0, "127.0.0.1", () => {
+          const addr = server.address();
+          resolve({ server, port: typeof addr === "object" && addr ? addr.port : 0 });
+        });
+      }),
+      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+    );
+    const hub = await startTestHub();
+    await registerBridge(hub, bridge.port);
+
+    const res = await fetch(
+      `http://127.0.0.1:${hub.port}/api/instances/inst-1/sessions/s1/delete`,
+      { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } },
+    );
+    expect(res.status).toBe(200);
+    await expect(res.json()).resolves.toEqual({ ok: true, deleted: true });
+    expect(seen).toEqual(["POST /sessions/s1/delete"]);
+  });
+});
+
 describe("hub backend restart proxy", () => {
   /** Register a bridge under the canonical test instance id. */
   async function registerBridge(hub: HubHandle, port: number): Promise<void> {
@@ -843,16 +1052,18 @@ describe("hub instance shutdown", () => {
     const { child, pid } = await startDummyBridge();
     await registerInstance(hub, pid, { origin: "serve" });
 
+    // Attach the listener BEFORE the kill: SIGTERM lands in ~0ms, so an
+    // `await shutdown()` first would let the dummy die and replay nothing for a
+    // late `once("exit")` — the test then hangs until timeout even though the
+    // shutdown worked exactly as intended.
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+
     const res = await shutdown(hub);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true });
 
     // SIGTERM'd → the process exits and the instance leaves the registry.
-    await withTimeout(
-      new Promise<void>((resolve) => child.once("exit", () => resolve())),
-      5000,
-      "dummy bridge exit",
-    );
+    await withTimeout(exited, STEP_MS, "dummy bridge exit");
     const list = await (await listInstances(hub)).json();
     expect(list).toHaveLength(0);
   });
@@ -893,24 +1104,24 @@ describe("hub instance shutdown", () => {
     const res = await shutdown(hub);
     expect(res.status).toBe(200);
 
-    await withTimeout(cliExited, 5000, "tui cli exit");
-    await withTimeout(bridgeExited, 5000, "bridge exit");
+    await withTimeout(cliExited, STEP_MS, "tui cli exit");
+    await withTimeout(bridgeExited, STEP_MS, "bridge exit");
     const list = await (await listInstances(hub)).json();
     expect(list).toHaveLength(0);
-  }, 15_000);
+  });
 
   it("kills an editor-origin bridge that carries an incubation nonce", async () => {
     const hub = await startTestHub();
     const { child, pid } = await startDummyBridge();
     await registerInstance(hub, pid, { origin: "editor", nonce: "nonce-1" });
 
+    // Before the kill, for the same reason as the serve-origin case above: a
+    // late `once("exit")` misses an event the kernel already delivered.
+    const exited = new Promise<void>((resolve) => child.once("exit", () => resolve()));
+
     expect((await shutdown(hub)).status).toBe(200);
-    await withTimeout(
-      new Promise<void>((resolve) => child.once("exit", () => resolve())),
-      5000,
-      "dummy bridge exit",
-    );
-  }, 15_000);
+    await withTimeout(exited, STEP_MS, "dummy bridge exit");
+  });
 
   it("refuses an editor-origin bridge without a nonce (403)", async () => {
     const hub = await startTestHub();

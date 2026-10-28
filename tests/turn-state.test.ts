@@ -1,8 +1,13 @@
 /**
- * Tests for the `$/zcode/turnState` out-of-band running indicator emitted by
+ * Tests for the turn-state out-of-band running indicator emitted by
  * prompt(): running:true when a turn starts, running:false when it ends, and
  * running:true from a preempted turn's finally while the preempting turn is
  * still in flight.
+ *
+ * The indicator is dual-emitted (#311): the deprecated `$/zcode/turnState`
+ * (LSP-style) and the spec-compliant `_zcode/turnState` — every transition
+ * must arrive identically on BOTH names so old and new consumers coexist
+ * during the migration window.
  *
  * The fake backend drives prompt() end-to-end: `session/send` accepts the
  * prompt and synchronously delivers scripted events to every registered
@@ -10,33 +15,48 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
+import { readdir } from "node:fs/promises";
+import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeEvent } from "../src/backend/types.js";
 import { prompt } from "../src/handlers/session.js";
 import { ZcodeAcpServer } from "../src/server.js";
+import { zcodeHomeDir } from "../src/utils.js";
 
 vi.mock("../src/tasks-index.js", () => ({
   upsertSessionTask: async () => true,
   updateSessionTitle: async () => true,
 }));
 
-/** cx that records every $/zcode/turnState notification payload. */
-function collectCx(): {
+type TurnStatePayload = { sessionId: string; running: boolean };
+
+/** cx that records every turnState notification payload, per method name.
+ * Registering it on the server mirrors production (every connection lives in
+ * the ClientRegistry) — the lifecycle transitions broadcast to the registry,
+ * not to the prompt() argument. */
+function collectCx(server?: ZcodeAcpServer): {
   cx: acp.AgentContext;
-  turnStates: Array<{ sessionId: string; running: boolean }>;
+  /** Deprecated `$/zcode/turnState` payloads. */
+  turnStates: TurnStatePayload[];
+  /** Spec-compliant `_zcode/turnState` payloads (#311). */
+  turnStatesV2: TurnStatePayload[];
 } {
-  const turnStates: Array<{ sessionId: string; running: boolean }> = [];
+  const turnStates: TurnStatePayload[] = [];
+  const turnStatesV2: TurnStatePayload[] = [];
   const cx = {
     notify: async (method: string, params: Record<string, unknown>) => {
       if (method === "$/zcode/turnState") {
-        turnStates.push(params as { sessionId: string; running: boolean });
+        turnStates.push(params as TurnStatePayload);
+      } else if (method === "_zcode/turnState") {
+        turnStatesV2.push(params as TurnStatePayload);
       }
     },
     request: async () => ({}),
   } as unknown as acp.AgentContext;
-  return { cx, turnStates };
+  if (server) server.clients.add(cx);
+  return { cx, turnStates, turnStatesV2 };
 }
 
 /** Fake backend whose session/send delivers `events()` to all listeners. */
@@ -87,6 +107,135 @@ function promptParams(): acp.PromptRequest {
 }
 
 describe("$/zcode/turnState emission", () => {
+  it("forwards exact embedded PDF bytes through prompt to native session/send", async () => {
+    const backend = scriptedBackend(() => [
+      { type: "turn.completed", payload: { resultType: "success" } },
+    ]);
+    const request = vi.spyOn(backend, "request");
+    const server = setup(backend);
+    const { cx } = collectCx();
+    const data = Buffer.from("synthetic PDF payload").toString("base64");
+    const result = await prompt(
+      server,
+      {
+        sessionId: "sess_ts",
+        prompt: [
+          { type: "text", text: "inspect" },
+          {
+            type: "resource",
+            resource: {
+              uri: "file:///does-not-exist/paper.pdf",
+              mimeType: "application/pdf",
+              blob: data,
+            },
+          },
+        ],
+      },
+      cx,
+      99,
+    );
+    expect(result.stopReason).toBe("end_turn");
+    const sent = request.mock.calls.find((call) => call[1] === "session/send");
+    expect(sent?.[2]).toEqual({
+      sessionId: "zs_ts",
+      content: "inspect",
+      attachments: [
+        {
+          kind: "pdf",
+          filename: "paper.pdf",
+          mimeType: "application/pdf",
+          dataBase64: data,
+          sizeBytes: Buffer.byteLength("synthetic PDF payload"),
+        },
+      ],
+    });
+  });
+
+  it.each([
+    [{ type: "resource", resource: { uri: "memory://instructions", text: "/compact" } }],
+    [
+      { type: "text", text: "/compact" },
+      { type: "resource_link", name: "notes", uri: "file:///missing/notes.txt" },
+    ],
+  ] as acp.ContentBlock[][])(
+    "sends slash-like attached context to the model, not command handlers",
+    async (...blocks) => {
+      const backend = scriptedBackend(() => [
+        { type: "turn.completed", payload: { resultType: "success" } },
+      ]);
+      const request = vi.spyOn(backend, "request");
+      const { cx } = collectCx();
+      await prompt(setup(backend), { sessionId: "sess_ts", prompt: blocks }, cx, 101);
+      const sent = request.mock.calls.find((call) => call[1] === "session/send");
+      expect(sent).toBeDefined();
+      expect((sent?.[2] as { content: string }).content).not.toMatch(/^\//);
+      expect((sent?.[2] as { content: string }).content).toContain("/compact");
+      expect(request.mock.calls.some((call) => call[1] === "session/compact")).toBe(false);
+    },
+  );
+
+  it("rejects goal-loop binary prompts instead of parking text and dropping bytes", async () => {
+    const backend = scriptedBackend(() => []);
+    const request = vi.spyOn(backend, "request");
+    const server = setup(backend);
+    const parkPrompt = vi.fn();
+    server.goalLoops.set("zs_ts", { parkPrompt } as never);
+    const { cx } = collectCx();
+    await expect(
+      prompt(
+        server,
+        {
+          sessionId: "sess_ts",
+          prompt: [
+            {
+              type: "resource",
+              resource: {
+                uri: "memory://paper.pdf",
+                mimeType: "application/pdf",
+                blob: Buffer.from("synthetic").toString("base64"),
+              },
+            },
+          ],
+        },
+        cx,
+        100,
+      ),
+    ).rejects.toMatchObject({ code: -32602 });
+    expect(parkPrompt).not.toHaveBeenCalled();
+    expect(request.mock.calls.some((call) => call[1] === "session/send")).toBe(false);
+
+    // Review of #315: a STAGED (file-kind) binary rejected on this path must
+    // not leave an orphan behind in the no-GC attachment directory.
+    await expect(
+      prompt(
+        server,
+        {
+          sessionId: "sess_ts",
+          prompt: [
+            {
+              type: "resource",
+              resource: {
+                uri: "memory://orphan.bin",
+                mimeType: "application/octet-stream",
+                blob: Buffer.from("orphan-bytes").toString("base64"),
+              },
+            },
+          ],
+        },
+        cx,
+        101,
+      ),
+    ).rejects.toMatchObject({ code: -32602 });
+    const staging = join(zcodeHomeDir(), "v2", "acp-attachments");
+    let listed: string[] = [];
+    try {
+      listed = await readdir(staging);
+    } catch {
+      /* an absent directory is also clean */
+    }
+    expect(listed).toEqual([]);
+  });
+
   it("emits running:true at turn start and running:false at completion", async () => {
     const server = setup(
       scriptedBackend(() => [
@@ -98,12 +247,57 @@ describe("$/zcode/turnState emission", () => {
         { type: "turn.completed", payload: { resultType: "success" } },
       ]),
     );
-    const { cx, turnStates } = collectCx();
+    const { cx, turnStates } = collectCx(server);
 
     const result = await prompt(server, promptParams(), cx, 1);
 
     expect(result).toEqual({ stopReason: "end_turn" });
     expect(turnStates).toEqual([
+      { sessionId: "sess_ts", running: true },
+      { sessionId: "sess_ts", running: false },
+    ]);
+  });
+
+  it("dual-emits the spec-compliant _zcode/turnState identically (#311)", async () => {
+    // The `$/` spelling is the LSP convention — ACP reserves `_`-prefixed
+    // names for extension notifications, and strict routers (the Python
+    // agent-client-protocol library) error on it. Both names must carry the
+    // exact same transitions while consumers migrate.
+    const server = setup(
+      scriptedBackend(() => [
+        { type: "turn.started" },
+        { type: "turn.completed", payload: { resultType: "success" } },
+      ]),
+    );
+    const { cx, turnStates, turnStatesV2 } = collectCx(server);
+
+    await prompt(server, promptParams(), cx, 9);
+
+    expect(turnStatesV2).toEqual(turnStates);
+    expect(turnStatesV2).toEqual([
+      { sessionId: "sess_ts", running: true },
+      { sessionId: "sess_ts", running: false },
+    ]);
+  });
+
+  it("delivers the lifecycle to attach-only clients that never prompted", async () => {
+    // Regression (2026-10-21): the transitions were cx-targeted, so a second
+    // client attached to the session (desktop watching a mobile-driven turn)
+    // never saw running:false — its is_running stuck true and a force-sent
+    // queued prompt never flushed. The lifecycle must reach every registered
+    // client, not just the prompting connection.
+    const server = setup(
+      scriptedBackend(() => [
+        { type: "turn.started" },
+        { type: "turn.completed", payload: { resultType: "success" } },
+      ]),
+    );
+    const { cx } = collectCx(server);
+    const watcher = collectCx(server);
+
+    await prompt(server, promptParams(), cx, 11);
+
+    expect(watcher.turnStates).toEqual([
       { sessionId: "sess_ts", running: true },
       { sessionId: "sess_ts", running: false },
     ]);
@@ -118,7 +312,7 @@ describe("$/zcode/turnState emission", () => {
         ? { error: { code: -32000, message: "boom" } }
         : { result: {} };
     const server = setup(backend);
-    const { cx, turnStates } = collectCx();
+    const { cx, turnStates } = collectCx(server);
 
     await expect(prompt(server, promptParams(), cx, 2)).rejects.toThrow();
 
@@ -127,6 +321,21 @@ describe("$/zcode/turnState emission", () => {
       { sessionId: "sess_ts", running: false },
     ]);
     expect(server.pendingTurns.size).toBe(0);
+  });
+
+  it("emits running:false on an intercepted slash command", async () => {
+    const server = setup(scriptedBackend(() => []));
+    const { cx, turnStates } = collectCx();
+
+    const result = await prompt(
+      server,
+      { sessionId: "sess_ts", prompt: [{ type: "text", text: "/help" }] } as acp.PromptRequest,
+      cx,
+      1,
+    );
+
+    expect(result).toEqual({ stopReason: "end_turn" });
+    expect(turnStates).toEqual([{ sessionId: "sess_ts", running: false }]);
   });
 
   it("preserves a non-retryable model quota failure in the ACP error", async () => {
@@ -157,7 +366,7 @@ describe("$/zcode/turnState emission", () => {
         },
       ]),
     );
-    const { cx, turnStates } = collectCx();
+    const { cx, turnStates } = collectCx(server);
 
     const error = await prompt(server, promptParams(), cx, 3).then(
       () => null,
@@ -206,7 +415,7 @@ describe("$/zcode/turnState emission", () => {
         ];
       }),
     );
-    const { cx, turnStates } = collectCx();
+    const { cx, turnStates } = collectCx(server);
 
     const p1 = prompt(server, promptParams(), cx, 101);
     // Wait until turn 1 has been accepted and parked in its event loop (its
@@ -225,5 +434,108 @@ describe("$/zcode/turnState emission", () => {
       { sessionId: "sess_ts", running: true }, // turn 1 exits, still busy
       { sessionId: "sess_ts", running: false }, // turn 2 completes
     ]);
+  });
+});
+
+describe("backend-loaded stamp after backend-lost turns", () => {
+  it("a FAILED backend-lost recovery leaves no stamp — the respawned backend never loaded the session", async () => {
+    // Ghost-stamp regression (2026-10 review): the turn's finally used to
+    // stamp backend-loaded unconditionally. A backend dying mid-turn with a
+    // failed recovery (reload rejected on the fresh process) left a fresh
+    // stamp vouching for a session the NEW backend never loaded — every
+    // session/load in the TTL window then skipped the resume RPC and
+    // replayed empty.
+    const server = new ZcodeAcpServer();
+    const listeners: Array<{ handleEvent: (e: ZcodeEvent) => void }> = [];
+    // The respawned generation: answers the registry ping, refuses the reload.
+    const b2 = {
+      isDead: false,
+      request: async (_id: number, method: string) => {
+        if (method === "session/resume") {
+          return { error: { code: -32004, message: "Session is not active: zs_ts" } };
+        }
+        return { result: {} };
+      },
+      send: () => {},
+      pollServerRequests: () => [],
+      registerEventListener: () => {},
+      unregisterEventListener: () => {},
+    } as unknown as ZcodeBackend;
+    let flipped = false;
+    const b1 = {
+      isDead: false,
+      request: async (_id: number, method: string) => {
+        switch (method) {
+          case "workspace/updateProviderRegistry":
+          case "session/subscribe":
+            return { result: {} };
+          case "session/read":
+            return { result: { projection: { status: "idle", contextUsed: 0 }, settings: {} } };
+          case "session/messages":
+            return { result: { messages: [] } };
+          case "session/send": {
+            for (const e of [
+              { type: "turn.started" },
+              {
+                type: "turn.failed",
+                payload: {
+                  error: {
+                    code: "UNKNOWN_ERROR",
+                    message: "Turn execution failed",
+                    cause: { code: "ERR_INVALID_STATE", message: "database is not open" },
+                  },
+                },
+              },
+            ] as ZcodeEvent[]) {
+              for (const l of listeners) l.handleEvent(e);
+            }
+            // The process dies with the turn: by the time the recovery runs,
+            // the world has already moved to a respawned backend (stamps
+            // voided, exactly as ensureBackend's spawn branch does).
+            flipped = true;
+            b1.isDead = true;
+            server.backend = b2;
+            server.resetBackendGeneration();
+            return { result: { accepted: true } };
+          }
+          default:
+            return { result: {} };
+        }
+      },
+      send: () => {},
+      pollServerRequests: () => [],
+      registerEventListener: (_sid: string, l: { handleEvent: (e: ZcodeEvent) => void }) => {
+        listeners.push(l);
+      },
+      unregisterEventListener: (_sid: string, l: { handleEvent: (e: ZcodeEvent) => void }) => {
+        const i = listeners.indexOf(l);
+        if (i >= 0) listeners.splice(i, 1);
+      },
+    } as unknown as ZcodeBackend;
+    server.backend = b1;
+    server.registerSession("sess_ts", "zs_ts");
+    server.markBackendLoaded("sess_ts");
+    const { cx } = collectCx();
+
+    await expect(prompt(server, promptParams(), cx, 7)).rejects.toThrow();
+
+    expect(flipped).toBe(true);
+    // No ghost stamp: the load path must re-resume instead of replaying empty.
+    expect(server.isBackendSessionLive("sess_ts")).toBe(false);
+  });
+
+  it("a turn that runs to completion still refreshes the stamp", async () => {
+    const server = setup(
+      scriptedBackend(() => [
+        { type: "turn.started" },
+        { type: "turn.completed", payload: { resultType: "success" } },
+      ]),
+    );
+    const { cx } = collectCx();
+
+    const result = await prompt(server, promptParams(), cx, 8);
+
+    expect(result).toEqual({ stopReason: "end_turn" });
+    expect(server.isBackendSessionLive("sess_ts")).toBe(true);
   });
 });

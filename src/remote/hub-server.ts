@@ -51,7 +51,7 @@ import { EventEmitter } from "node:events";
 import net from "node:net";
 import path from "node:path";
 import process from "node:process";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import type { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
 
@@ -60,28 +60,41 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { resolveRuntime, runtimeSpawnParts } from "../runtime.js";
 import { sessionTabTitle } from "../terminal-title.js";
 import { AGENT_INFO, compareVersions, log, warn } from "../utils.js";
-import type { TerminalPrefs } from "../config/user-config.js";
+import { expandHomePath, type TerminalPrefs } from "../config/user-config.js";
 import { tuiStatsSegments } from "../config/settings.js";
 import { readCodeFingerprint } from "./code-fingerprint.js";
-import { remoteEnabledLive, remoteTerminalPrefs } from "./config.js";
+import { remoteEnabledLive, remoteProjectRoots, remoteTerminalPrefs } from "./config.js";
+import { envWithLoginShell } from "./login-shell-env.js";
 import { accountUsageStats, type UsageStatsResult } from "../handlers/account.js";
 import { BOOT_RESUME_TRIGGER } from "../handlers/session.js";
 import { createSettingsHandler } from "./settings-endpoint.js";
 import {
   composeQuotaDock,
+  formatCpDockSegment,
   formatGoDockSegment,
   formatOcDockSegment,
   formatQuotaDock,
 } from "../quota/format.js";
+import { queryCpUsage } from "../quota/cliproxy/index.js";
 import { queryQuota } from "../quota/index.js";
 import { queryOcUsage } from "../quota/ollama-cloud/index.js";
 import { queryGoUsage } from "../quota/opencode-go/index.js";
-import { listKnownWorkspaces } from "../tasks-index.js";
+import { isTaskDeleted, listKnownWorkspaces, softDeleteWorkspaceTasks } from "../tasks-index.js";
+import { buildWorkflowOverview } from "./workflow-overview.js";
+import { collectSystemStats } from "./system-stats.js";
 
 export interface HubOptions {
   port: number;
   host: string;
   token: string;
+  /**
+   * Absolute path of a web-client build (`dist/`) to serve same-origin: after
+   * every existing route, GET/HEAD paths resolve inside this tree (`/` →
+   * index.html; content-hashed `assets/` are immutable). Unset — or a
+   * missing/unreadable dir at startup (one warning, silent degradation) —
+   * disables the mount; static hits never extend the hub's idle lifetime.
+   */
+  webDir?: string;
   /** Registration TTL before an instance is pruned (default 30s). */
   heartbeatTimeoutMs?: number;
   /**
@@ -100,6 +113,11 @@ export interface HubOptions {
    * shrink it).
    */
   tuiRegisterTimeoutMs?: number;
+  /**
+   * How long after its last stamped HTTP call the desktop client still counts
+   * as present (default DESKTOP_PRESENCE_TTL_MS; tests shrink it).
+   */
+  desktopPresenceTtlMs?: number;
   /**
    * Fires when the hub decided it should restart onto newer on-disk code
    * (a newer bridge registered, or POST /api/upgrade found the dist newer).
@@ -209,6 +227,8 @@ interface InstanceEntry {
 const HEARTBEAT_TIMEOUT_MS = 30_000;
 const IDLE_EXIT_MS = 10 * 60_000;
 const PING_INTERVAL_MS = 30_000;
+/** Max subdirectory names per GET /api/fs/list before truncation. */
+const FS_LIST_LIMIT = 2000;
 /**
  * Per-instance TCP probe timeout for /api/instances?probe=1. Generous on
  * purpose: the bridge is single-threaded and a busy event loop (large payload
@@ -226,6 +246,19 @@ const PROBE_TIMEOUT_MS = 2_000;
  */
 const PROBE_GRACE_MS = 8_000;
 const MAX_BODY_BYTES = 1024 * 1024;
+/**
+ * Desktop Presence by recent request (amendment to ADR-0016): the desktop app
+ * polls GET /api/instances every 15s for its whole lifetime (DISCOVERY_REFRESH_MS
+ * in the app's runtime.rs), every call stamped with DESKTOP_CLIENT_HEADER. That
+ * poll is the one presence signal an IDLE desktop still emits: connection
+ * presence (`desktopPairs`) ends with the last proxied ACP connection, and a
+ * serve bridge self-exits once its last session closes — so a running desktop
+ * app with no open tab was invisible, and the next phone-originated
+ * create/resume opened a terminal window next to it. Three poll intervals of
+ * slack: the app schedules each poll AFTER the previous answer lands, so a
+ * slow hub stretches the gap past 15s.
+ */
+const DESKTOP_PRESENCE_TTL_MS = 45_000;
 
 /** Constant-time token compare (hash both to equal length first). */
 function tokenEquals(a: string, b: string): boolean {
@@ -242,9 +275,11 @@ function authorized(req: IncomingMessage, url: URL, token: string): boolean {
 }
 
 function setCors(res: ServerResponse): void {
-  // The web UI is deployed as a separate origin; the token is the boundary.
+  // The web UI is deployed either as a separate origin (Netlify/Cloudflare
+  // Pages) or same-origin from the hub's own static mount (remote.webDir);
+  // the token is the boundary in both shapes.
   res.setHeader("Access-Control-Allow-Origin", "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Authorization, Content-Type");
   // Custom response headers JS may read cross-origin; without this the file
   // viewer's line-window fetches cannot see X-Zcode-First-Line at all.
@@ -278,6 +313,125 @@ function canonicalPath(p: string): string {
   } catch {
     return p;
   }
+}
+
+/**
+ * Canonical spellings of the configured remote.projectRoots (config file >
+ * env, LIVE read per call — same convention as remoteEnabledLive). These
+ * widen the session-create whitelist beyond the known-project list to any
+ * subdirectory under a root, powering the mobile app's browse-and-create
+ * flow. Empty when unconfigured: the known list alone stays the whitelist.
+ */
+function projectRootsRealpaths(): string[] {
+  return remoteProjectRoots().map(canonicalPath);
+}
+
+/** Whether the canonical path c is at or under one of the canonical roots. */
+function underAnyRoot(c: string, roots: string[]): boolean {
+  return roots.some((r) => c === r || c.startsWith(r + path.sep));
+}
+
+/**
+ * Whether a freshly-picked directory may host a NEW session: an existing
+ * directory that is not the filesystem root. Deliberately NARROWER than
+ * the known-list's isSelectableWorkspace exclusions — those temp/config-home
+ * rules guard AUTO-discovered historical cwds, while the paths reaching here
+ * sit under a root the user configured explicitly and are taken at face
+ * value.
+ */
+function isStartableDir(p: string): boolean {
+  if (canonicalPath(p) === path.sep) return false;
+  try {
+    return statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/** Minimal closed MIME set for the web client's build output (spec §5). */
+const STATIC_MIME: Record<string, string> = {
+  ".html": "text/html; charset=utf-8",
+  ".js": "text/javascript; charset=utf-8",
+  ".mjs": "text/javascript; charset=utf-8",
+  ".css": "text/css; charset=utf-8",
+  ".svg": "image/svg+xml",
+  ".png": "image/png",
+  ".ico": "image/x-icon",
+  ".woff2": "font/woff2",
+  ".json": "application/json; charset=utf-8",
+  ".txt": "text/plain; charset=utf-8",
+  ".map": "application/json; charset=utf-8",
+  ".webmanifest": "application/manifest+json; charset=utf-8",
+};
+
+/**
+ * Resolve the webDir to a canonical serving root, or null (one warning) when
+ * it is missing/unreadable — the hub keeps serving its API either way.
+ */
+function resolveWebRoot(webDir: string): string | null {
+  try {
+    const real = realpathSync(webDir);
+    if (!statSync(real).isDirectory()) throw new Error("not a directory");
+    return real;
+  } catch (e) {
+    warn(
+      `hub: webDir ${webDir} unusable (${e instanceof Error ? e.message : String(e)}) — ` +
+        "static hosting disabled, API unaffected",
+    );
+    return null;
+  }
+}
+
+/**
+ * Serve one GET/HEAD path from the static root. Returns false (nothing
+ * written) for anything that is not a real file inside the root — the
+ * caller's terminal 404 then applies. Traversal defenses are layered: the
+ * URL parser neutralizes literal dot segments, decode + normalize + prefix
+ * check catches the encoded `%2e%2e%2f` spellings, and a realpath re-check
+ * pins the FINAL target inside the root so symlinked files cannot escape.
+ */
+async function serveStatic(
+  root: string,
+  pathname: string,
+  method: string,
+  res: ServerResponse,
+): Promise<boolean> {
+  let decoded: string;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return false; // malformed percent-encoding
+  }
+  if (decoded.includes("\0")) return false;
+  if (decoded === "/") decoded = "/index.html";
+  const target = path.normalize(path.join(root, `.${decoded}`));
+  if (target !== root && !target.startsWith(root + path.sep)) return false;
+  let real: string;
+  try {
+    real = realpathSync(target);
+  } catch {
+    return false;
+  }
+  if (real !== root && !real.startsWith(root + path.sep)) return false;
+  let body: Buffer;
+  try {
+    const st = await stat(real);
+    if (!st.isFile()) return false;
+    body = await readFile(real);
+  } catch {
+    return false; // vanished, or a stat race mid-build
+  }
+  const cacheControl = real.startsWith(root + path.sep + "assets" + path.sep)
+    ? "public, max-age=31536000, immutable"
+    : "no-cache";
+  res.writeHead(200, {
+    "Content-Type": STATIC_MIME[path.extname(real).toLowerCase()] ?? "application/octet-stream",
+    "Content-Length": body.length,
+    "Cache-Control": cacheControl,
+    "X-Content-Type-Options": "nosniff",
+  });
+  res.end(method === "HEAD" ? undefined : body);
+  return true;
 }
 
 function validSessions(raw: unknown): SessionSummary[] | null {
@@ -360,9 +514,10 @@ export type TerminalLaunch =
   /** Ghostty: `-e` trips its "Allow Ghostty to Execute" security prompt on
    * EVERY launch (GHSA-q9fg-cpmh-c78x — upstream refuses a disable switch),
    * so the hub drives its AppleScript dictionary instead (Ghostty ≥1.3.0):
-   * a `new tab` in the front window reuses an existing window, and `command`
-   * on a surface configuration runs the script without the prompt. Only a
-   * one-time macOS Automation (TCC) grant for the hub is required. */
+   * a `new tab` in the front window reuses an existing window, and
+   * `initial input` types the script into the default shell without the
+   * prompt. Only a one-time macOS Automation (TCC) grant for the hub is
+   * required. */
   | { kind: "ghosttyScript"; app: string }
   /** Warp: refuses `.command` files and its CLI is agent-only, but its URI
    * scheme EXECUTES a script handed to action/new_tab's path param
@@ -520,11 +675,22 @@ function appleScriptString(s: string): string {
 /**
  * The AppleScript source that opens the TUI script as a NEW TAB in Ghostty's
  * front window (a new window only when none exists). See the ghosttyScript
- * launcher: `command` on a surface configuration is Ghostty's trusted,
- * prompt-free path to run a program — unlike `-e`, which trips its
- * "Allow Ghostty to Execute" security gate on every launch.
+ * launcher: surface configuration `initial working directory` starts the tab's
+ * shell IN the project (a bare new tab inherits Ghostty's default cwd — the
+ * in-script `cd` only moves the child `sh`, so the terminal itself — prompt,
+ * OSC 7, later tabs' inherited cwd — would sit at `~`), and `initial input`
+ * then types "/bin/sh <script>; exit" into it — prompt-free, unlike `-e`
+ * ("Allow Ghostty to Execute" gate), and auto-closing: a `command` surface
+ * force-enables wait-after-command ONE-WAY (libghostty embedded.zig; ghostty
+ * discussion #13167), so after the CLI tree exits the tab would sit on "Press
+ * any key to close" forever and windows would pile up. `; exit` mirrors
+ * Ghostty's own open-a-script path (AppDelegate): the shell exits with the
+ * tree and the surface then closes itself.
  */
-export function ghosttyTabAppleScript(app: string, scriptPath: string): string {
+export function ghosttyTabAppleScript(app: string, scriptPath: string, cwd: string): string {
+  // Typed into the tab's default shell: single-quoted for the shell, then
+  // escaped for the AppleScript literal.
+  const typedInput = `/bin/sh ${shQuote(scriptPath)}; exit`;
   return [
     `tell application ${appleScriptString(app)}`,
     // activate requires live GUI-session focus — while the screen is LOCKED it
@@ -540,7 +706,8 @@ export function ghosttyTabAppleScript(app: string, scriptPath: string): string {
     "set tgt to front window",
     "end if",
     "set cfg to new surface configuration",
-    `set command of cfg to "/bin/sh " & ${appleScriptString(scriptPath)}`,
+    `set initial working directory of cfg to ${appleScriptString(cwd)}`,
+    `set initial input of cfg to ${appleScriptString(typedInput)} & linefeed`,
     "new tab in tgt with configuration cfg",
     "end tell",
   ].join("\n");
@@ -612,7 +779,7 @@ async function spawnTerminalTui(opts: {
   } else if (launch.kind === "ghosttyScript") {
     // osascript talks to the running app — a non-zero exit (pre-1.3 Ghostty,
     // denied Automation permission) falls through to the headless bridge.
-    argv = ["osascript", "-e", ghosttyTabAppleScript(launch.app, script)];
+    argv = ["osascript", "-e", ghosttyTabAppleScript(launch.app, script, opts.cwd)];
   } else if (launch.kind === "warpUri") {
     // new_tab = Warp's default open mode (like Cmd+T: a tab in the focused
     // window; Warp opens a window first if none exists).
@@ -767,8 +934,11 @@ function getQuotaDock(): Promise<{ formatted: string | null; fetchedAt: number }
     queryOcUsage()
       .then(formatOcDockSegment)
       .catch(() => null),
-  ]).then(([glm, go, oc]) => {
-    dockCache = { formatted: composeQuotaDock(glm, go, oc), at: Date.now() };
+    queryCpUsage()
+      .then((cp) => formatCpDockSegment(cp.result))
+      .catch(() => null),
+  ]).then(([glm, go, oc, cp]) => {
+    dockCache = { formatted: composeQuotaDock(glm, go, oc, cp), at: Date.now() };
     return { formatted: dockCache.formatted, fetchedAt: dockCache.at };
   });
 }
@@ -975,6 +1145,74 @@ async function diskCodeIsNewer(
 }
 
 /**
+ * clientInfo name the desktop client (the zcode-acp-remote Desktop Workbench)
+ * sends at `initialize` — the Desktop Presence identity (amendment to
+ * ADR-0016). The bridge-side twin of this identification is
+ * `ClientRegistry.nameConnection` (broadcast.ts); the hub cannot reuse it
+ * because bridges sit downstream of the hub's incubation decision.
+ */
+export const DESKTOP_CLIENT_NAME = "zcode-acp-remote-desktop";
+
+/**
+ * Desktop Presence wire peek (amendment to ADR-0016): the hub is a frame-level
+ * proxy (ADR-0002) with no ACP layer of its own, so a hub client's identity is
+ * visible only on the wire. The first client→bridge frame of an ACP connection
+ * is always `initialize` (the SDK enforces it and rejects later duplicates), so
+ * the connection's clientInfo name can be read straight off that frame.
+ * Returns: the name ("" when the initialize carries no clientInfo — the mobile
+ * App), `null` when the frame decodes and parses but is NOT an initialize
+ * (none is coming — the bridge's SDK shuts such connections down), `undefined`
+ * when the frame cannot be decoded or parsed (keep watching). Never throws.
+ */
+export function initializeClientName(data: RawData): string | null | undefined {
+  let text: string;
+  if (typeof data === "string") text = data;
+  else if (Array.isArray(data)) text = Buffer.concat(data.map((c) => Buffer.from(c))).toString();
+  else if (data instanceof ArrayBuffer) text = Buffer.from(data).toString();
+  else if (ArrayBuffer.isView(data))
+    text = Buffer.from(data.buffer, data.byteOffset, data.byteLength).toString();
+  else return undefined;
+  let msg: unknown;
+  try {
+    msg = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  // ACP v2 may wrap the initialize in a single-entry JSON-RPC batch.
+  const first = Array.isArray(msg) ? msg[0] : msg;
+  if (typeof first !== "object" || first === null) return undefined;
+  const { method, params } = first as { method?: unknown; params?: unknown };
+  if (method !== "initialize") return null;
+  const info = (params as { clientInfo?: { name?: unknown } } | undefined)?.clientInfo;
+  return typeof info?.name === "string" ? info.name : "";
+}
+
+/**
+ * Desktop Presence request identity (amendment to ADR-0016): the desktop
+ * client stamps every hub HTTP call with its clientInfo name. Connection
+ * presence (`desktopPairs`) needs a proxied ACP connection to a bridge, so a
+ * cold hub (instances: 0, nothing to connect to) would open a terminal for
+ * the very FIRST session create — the request itself is the one presence
+ * signal that always exists. Every authorized stamped call also refreshes the
+ * recent-request presence (DESKTOP_PRESENCE_TTL_MS), which is what keeps an
+ * idle desktop — no open tab, no proxied connection — visible to the hub.
+ */
+const DESKTOP_CLIENT_HEADER = "x-zcode-client";
+
+function requestIsDesktopClient(req: IncomingMessage): boolean {
+  const value = req.headers[DESKTOP_CLIENT_HEADER];
+  if (typeof value === "string") return value === DESKTOP_CLIENT_NAME;
+  return Array.isArray(value) && value.includes(DESKTOP_CLIENT_NAME);
+}
+
+/**
+ * Why the hub considers the desktop app present for one incubation decision
+ * (the diary line names it): a live proxied connection, the request's own
+ * identity header, or a stamped call within the presence TTL. `null` = absent.
+ */
+type DesktopPresence = "connection" | "request" | "recent";
+
+/**
  * Start the hub. Resolves once listening; rejects on bind failure (including
  * EADDRINUSE when another hub already owns the port).
  */
@@ -983,11 +1221,13 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     port,
     host,
     token,
+    webDir,
     heartbeatTimeoutMs = HEARTBEAT_TIMEOUT_MS,
     probeGraceMs = PROBE_GRACE_MS,
     idleExitMs = IDLE_EXIT_MS,
     pingIntervalMs = PING_INTERVAL_MS,
     tuiRegisterTimeoutMs = TUI_REGISTER_TIMEOUT_MS,
+    desktopPresenceTtlMs = DESKTOP_PRESENCE_TTL_MS,
     onIdleExit,
     onRestart,
     codePaths = defaultCodePaths(),
@@ -1009,8 +1249,90 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
   const hubFingerprint =
     options.hubFingerprint !== undefined ? options.hubFingerprint : readCodeFingerprint();
 
+  /**
+   * Canonical web-client root (realpath'd webDir) or null when static
+   * hosting is off/unusable. Frozen at startup on purpose: the tree is a
+   * build output; per-request re-resolution buys nothing and a mid-run
+   * disappearance must serve 404s, not warnings.
+   */
+  const webRoot = webDir ? resolveWebRoot(webDir) : null;
+
   const instances = new Map<string, InstanceEntry>();
+  /**
+   * Remote-close tombstones (ADR-0006 follow-up): sessionId → closed-at. A
+   * proxied close the bridge answered 200 lands here, so the HUB — not just
+   * the bridge's next heartbeat — knows the session is closed. Two jobs:
+   * the cached instance entry drops the sid immediately (the ≤10s heartbeat
+   * window used to keep serving it to discovery clients), and an AUTO
+   * resume (a client reconnect ladder re-incubating its own tab) is refused
+   * with 409 instead of resurrecting what the user closed from another
+   * surface. A user-intent resume always passes and clears the stone —
+   * close retires, it never deletes, so manual re-launch stays open (the
+   * same self-heal contract as the bridge's markSessionActive).
+   */
+  /**
+   * One tombstoned conversation: closed-at plus EVERY id spelling the closing
+   * bridge reported (the requested sid, its backend `sess_…` id, and local
+   * aliases — the same conversation is addressable under different spellings
+   * per bridge). All map keys share ONE entry; every clear path (user resume,
+   * TTL expiry, a heartbeat re-advertise past the heartbeat TTL) removes the
+   * whole group, or a user resume under one spelling would leave the others
+   * refused while the conversation is alive again.
+   */
+  interface ClosedSessionEntry {
+    closedAt: number;
+    spellings: string[];
+  }
+  const closedSessions = new Map<string, ClosedSessionEntry>();
+  const CLOSED_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+  const clearClosedSession = (sid: string): void => {
+    const entry = closedSessions.get(sid);
+    if (!entry) return;
+    for (const s of entry.spellings) closedSessions.delete(s);
+  };
+  const stampClosedSession = (spellings: string[]): void => {
+    // A fresh stamp replaces any stale group that shares a spelling.
+    for (const s of spellings) clearClosedSession(s);
+    const entry: ClosedSessionEntry = { closedAt: Date.now(), spellings };
+    for (const s of spellings) closedSessions.set(s, entry);
+  };
+  const isSessionClosed = (sid: string): boolean => {
+    const entry = closedSessions.get(sid);
+    if (!entry) return false;
+    if (Date.now() - entry.closedAt > CLOSED_TOMBSTONE_TTL_MS) {
+      clearClosedSession(sid);
+      return false;
+    }
+    return true;
+  };
   const proxyPairs = new Set<{ client: WebSocket; bridge: WebSocket }>();
+  /**
+   * Desktop Presence (amendment to ADR-0016): proxy pairs whose client
+   * initialized under DESKTOP_CLIENT_NAME. Membership is per connection —
+   * added at the pair's initialize (see startProxy), dropped by its teardown —
+   * so presence ends when the desktop app disconnects (close, crash, sleep
+   * past the keepalive) and visible-terminal incubation resumes for later
+   * creates. Sessions that already have a window are never touched.
+   */
+  const desktopPairs = new Set<{ client: WebSocket; bridge: WebSocket }>();
+  /**
+   * Desktop Presence by recent request: when the last AUTHORIZED call stamped
+   * with the desktop identity landed (0 = never). Refreshed by handleHttp for
+   * every route — the 15s discovery poll is the steady source, but any
+   * stamped call counts.
+   */
+  let desktopSeenAt = 0;
+  /**
+   * The one incubation-time presence verdict (amendment to ADR-0016). Checked
+   * at the endpoint, once per request — a desktop client dropping mid-flight
+   * never opens a window retroactively.
+   */
+  const desktopPresence = (req: IncomingMessage): DesktopPresence | null => {
+    if (desktopPairs.size > 0) return "connection";
+    if (requestIsDesktopClient(req)) return "request";
+    if (desktopSeenAt > 0 && Date.now() - desktopSeenAt < desktopPresenceTtlMs) return "recent";
+    return null;
+  };
   const timers: Array<ReturnType<typeof setInterval>> = [];
 
   /**
@@ -1059,6 +1381,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     kind: "tui" | "serve" | "resume",
     sessionId?: string,
     tabTitle?: string,
+    desktop: DesktopPresence | null = null,
   ): Promise<{ id: string; reused: boolean }> => {
     // Async spawn failures (ENOENT — the dir vanished between the whitelist
     // check and the spawn) arrive as an 'error' event with exitCode still
@@ -1071,8 +1394,16 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     // terminalTuiScript exports the var into the terminal's fresh shell; the
     // detached serve spawn inherits it directly.
     const nonce = randomUUID();
+    // The login-shell completion comes FIRST so the plumbing below overrides
+    // it. This hub is a detached daemon whose birth env came from whatever
+    // spawned its bridge — an editor GUI process, which means launchd's bare
+    // PATH with no version managers in it. Without this, a session opened from
+    // a phone cannot find `pnpm` / `cargo` / `java` even though the same
+    // command works in the user's terminal. The probe is async and shared, so
+    // the hub's event loop (WS proxying, heartbeats) never freezes for it.
+    const shellEnv = await envWithLoginShell();
     const env: NodeJS.ProcessEnv = {
-      ...process.env,
+      ...shellEnv,
       ZCODE_ACP_REMOTE: "1",
       ZCODE_ACP_REMOTE_TOKEN: token,
       ZCODE_ACP_HUB_PORT: String(port),
@@ -1102,7 +1433,10 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     // never saw it). terminalTuiScript exports it into the terminal's fresh
     // shell — launchd's environment would otherwise drop it, and martty
     // reads the variable once at its own process start.
-    const statsFilter = tuiStatsSegments(process.env);
+    //
+    // Read from the completed env, not process.env: the fallback the user
+    // exported in their shell lives only in the login shell's environment.
+    const statsFilter = tuiStatsSegments(env);
     if (statsFilter !== undefined) env.DSH_TUI_STATS = statsFilter;
     if (kind === "resume") {
       // ADR-0017: the requested session rides the env — terminalTuiScript
@@ -1139,14 +1473,34 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       // never churns when the bridge takes over the script's initial printf.
       env.ZCODE_ACP_TAB_TITLE = sessionTabTitle(tabTitle, workspacePath);
     }
+    // Desktop Presence (amendment to ADR-0016): while the desktop app is
+    // present — a proxied connection, the request's own identity header, or a
+    // stamped call within the presence TTL (see desktopPresence) —
+    // session-create AND resume incubate in the headless serve form: the
+    // desktop app is the presenting surface, so a terminal window would
+    // re-render the same stream for nobody (a resume's window was ADR-0017's
+    // mobile surface; a desktop-originated resume loads the session itself
+    // after attach). Equivalent to the exhausted-terminal-list fallback: the
+    // launch list is empty, so openNextTerminal yields to the detached serve
+    // spawn at once. The verdict was taken at the endpoint, once per request.
+    // The listing was already headless; `ZCODE_ACP_HUB_TERMINAL=0` stays the
+    // static variant.
+    const desktopPresent = (kind === "tui" || kind === "resume") && desktop !== null;
+    if (desktopPresent) {
+      // warn (not log): the daemon's stderr is null in production, so the
+      // diary is the only place this state change is observable.
+      warn(
+        `hub: desktop app present (${desktop}) — incubating ${workspacePath} headless (Desktop Presence)`,
+      );
+    }
     // Terminal preference list (ADR-0016 amendment): visible-terminal kinds
     // walk it — a failed launch moves down at once, a window that never
     // registers moves down at its timeout — and only the exhausted list
     // falls back to the detached headless spawn. "serve" never pops a window.
     const launches =
-      kind === "serve"
+      kind === "serve" || desktopPresent
         ? []
-        : (terminalLaunches ?? resolveTerminalLaunches(remoteTerminalPrefs(process.env)));
+        : (terminalLaunches ?? resolveTerminalLaunches(remoteTerminalPrefs(env)));
     let li = 0;
     /**
      * Try launches[li..] until one OPENS; advance li past every failure and
@@ -1332,6 +1686,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     kind: "tui" | "serve" | "resume",
     sessionId?: string,
     tabTitle?: string,
+    desktop: DesktopPresence | null = null,
   ): Promise<{ id: string; reused: boolean }> => {
     const mapKey =
       kind === "resume" ? `${workspacePath}\u0000resume\u0000${sessionId ?? ""}` : workspacePath;
@@ -1340,7 +1695,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       log(`hub: joining the incubating serve bridge for ${workspacePath}`);
       return inflight.promise;
     }
-    const promise = incubateServe(workspacePath, kind, sessionId, tabTitle);
+    const promise = incubateServe(workspacePath, kind, sessionId, tabTitle, desktop);
     serveIncubations.set(mapKey, { kind, promise });
     // Drop the entry once settled (identity-checked — a newer incubation may
     // already have replaced it). The catch keeps the DERIVED promise handled;
@@ -1453,13 +1808,24 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       return;
     }
     if (!authorized(req, url, token)) {
-      warn("hub: unauthorized WS upgrade rejected");
+      warn(
+        `hub: unauthorized WS upgrade rejected (instance=${url.searchParams.get("instance") ?? "<none>"})`,
+      );
       rejectUpgrade(socket, 401, "Unauthorized");
       return;
     }
-    const entry = instances.get(url.searchParams.get("instance") ?? "");
+    const requestedId = url.searchParams.get("instance") ?? "";
+    const entry = instances.get(requestedId);
     if (!entry) {
-      warn("hub: WS upgrade for unknown instance rejected");
+      // Name the id and what IS registered: a client attaching to a pruned
+      // instance (heartbeat slipped past the TTL) and a client holding a stale
+      // id look identical otherwise, and the hub log was the only evidence
+      // available for either (2026-10-21: a 2.5-minute outage had to be
+      // diagnosed without knowing which instance was rejected).
+      warn(
+        `hub: WS upgrade for unknown instance rejected (id=${requestedId || "<none>"}; ` +
+          `known: ${[...instances.keys()].join(", ") || "<none>"})`,
+      );
       rejectUpgrade(socket, 404, "Unknown Instance");
       return;
     }
@@ -1475,14 +1841,32 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     };
     socket.once("close", onClientGone);
     socket.once("error", onClientGone);
-    bridge.once("open", () => {
-      if (clientGone) return; // terminated above; "open" can no longer fire
+    // Dial-phase guard: exactly one of open/fail settles the upgrade. The
+    // error path must stay attached AFTER the first emission (Bun's
+    // WebSocket reports one failed connect through two dispatch paths —
+    // once via the listener, once as an unhandled 'error' — observed live
+    // 2026-10-20: a corpse dial logged the warn AND threw an uncaught
+    // ErrorEvent), and must never fire into an upgraded socket.
+    let settled = false;
+    bridge.on("open", () => {
+      if (settled || clientGone) return; // terminated above; "open" is moot
+      settled = true;
       socket.removeListener("close", onClientGone);
       socket.removeListener("error", onClientGone);
       wss.handleUpgrade(req, socket, head, (client) => startProxy(client, bridge));
     });
-    bridge.once("error", (e) => {
+    bridge.on("error", (e: Error) => {
+      if (settled) return;
+      settled = true;
       warn(`hub: dial bridge :${entry.port} failed: ${e.message}`);
+      // ECONNREFUSED on loopback means nothing is bound — the bridge process
+      // is gone (a busy-but-alive bridge's OS backlog still accepts). Prune
+      // now so the next client attempt reads "unknown instance" and falls
+      // back to re-incubation, instead of dialing a corpse until the
+      // heartbeat TTL expires. A wrong prune self-heals on the bridge's next
+      // heartbeat.
+      instances.delete(entry.id);
+      idleSince = null; // re-arm the idle clock on membership change
       rejectUpgrade(socket, 502, "Bridge Unreachable");
     });
   });
@@ -1500,6 +1884,12 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       res.end("ok");
       return;
     }
+    // Desktop Presence by recent request: every AUTHORIZED call the desktop
+    // client stamped refreshes the TTL (the 15s discovery poll in practice).
+    // Authorization first — a bare header must never suppress windows. The
+    // routes re-check authorization themselves; this extra compare only runs
+    // for stamped requests.
+    if (requestIsDesktopClient(req) && authorized(req, url, token)) desktopSeenAt = Date.now();
     if (url.pathname === "/api/instances" && req.method === "GET") {
       if (!authorized(req, url, token)) {
         res.writeHead(401, { "Content-Type": "text/plain" });
@@ -1577,6 +1967,26 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       res.end(JSON.stringify(list));
       return;
     }
+    // GET /api/workflow-overview — the machine-level workflow page payload
+    // (see workflow-overview.ts): one group per WORKSPACE (not per bridge —
+    // a project with an editor + serve bridge must not render twice) plus the
+    // machine-wide active-run list (the journal is shared; a client attached
+    // to one instance must still see another project's flying runs).
+    if (url.pathname === "/api/workflow-overview" && req.method === "GET") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const overview = await buildWorkflowOverview(Array.from(instances.values()));
+      res.writeHead(200, {
+        "Content-Type": "application/json",
+        // Live data — the hub holds no cache; clients must not either.
+        "Cache-Control": "no-store",
+      });
+      res.end(JSON.stringify(overview));
+      return;
+    }
     if (url.pathname === "/api/quota" && req.method === "GET") {
       if (!authorized(req, url, token)) {
         res.writeHead(401, { "Content-Type": "text/plain" });
@@ -1616,6 +2026,36 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       }
       return;
     }
+    // GET /api/system-stats — machine-level system status (host info, CPU,
+    // memory, storage, battery, power assertions, network, hub + bridge
+    // process resources) for the App's system-status page. Every field is
+    // independently best-effort (see system-stats.ts): rate fields need two
+    // polls ~1s apart to have a delta baseline. The hub-side 1s collect cache
+    // is the only caching layer.
+    if (url.pathname === "/api/system-stats" && req.method === "GET") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      try {
+        const stats = await collectSystemStats(
+          Array.from(instances.values(), (e) => ({
+            id: e.id,
+            pid: e.pid,
+            workspace: e.workspace,
+          })),
+          { version: AGENT_INFO.version, instances: instances.size },
+        );
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(JSON.stringify(stats));
+      } catch (err) {
+        warn(`hub: system-stats collect failed: ${String(err)}`);
+        res.writeHead(502, { "Content-Type": "text/plain" });
+        res.end("system stats failed");
+      }
+      return;
+    }
     // GET /api/projects — the machine's known-project list (remote
     // session-create, ADR-0014). Sourced from the App's tasks index: every
     // workspace that ever ran a session. The list gates POST /api/instances
@@ -1635,6 +2075,106 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         "Cache-Control": "no-store",
       });
       res.end(JSON.stringify(projects));
+      return;
+    }
+    // GET /api/fs/list?path=<abs> — one directory level of the hub machine's
+    // filesystem, for the mobile app's browse-and-create flow. Read-only and
+    // deliberately unscoped (the token is the boundary, like every other hub
+    // route); the response's `creatable` flags whether a NEW session may
+    // start in the LISTED directory itself — a known project or under a
+    // configured remote.projectRoots root. Only subdirectories are listed:
+    // the flow picks a working directory, never a file.
+    if (url.pathname === "/api/fs/list" && req.method === "GET") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const rawPath = (url.searchParams.get("path") ?? "").trim();
+      const target = rawPath === "" || rawPath === "~" ? homedir() : expandHomePath(rawPath);
+      if (!path.isAbsolute(target)) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("absolute path required");
+        return;
+      }
+      let real: string;
+      try {
+        real = realpathSync(target);
+        if (!(await stat(real)).isDirectory()) throw new Error("not a directory");
+      } catch {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("directory not found");
+        return;
+      }
+      let dirents: Dirent[];
+      try {
+        dirents = await readdir(real, { withFileTypes: true });
+      } catch {
+        dirents = []; // unreadable dir (EACCES) — an empty listing, not an error
+      }
+      const names: string[] = [];
+      let truncated = false;
+      for (const d of dirents) {
+        if (names.length >= FS_LIST_LIMIT) {
+          truncated = true;
+          break;
+        }
+        let isDir = d.isDirectory();
+        if (!isDir && d.isSymbolicLink()) {
+          // Follow symlinks with stat: a linked-in directory is a navigable
+          // workspace candidate; a broken link simply drops out.
+          try {
+            isDir = statSync(path.join(real, d.name)).isDirectory();
+          } catch {
+            isDir = false;
+          }
+        }
+        if (isDir) names.push(d.name);
+      }
+      names.sort((a, b) => a.localeCompare(b));
+      const known = await listKnownWorkspaces(projectsDbPath);
+      const knownPaths = new Set(known.map((p) => canonicalPath(p.workspacePath)));
+      const creatable =
+        knownPaths.has(real) ||
+        (isStartableDir(real) && underAnyRoot(real, projectRootsRealpaths()));
+      const parent = path.dirname(real);
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(
+        JSON.stringify({
+          path: real,
+          parent: parent === real ? null : parent,
+          creatable,
+          entries: names.map((name) => ({ name })),
+          truncated,
+        }),
+      );
+      return;
+    }
+    // POST /api/projects/delete — soft-delete a project (tombstones, not a
+    // purge): every tasks row of the workspace gets deleted=1, so the project
+    // vanishes from GET /api/projects and POST /api/instances above (unknown
+    // project), its sessions from every listing, and the desktop App's
+    // sidebar too (same index). The backend store keeps all conversation
+    // bytes; a NEW session in that project re-adds a fresh row and the
+    // project reappears — a hide, not a ban. Idempotent: 0 rows flipped is
+    // still ok (already deleted / never known).
+    if (url.pathname === "/api/projects/delete" && req.method === "POST") {
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const body = await readJson(req);
+      const rawPath = (body as { workspacePath?: unknown } | undefined)?.workspacePath;
+      const workspacePath = typeof rawPath === "string" ? rawPath.trim() : "";
+      if (!workspacePath) {
+        res.writeHead(400, { "Content-Type": "text/plain" });
+        res.end("workspacePath required");
+        return;
+      }
+      const deletedTasks = await softDeleteWorkspaceTasks(workspacePath, projectsDbPath);
+      res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+      res.end(JSON.stringify({ ok: true, deletedTasks }));
       return;
     }
     // GET /api/projects/sessions?workspacePath=… — the project's backend
@@ -1734,6 +2274,9 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     // reuses a live serve bridge: the App flow always runs the history
     // listing first, which incubates a headless serve instance, and reuse
     // would mean the window can never open (the pre-amendment behaviour).
+    // Desktop Presence inverts both rules (see desktopPresence below): no
+    // window is coming, so the workspace's live serve bridge hosts the session
+    // too, and only a workspace without one spawns — headless.
     // The hub waits for the bridge's heartbeat registration; the bridge lives
     // its own life afterwards (a terminal TUI until the window closes, a
     // serve bridge on its idle timer). Concurrent identical POSTs join one
@@ -1765,10 +2308,85 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         return;
       }
       const known = await listKnownWorkspaces(projectsDbPath);
-      if (!known.some((p) => p.workspacePath === workspacePath)) {
+      // The known-project list is the default whitelist; the configured
+      // remote.projectRoots widen it to any existing subdirectory under a
+      // root (the mobile app's browse-and-create flow). Same convenience-
+      // bound caveat as GET /api/projects: the trust boundary is the token,
+      // this gate only keeps fat-fingered paths out.
+      const roots = projectRootsRealpaths();
+      const allowed =
+        known.some((p) => p.workspacePath === workspacePath) ||
+        (isStartableDir(workspacePath) && underAnyRoot(canonicalPath(workspacePath), roots));
+      if (!allowed) {
         res.writeHead(403, { "Content-Type": "text/plain" });
         res.end("unknown project");
         return;
+      }
+      // A tombstoned session is not resumable: the listing never offers it,
+      // so an id arriving here comes from a stale client cache. Refusing
+      // keeps the delete sticky; a BOGUS id still gets its honest window
+      // (unknown ≠ deleted — isTaskDeleted is false without a row).
+      if (resumeSid && (await isTaskDeleted(resumeSid, projectsDbPath))) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("session deleted");
+        return;
+      }
+      // Remote-close tombstone gate (ADR-0006 follow-up): `intent` separates
+      // a client's own reconnect ladder ("auto" — a tab re-incubating itself
+      // after its bridge left discovery) from a human picking the session
+      // ("user", the default — older clients and every manual re-launch keep
+      // working). Auto never resurrects a session the user closed from
+      // another surface; user always may, and clears the stone so later
+      // autos track the reopened truth. Ordered before the Desktop Presence
+      // reuse on purpose: for an auto, closed beats any holder the stale
+      // cache still names.
+      const intent =
+        (body as { intent?: unknown } | undefined)?.intent === "auto" ? "auto" : "user";
+      if (resumeSid && intent === "auto" && isSessionClosed(resumeSid)) {
+        res.writeHead(409, { "Content-Type": "text/plain" });
+        res.end("session closed");
+        return;
+      }
+      if (resumeSid && intent === "user") {
+        // Whole spelling group: the conversation is open again, so every
+        // id spelling of it must stop being refused.
+        clearClosedSession(resumeSid);
+      }
+      // Desktop Presence (amendment to ADR-0016): the desktop app is the
+      // presenting surface, so no window opens — and with no window to be the
+      // feature, the pre-amendment reuse is right again: the workspace's live
+      // serve bridge (the listing's, an earlier create's, an open window's)
+      // hosts this session too. The client attaches and session/new-s or
+      // session/loads there, exactly as it already does after a headless
+      // rescue — one bridge and one backend process per project instead of
+      // one per session. A resume prefers the bridge that holds the session
+      // LIVE (any origin): two bridges must never load one conversation. Only
+      // a workspace with no live serve bridge still spawns, headless. An
+      // unhealthy-marked bridge is skipped (a dead one would fail the dial
+      // and only be pruned afterwards); a stalled-but-alive one costs a
+      // duplicate, the status quo before this reuse.
+      const desktop = desktopPresence(req);
+      if (desktop) {
+        const holder = resumeSid
+          ? Array.from(instances.values()).find((e) =>
+              e.sessions.some((s) => s.sessionId === resumeSid),
+            )
+          : undefined;
+        const live =
+          holder ?? findServeInstances(workspacePath).find((e) => e.unhealthySince === undefined);
+        if (live) {
+          // warn (not log): the diary is the only place this decision is
+          // observable on the detached daemon (the phone's create that
+          // deliberately did NOT open a window).
+          warn(
+            `hub: desktop app present (${desktop}) — ${
+              resumeSid ? `resume ${resumeSid.slice(0, 8)}` : "create"
+            } for ${workspacePath} reuses ${live.origin} bridge ${live.id}`,
+          );
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify({ id: live.id, reused: true }));
+          return;
+        }
       }
       if (resumeSid) {
         // Tab title, best-effort: the App browsed this conversation through
@@ -1792,12 +2410,15 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           tabTitle = sanitizeTabTitle((row as { title?: unknown } | undefined)?.title);
         }
         // Resume never reuses the live serve bridge: the window IS the
-        // feature, and the answer must be the NEW instance so the attaching
-        // client and the terminal share one bridge (and one backend process)
-        // for the session. A bogus id still opens the window — the TUI
-        // shows the load failure and falls back to a fresh session, the same
-        // honesty as a window that dies early (ADR-0016 §4).
-        const incubation = joinIncubation(workspacePath, "resume", resumeSid, tabTitle);
+        // feature for MOBILE-originated resumes (the attaching client and the
+        // terminal share one bridge and one backend process for the session;
+        // ADR-0017). Under Desktop Presence the reuse above already answered
+        // when a live bridge existed; what reaches here incubates headless
+        // (the client loads the session itself after attach). A bogus id
+        // still gets its honest spawn — the surface shows the load failure
+        // and falls back to a fresh session, the same honesty as a window
+        // that dies early (ADR-0016 §4).
+        const incubation = joinIncubation(workspacePath, "resume", resumeSid, tabTitle, desktop);
         try {
           const out = await incubation;
           res.writeHead(200, { "Content-Type": "application/json" });
@@ -1809,15 +2430,18 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         return;
       }
       // Session-create ALWAYS incubates a VISIBLE terminal TUI (ADR-0016 as
-      // amended): the App flow lists the project's history first, which
-      // incubates a headless serve bridge — reusing that instance (the
-      // original behaviour) meant a window could NEVER open once the project
-      // was browsed, and every create ran invisibly in the background. The
-      // answer is the NEW window's instance; concurrent identical POSTs join
-      // one incubation, and the detached headless serve spawn remains the
-      // fallback (no GUI / gated off / open failure). Clients that want a
-      // headless attach use the listing's instance id instead of this POST.
-      const incubation = joinIncubation(workspacePath, "tui");
+      // amended) — UNLESS Desktop Presence applies (see desktopPresence; a
+      // workspace with a live bridge was already answered above, so what
+      // reaches here under presence spawns headless). The App flow lists the
+      // project's history first, which incubates a headless serve bridge —
+      // reusing that instance (the original behaviour) meant a window could
+      // NEVER open once the project was browsed, and every create ran
+      // invisibly in the background. The answer is the NEW spawn's instance;
+      // concurrent identical POSTs join one incubation, and the detached
+      // headless serve spawn remains the fallback (no GUI / gated off / open
+      // failure). Clients that want a headless attach use the listing's
+      // instance id instead of this POST.
+      const incubation = joinIncubation(workspacePath, "tui", undefined, undefined, desktop);
       try {
         const out = await incubation;
         res.writeHead(200, { "Content-Type": "application/json" });
@@ -2037,13 +2661,14 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       res.end(JSON.stringify({ ok: true }));
       return;
     }
-    // POST /api/instances/{id}/sessions/{sid}/close|rename — the remote HTTP
-    // write surface (ADR-0006): forward-and-relay to the bridge's loopback
-    // route. The hub still routes by instance id only; semantics (running
-    // guard / discovery retirement, title validation + pinning + broadcast)
-    // stay in the bridge. Any request body pipes through untouched.
+    // POST /api/instances/{id}/sessions/{sid}/close|rename|delete — the
+    // remote HTTP write surface (ADR-0006): forward-and-relay to the bridge's
+    // loopback route. The hub still routes by instance id only; semantics
+    // (running guard / discovery retirement, title validation + pinning +
+    // broadcast, delete tombstoning + live refusal) stay in the bridge. Any
+    // request body pipes through untouched.
     const sessionOpMatch = url.pathname.match(
-      /^\/api\/instances\/([^/]+)\/sessions\/([^/]+)\/(close|rename)$/,
+      /^\/api\/instances\/([^/]+)\/sessions\/([^/]+)\/(close|rename|delete)$/,
     );
     if (sessionOpMatch && req.method === "POST") {
       const [, instId, sid, op] = sessionOpMatch;
@@ -2070,7 +2695,44 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           delete headers["transfer-encoding"];
           delete headers.connection;
           res.writeHead(up.statusCode ?? 502, headers);
-          up.pipe(res);
+          if (op !== "close" || up.statusCode !== 200) {
+            up.pipe(res);
+            return;
+          }
+          // Close-200: tee the (tiny) JSON body to learn EVERY spelling of
+          // the closed conversation — the bridge answers
+          // {ok, sessionIds}; older bridges without the field fall back to
+          // the requested sid alone. The tombstone and the cached-entry drop
+          // then cover the whole group, so an auto ladder is refused
+          // whichever spelling it quotes (alias vs backend id) and the
+          // listing stops offering the conversation, not one spelling of it.
+          const chunks: Buffer[] = [];
+          up.on("data", (chunk: Buffer) => chunks.push(chunk));
+          up.on("end", () => {
+            let spellings = [sid!];
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+                sessionIds?: unknown;
+              };
+              if (Array.isArray(body.sessionIds)) {
+                const extra = body.sessionIds.filter(
+                  (s): s is string => typeof s === "string" && s.length > 0 && s !== sid,
+                );
+                if (extra.length > 0) spellings = [sid!, ...extra];
+              }
+            } catch {
+              // non-JSON body — the requested sid alone (conservative)
+            }
+            stampClosedSession(spellings);
+            const cached = instances.get(instId!);
+            if (cached) {
+              instances.set(instId!, {
+                ...cached,
+                sessions: cached.sessions.filter((s) => !spellings.includes(s.sessionId)),
+              });
+            }
+            res.end(Buffer.concat(chunks));
+          });
         },
       );
       upstream.on("error", () => {
@@ -2089,6 +2751,53 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       });
       // Relay any request body through (close sends none, rename carries the
       // JSON title — chunked, since the hub does not forward headers).
+      req.pipe(upstream);
+      return;
+    }
+    // POST /api/instances/{id}/push/test — the push-channel verification route
+    // (push-backend-requirements §7): strip the instance prefix, forward the
+    // /push/test suffix to the bridge's loopback endpoint. Same
+    // forward-and-relay shape as the session close/rename block above; the hub
+    // parses no body and holds no push state.
+    const pushMatch = url.pathname.match(/^\/api\/instances\/([^/]+)\/(push\/test)$/);
+    if (pushMatch && req.method === "POST") {
+      const [, instId, suffix] = pushMatch;
+      if (!authorized(req, url, token)) {
+        res.writeHead(401, { "Content-Type": "text/plain" });
+        res.end("unauthorized");
+        return;
+      }
+      const entry = instances.get(instId!);
+      if (!entry) {
+        res.writeHead(404, { "Content-Type": "text/plain" });
+        res.end("unknown instance");
+        return;
+      }
+      const upstream = httpRequest(
+        {
+          host: "127.0.0.1",
+          port: entry.port,
+          path: `/${suffix}`,
+          method: "POST",
+        },
+        (up) => {
+          const headers = { ...up.headers };
+          delete headers["transfer-encoding"];
+          delete headers.connection;
+          res.writeHead(up.statusCode ?? 502, headers);
+          up.pipe(res);
+        },
+      );
+      upstream.on("error", () => {
+        if (res.headersSent) res.destroy();
+        else {
+          res.writeHead(502, { "Content-Type": "text/plain" });
+          res.end("bridge unreachable");
+        }
+      });
+      res.on("close", () => {
+        if (!res.writableEnded) upstream.destroy();
+      });
       req.pipe(upstream);
       return;
     }
@@ -2123,7 +2832,19 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           id,
           port: bridgePort,
           pid: typeof body.pid === "number" ? body.pid : 0,
-          startedAt: prev?.startedAt ?? Date.now(),
+          // The registrant's own start time when it sends one, else the hub's
+          // clock. The sender knows its real boot instant; the hub's `Date.now()`
+          // is skewed by however long the register took to arrive, and a bridge
+          // whose first register is slow (a cold provider sync) would look NEWER
+          // than a bridge that actually started after it. That ordering is
+          // load-bearing: it is the tie-break when two bridges advertise the
+          // same session with the same updatedAt, and the winner is the one
+          // clients attach to. A re-registration keeps the first value seen.
+          startedAt:
+            prev?.startedAt ??
+            (typeof body.startedAt === "number" && Number.isFinite(body.startedAt)
+              ? body.startedAt
+              : Date.now()),
           workspace: typeof body.workspace === "string" ? body.workspace : "",
           sessions,
           lastSeen: Date.now(),
@@ -2136,6 +2857,21 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
             ? { tuiPid: body.tuiPid }
             : {}),
         });
+        // A registration advertising a tombstoned session again is fresh
+        // evidence the session is genuinely alive (a client resumed it and
+        // the bridge re-advertised) — clear the stone so later autos are not
+        // refused off stale history. Guarded by the heartbeat TTL: a
+        // heartbeat already in flight when the close landed can still carry
+        // the sid from a pre-close snapshot, and that must NOT clear the
+        // stone the close just stamped. The clear is per GROUP: a
+        // re-advertised spelling revives the whole conversation, so every
+        // spelling of it stops being refused.
+        for (const s of sessions) {
+          const entry = closedSessions.get(s.sessionId);
+          if (entry && Date.now() - entry.closedAt > HEARTBEAT_TIMEOUT_MS) {
+            clearClosedSession(s.sessionId);
+          }
+        }
       } else {
         instances.delete(id);
         idleSince = null; // re-arm the idle clock on membership change
@@ -2172,6 +2908,14 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       }
       return;
     }
+    // Same-origin web client (opt-in webDir): mounted AFTER every existing
+    // route, so API/WS precedence is untouched. Unauthenticated by design —
+    // public frontend bytes; the bearer token remains the /api/* boundary.
+    // Static hits deliberately never touch idleSince: a configured webDir
+    // must not by itself keep the idle-retire clock from firing.
+    if (webRoot !== null && (req.method === "GET" || req.method === "HEAD")) {
+      if (await serveStatic(webRoot, url.pathname, req.method ?? "GET", res)) return;
+    }
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");
   }
@@ -2184,8 +2928,29 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     pongResponsive.add(bridge);
     client.on("pong", () => pongResponsive.add(client));
     bridge.on("pong", () => pongResponsive.add(bridge));
+    // Desktop Presence (amendment to ADR-0016): watch the client's frames
+    // until the connection's `initialize` shows up (always the FIRST frame —
+    // see initializeClientName) and record whether this pair is the desktop
+    // client. Removed at the first decodable frame either way; teardown drops
+    // the pair, so presence ends with the connection.
+    const watchClientIdentity = (data: RawData, isBinary: boolean): void => {
+      if (isBinary) return; // ACP frames are text; the SDK drops binary ones
+      const name = initializeClientName(data);
+      if (name === undefined) return;
+      client.removeListener("message", watchClientIdentity);
+      if (name === DESKTOP_CLIENT_NAME) {
+        desktopPairs.add(pair);
+        // warn (not log): debug-only stderr is invisible under the detached
+        // daemon — the diary line is how presence is confirmed in production.
+        warn(
+          "hub: desktop client connected — new remote sessions incubate headless (Desktop Presence)",
+        );
+      }
+    };
+    client.on("message", watchClientIdentity);
     const teardown = (): void => {
       if (!proxyPairs.delete(pair)) return;
+      desktopPairs.delete(pair);
       client.close();
       bridge.close();
     };
@@ -2296,7 +3061,9 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       // port 0 binds an ephemeral port — report the actual one (used by tests).
       const addr = server.address();
       const bound = typeof addr === "object" && addr !== null ? addr.port : port;
-      log(`hub: listening on ${host}:${bound} (instances: 0)`);
+      // warn (not log): the daemon's stderr is null in production — the
+      // diary line is the only record of when/where a hub came up.
+      warn(`hub: listening on ${host}:${bound} (instances: 0)`);
       resolve({ port: bound, close });
     });
   });

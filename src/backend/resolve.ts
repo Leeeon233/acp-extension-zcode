@@ -13,7 +13,7 @@ import path from "node:path";
 import process from "node:process";
 import { execFileSync } from "node:child_process";
 
-import { log, zcodePersonalProviderPath } from "../utils.js";
+import { log, warn, zcodePersonalProviderPath } from "../utils.js";
 
 /** `which bin` — resolve a binary on PATH without external deps. */
 function whichSync(bin: string): string | null {
@@ -178,9 +178,9 @@ export function builtinProviderEnv(entryArg?: string): NodeJS.ProcessEnv {
   const found = candidates.find((c) => existsSync(c));
   if (!found) return {};
   const personal = zcodePersonalProviderPath();
-  return existsSync(personal)
-    ? { [BUILTIN_PROVIDER_ENV]: found, [PERSONAL_PROVIDER_ENV]: personal }
-    : { [BUILTIN_PROVIDER_ENV]: found };
+  // A missing personal table is valid: the backend reads it as an empty layer.
+  // Both paths must still be explicit to keep the builtin revision path stable.
+  return { [BUILTIN_PROVIDER_ENV]: found, [PERSONAL_PROVIDER_ENV]: personal };
 }
 
 /**
@@ -196,11 +196,31 @@ export function builtinProviderEnv(entryArg?: string): NodeJS.ProcessEnv {
  * tree discovers skills/MCP/credentials there while the spawned backend still
  * reads the real `~/.zcode` — split-brain. An unset ZCODE_HOME returns {} so
  * any ambient ZCODE_DATA_BASE_DIR passes through untouched.
+ *
+ * The translation only EXISTS when the tree's basename is `.zcode` — the
+ * backend unconditionally appends `.zcode` to the base dir, so a differently
+ * named tree cannot be projected onto it at all. dirname() of such a path
+ * would point the backend at a sibling `.zcode` that may belong to someone
+ * else entirely; leaving the env unset (backend reads the ambient default)
+ * and warning is the honest failure — the mismatch is visible instead of
+ * silently wired to the wrong tree.
  */
+let warnedNonZcodeHome = false;
 export function zcodeDataBaseDirEnv(): NodeJS.ProcessEnv {
   const home = process.env.ZCODE_HOME?.trim();
   if (!home) return {};
-  return { ZCODE_DATA_BASE_DIR: path.dirname(path.resolve(home)) };
+  const resolved = path.resolve(home);
+  if (path.basename(resolved) !== ".zcode") {
+    if (!warnedNonZcodeHome) {
+      warnedNonZcodeHome = true;
+      warn(
+        `ZCODE_HOME='${resolved}' does not end in '.zcode' — the backend only understands a ` +
+          `base dir + '.zcode', so it will NOT see this tree (leaving ZCODE_DATA_BASE_DIR unset)`,
+      );
+    }
+    return {};
+  }
+  return { ZCODE_DATA_BASE_DIR: path.dirname(resolved) };
 }
 
 /**
@@ -248,11 +268,25 @@ function disallowedToolsValue(): string | undefined {
 }
 
 /**
+ * The same merged disallow list as an array — the shape the per-session
+ * `toolDenylist` param takes (handlers/session.ts). Empty when nothing is
+ * disallowed. Deduped; the user's entries come first, then the defaults.
+ */
+export function disallowedToolList(): string[] {
+  const value = disallowedToolsValue();
+  return value ? [...new Set(value.split(/[,\s]+/).filter(Boolean))] : [];
+}
+
+/**
  * The backend subcommand and its flags, shared by every launch path.
  *
  * `ZCODE_DISALLOWED_TOOLS` is merged with the default Cron* disallow list
  * (see AUTOMATION_TOOL_DEFAULTS) and passed as the app-server's
- * `--disallowed-tools` value; unset means only the defaults.
+ * `--disallowed-tools` value; unset means only the defaults. NOTE the
+ * app-server command path parses this flag but never consumes it (upstream
+ * cli/src/run.ts routes `toolDisallowlist` to the prompt/TUI paths only), so
+ * the EFFECTIVE channel is the per-session `toolDenylist` on session/create
+ * and session/resume (#340). The flag stays for a future CLI that wires it.
  */
 export function backendArgs(): string[] {
   const disallowed = disallowedToolsValue();

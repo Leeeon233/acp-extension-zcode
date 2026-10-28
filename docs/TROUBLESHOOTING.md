@@ -27,6 +27,10 @@
    ```
    - If not found, set: `export ZCODE_BIN=/path/to/zcode`
 
+   Which engine binary the bridge actually resolved — the `resolve: launching
+zcode with …` line, including every probe fallback — only prints with
+   `ZCODE_ACP_DEBUG=1`; set it before reporting backend-resolution issues (#320).
+
 3. Check the ZCode configuration:
 
    ```bash
@@ -109,8 +113,15 @@ account provider. A `headersApplied:false` answer makes the turn fail with
 -32031 and retry. The bridge (0.42.5+) answers with the coding plan's API key
 from `~/.zcode/v2/config.json` (`codingPlanRequestAuthFor`) — if sends still
 fail, check that the enabled `builtin:bigmodel-coding-plan` entry carries a
-non-empty `options.apiKey` in that file. Start-plan providers stay declined
-(Aliyun captcha — desktop app only, issue #123).
+non-empty `options.apiKey` in that file. On a fresh desktop-only install that
+never wrote `config.json`, both the entitlement snapshot and the request key
+come from the encrypted store `~/.zcode/v2/credentials.json` instead (#320) —
+log into the ZCode desktop app once so it exists. A coding-plan key added in
+the desktop's Settings → Model Provider ("Use API key") counts too (#344): it
+lands in `~/.zcode/v2/provider_config.json` as a
+`zhipu-coding-plan-api-key` rule and the bridge reads it as an entitlement +
+request-key source. Start-plan providers stay
+declined (Aliyun captcha — desktop app only, issue #123).
 
 ### Authentication / credential errors (401, provider auth failed)
 
@@ -128,7 +139,7 @@ non-empty `options.apiKey` in that file. Start-plan providers stay declined
    - There must be a `provider` entry with `"enabled": true`
    - Its `options.apiKey` must be present and non-empty
 
-2. If the file is missing or the key is stale, **install and log into the ZCode desktop app** — it writes a fresh `config.json` with a valid enabled provider. There is no manual API-key configuration in the editor.
+2. If the file is missing or the key is stale, **install and log into the ZCode desktop app** — it writes a fresh `config.json` with a valid enabled provider. There is no manual API-key configuration in the editor. The `authenticate` sign-in call editors make (Xcode) answers `{}` once ANY credential source is readable (config.json, provider_config.json's manual coding-plan key, a saved `zcode-acp setup` account, or the encrypted store); before that it errors with instructions.
 
 3. There is no env override for the provider base URL: the app-server reads `ZCODE_BASE_URL` as its own service origin, so the bridge never passes one through (see `src/backend/credentials.ts`). Edit `config.json` (or the provider config in the App) instead.
 

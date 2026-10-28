@@ -15,13 +15,16 @@
  * appears to do nothing.
  *
  * Error mapping is deliberately coarse — the module's messages are already
- * actionable, so they are passed through as `error` rather than re-coded. Only
- * the validation failures that indicate a malformed request get a 400;
+ * actionable, so they are passed through as `error` rather than re-coded.
+ * Only the validation failures that indicate a malformed request get a 400;
+ * an unreachable or failing upstream gets 502/504 (the request may still have
+ * been carried out, so the client retries with the same idempotency key);
  * everything else is a 500, because it means the environment is wrong.
  */
 
 import type { IncomingMessage, ServerResponse } from "node:http";
 
+import { backendCapabilities } from "../backend/adapter.js";
 import { loadAllModels } from "../config/options.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { warn } from "../utils.js";
@@ -31,6 +34,7 @@ import {
   updateProvider,
   upsertModel,
 } from "../settings/provider-config.js";
+import { testModelConnectivity } from "../settings/model-connectivity.js";
 import {
   readCliConfig,
   readHooks,
@@ -39,6 +43,7 @@ import {
   setMcpServerEnabled,
   updateHookEntry,
   upsertMcpServer,
+  validateMcpServer,
   type HookEventName,
 } from "../settings/cli-config.js";
 import {
@@ -57,6 +62,7 @@ import {
   setSkillEnabledByPath,
 } from "../settings/skills.js";
 import { listBackups, readJsonDocument, writeJsonAtomic } from "../settings/atomic-write.js";
+import { BrokenConfigError, UpstreamError } from "../settings/errors.js";
 import {
   appBundlePath,
   appUpdateState,
@@ -71,6 +77,37 @@ import {
 } from "../settings/app-update.js";
 import { readUsageStats, type UsageRange } from "../settings/usage-stats.js";
 import {
+  amendRunSettings,
+  conversationRuns,
+  deleteWorkflow,
+  dismissFinishedSessionRuns,
+  dismissWorkflowRun,
+  dismissWorkflowRuns,
+  getWorkflow,
+  listRuns,
+  listWorkflows,
+  moveWorkflow,
+  requireWorkflowEnabled,
+  resolveWorkflowZcodeSid,
+  resumeWorkflowRun,
+  runArtifactData,
+  runArtifactRead,
+  runArtifacts,
+  runEvents,
+  runNodeResult,
+  runWorkspace,
+  setWorkflowGateMode,
+  startSavedWorkflow,
+  stopWorkflowRun,
+  updateWorkflowMeta,
+  workflowCreatePrompt,
+  WorkflowApiError,
+  WORKFLOW_GATE_SETTINGS,
+  type WorkflowGateModeSetting,
+  type WorkflowScope,
+} from "../settings/workflow.js";
+import { workflowOverrideNow } from "../config/workflow-gate.js";
+import {
   codingPlanProviderIds,
   isCodingPlanProvider,
   markResetHistoryRead,
@@ -81,6 +118,11 @@ import {
   type ResetType,
 } from "../settings/coding-plan.js";
 import { queryQuota } from "../quota/index.js";
+import {
+  isPlatformUsageRange,
+  readPlatformUsage,
+  type PlatformUsageRange,
+} from "../quota/platform-usage.js";
 import { zcodeCliConfigPath, zcodePersonalProviderPath } from "../utils.js";
 
 /** Body size cap. Settings payloads are small; hooks are the largest. */
@@ -146,16 +188,75 @@ function num(body: Record<string, unknown>, key: string): number | undefined {
   return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
+/**
+ * Decode one path segment, treating a malformed escape as a bad request.
+ *
+ * `decodeURIComponent` throws on a truncated escape (`/settings/mcp/%E0`),
+ * which would otherwise fall through to the route-level catch and answer 500
+ * with a warn — the request was malformed, the server is fine.
+ */
+function segment(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    throw new BadRequest(`malformed percent-encoding in path segment: ${raw}`);
+  }
+}
+
+/** A request the client got wrong — always a 400, never a 500. */
+class BadRequest extends Error {}
+
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
 }
 
-/** Map a module error to a status code. */
+/**
+ * Map a module error to a status code.
+ *
+ * Three classes, and the distinction matters for retry: a broken environment
+ * (a damaged config file) is a 500 the client cannot fix; an UPSTREAM failure —
+ * the reset API or the release manifest being unreachable, timing out, or
+ * answering 5xx — is a 502/504, which tells the client "your request may have
+ * been carried out, ask again with the same idempotency key" rather than "you
+ * built the request wrong". Only a genuine business rejection is a 400.
+ *
+ * Classification is structural, never message-matching (#240's original bug
+ * shape): the settings modules throw typed errors at the site where the
+ * intent is known (`BadRequest` here, `BrokenConfigError`/`UpstreamError` in
+ * src/settings/errors.ts), and Node's own network failures carry their errno
+ * structurally — `fetch` wraps it in `cause.code` (an `AggregateError` nests
+ * it in `cause.errors[].code`), the http client sets `error.code` directly,
+ * and the AbortSignal timeout surfaces as a DOMException named TimeoutError.
+ * A bare `Error` is the default and stays a 400: the bulk of those are the
+ * modules' own request validation ("timeoutMs must be a positive number" is
+ * the client's fault, not a gateway timeout).
+ */
 function statusFor(error: unknown): number {
-  const message = error instanceof Error ? error.message : String(error);
-  if (/is not valid JSON|not a JSON object|refusing to write|could not be read/u.test(message)) {
-    // The environment is broken (a damaged config file) — not the client's fault.
-    return 500;
+  if (error instanceof BadRequest) return 400;
+  if (error instanceof BrokenConfigError) return 500;
+  if (error instanceof UpstreamError) return 502;
+  if (error instanceof Error) {
+    if (error.name === "TimeoutError" || error.name === "AbortError") return 504;
+    const err = error as NodeJS.ErrnoException & {
+      cause?: { code?: unknown; errors?: Array<{ code?: unknown }> };
+    };
+    const codes = [
+      err.code,
+      err.cause?.code,
+      ...(err.cause?.errors ?? []).map((e) => e.code),
+    ].filter((c): c is string => typeof c === "string");
+    if (
+      codes.some(
+        (c) =>
+          /^(ECONNRESET|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|ECONNABORTED|EPIPE)$/u.test(c) ||
+          // undici's own failure family — e.g. a destroyed socket surfaces as
+          // cause.code UND_ERR_SOCKET ("fetch failed" with no errno).
+          /^UND_ERR_/u.test(c),
+      )
+    ) {
+      return 502;
+    }
+    if (codes.some((c) => /^(EACCES|EPERM|EISDIR|ENOTDIR)$/u.test(c))) return 500;
   }
   return 400;
 }
@@ -181,6 +282,12 @@ export function createSettingsHandler(
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
     const path = url.pathname.replace(/^\/api/u, "").replace(/\/+$/u, "") || "/";
     void route(req, res, url, path, server ?? null).catch((error) => {
+      // A rejected path segment is the client's fault, not the server's — say
+      // so with a 400 instead of logging a warn and answering 500.
+      if (error instanceof BadRequest) {
+        if (!res.writableEnded) sendError(res, 400, error.message);
+        return;
+      }
       warn(
         `settings: unhandled route error: ${error instanceof Error ? error.message : String(error)}`,
       );
@@ -198,9 +305,28 @@ async function route(
 ): Promise<void> {
   const method = req.method ?? "GET";
 
+  // Capability gates (ADR-0023): a backend kind without a surface gets 404 —
+  // the route does not exist for it. The machine-level mount (no server)
+  // proxies per-instance bridges, which enforce their own kind's table.
+  const caps = backendCapabilities(server?.backendKind ?? "zcode");
+  const workflowRoute =
+    path === "/settings/workflows" ||
+    path === "/settings/workflow-gate" ||
+    path === "/settings/workflow-create-prompt" ||
+    path === "/settings/workflow-runs" ||
+    path.startsWith("/settings/workflows/") ||
+    path.startsWith("/settings/workflow-runs/");
+  if (workflowRoute && !caps.workflowRoutes) return sendError(res, 404, "not found");
+  if (path === "/settings/backend/restart" && !caps.backendRestart) {
+    return sendError(res, 404, "not found");
+  }
+  if (!workflowRoute && path !== "/settings/backend/restart" && !caps.settings) {
+    return sendError(res, 404, "not found");
+  }
+
   // ---- reads ----
   if (method === "GET") {
-    if (path === "/settings/all") return void (await handleAll(res));
+    if (path === "/settings/all") return void (await handleAll(res, server));
     if (path === "/settings/models") return void (await handleModels(res));
     if (path === "/settings/skills") return void (await handleSkills(res));
     if (path === "/settings/mcp") return void (await handleMcp(res));
@@ -208,10 +334,50 @@ async function route(
     if (path === "/settings/agents") return void (await handleAgents(res));
     if (path === "/settings/backups") return void (await handleBackups(res));
     if (path === "/settings/usage") return void (await handleUsage(res, url));
+    if (path === "/settings/usage-platform") return void (await handleUsagePlatform(res, url));
     if (path === "/settings/quota") return void (await handleQuota(res));
     if (path === "/settings/reset-cards") return void (await handleResetCards(res, url));
-    if (path === "/settings/pending-restart") return void (await handlePendingRestart(res));
+    if (path === "/settings/pending-restart") return void (await handlePendingRestart(res, server));
     if (path === "/settings/app-update") return void (await handleAppUpdate(res, url));
+    // ---- dynamic-workflow management (per-instance; see the section comment
+    // below the write block) ----
+    if (path === "/settings/workflows") return void (await handleWorkflowList(res, server, url));
+    if (path === "/settings/workflows/runs")
+      return void (await handleWorkflowRuns(res, server, url));
+    if (path === "/settings/workflow-create-prompt") {
+      return void (await handleWorkflowCreatePrompt(res, server, url));
+    }
+    if (path === "/settings/workflow-runs") {
+      return void (await handleConversationRuns(res, server, url));
+    }
+    if (path.startsWith("/settings/workflows/")) {
+      const parts = path.slice("/settings/workflows/".length).split("/").map(segment);
+      if (parts.length === 2)
+        return void (await handleWorkflowGet(res, server, parts[0]!, parts[1]!));
+    }
+    if (path.startsWith("/settings/workflow-runs/")) {
+      const parts = path.slice("/settings/workflow-runs/".length).split("/").map(segment);
+      // [runId, kind, …] — events | artifacts | artifacts/{id}/data |
+      // artifacts/{id}/read | workspace | nodes/{siteId}/{ordinal}
+      if (parts.length === 2 && parts[1] === "events") {
+        return void (await handleRunEvents(res, server, url, parts[0]!));
+      }
+      if (parts.length === 2 && parts[1] === "artifacts") {
+        return void (await handleRunArtifacts(res, server, url, parts[0]!));
+      }
+      if (parts.length === 4 && parts[1] === "artifacts" && parts[3] === "data") {
+        return void (await handleRunArtifactData(res, server, url, parts[0]!, parts[2]!));
+      }
+      if (parts.length === 4 && parts[1] === "artifacts" && parts[3] === "read") {
+        return void (await handleRunArtifactRead(res, server, url, parts[0]!, parts[2]!));
+      }
+      if (parts.length === 2 && parts[1] === "workspace") {
+        return void (await handleRunWorkspace(res, server, url, parts[0]!));
+      }
+      if (parts.length === 4 && parts[1] === "nodes") {
+        return void (await handleRunNodeResult(res, server, url, parts[0]!, parts[2]!, parts[3]!));
+      }
+    }
     return sendError(res, 404, "not found");
   }
 
@@ -230,19 +396,25 @@ async function route(
       }
     }
 
+    if (method === "PUT" && path === "/settings/workflow-gate") {
+      return void (await handleWorkflowGateSet(res, server, body));
+    }
     if (method === "PUT" && path.startsWith("/settings/providers/")) {
-      const id = decodeURIComponent(path.slice("/settings/providers/".length));
+      const id = segment(path.slice("/settings/providers/".length));
       return void (await handleUpdateProvider(res, id, body));
     }
     if (method === "POST" && path === "/settings/models") {
       return void (await handleUpsertModel(res, body));
     }
+    if (method === "POST" && path === "/settings/models/test") {
+      return void (await handleModelTest(res, body));
+    }
     if (method === "DELETE" && path.startsWith("/settings/models/")) {
       const rest = path.slice("/settings/models/".length);
       const sep = rest.indexOf("/");
       if (sep <= 0) return sendError(res, 400, "expected /settings/models/{providerId}/{modelId}");
-      const providerId = decodeURIComponent(rest.slice(0, sep));
-      const modelId = decodeURIComponent(rest.slice(sep + 1));
+      const providerId = segment(rest.slice(0, sep));
+      const modelId = segment(rest.slice(sep + 1));
       return void (await handleRemoveModel(res, providerId, modelId));
     }
     if (method === "POST" && path === "/settings/skills/enable") {
@@ -252,15 +424,15 @@ async function route(
       return void (await handleSkillCopy(res, body));
     }
     if (method === "DELETE" && path.startsWith("/settings/skills/")) {
-      const skillPath = decodeURIComponent(path.slice("/settings/skills/".length));
+      const skillPath = segment(path.slice("/settings/skills/".length));
       return void (await handleSkillDelete(res, skillPath));
     }
     if (method === "PUT" && path.startsWith("/settings/mcp/")) {
-      const name = decodeURIComponent(path.slice("/settings/mcp/".length));
+      const name = segment(path.slice("/settings/mcp/".length));
       return void (await handleMcpUpsert(res, name, body));
     }
     if (method === "DELETE" && path.startsWith("/settings/mcp/")) {
-      const name = decodeURIComponent(path.slice("/settings/mcp/".length));
+      const name = segment(path.slice("/settings/mcp/".length));
       return void (await guard(res, async () => {
         await removeMcpServer(name);
         return { ok: true as const, effect: "needs-restart" as Effect };
@@ -285,15 +457,15 @@ async function route(
       path.startsWith("/settings/agents/") &&
       path.endsWith("/enable")
     ) {
-      const name = decodeURIComponent(path.slice("/settings/agents/".length, -"/enable".length));
+      const name = segment(path.slice("/settings/agents/".length, -"/enable".length));
       return void (await handleAgentEnable(res, name, body));
     }
     if (method === "PUT" && path.startsWith("/settings/agents/")) {
-      const name = decodeURIComponent(path.slice("/settings/agents/".length));
+      const name = segment(path.slice("/settings/agents/".length));
       return void (await handleAgentUpsert(res, name, body));
     }
     if (method === "DELETE" && path.startsWith("/settings/agents/")) {
-      const name = decodeURIComponent(path.slice("/settings/agents/".length));
+      const name = segment(path.slice("/settings/agents/".length));
       return void (await guard(res, async () => {
         await deleteAgent(name);
         return { ok: true as const, effect: "needs-restart" as Effect };
@@ -316,6 +488,89 @@ async function route(
     }
     if (method === "POST" && path === "/settings/app-update/install") {
       return void (await handleAppUpdateInstall(res, body));
+    }
+    // ---- dynamic-workflow management (writes) ----
+    if (method === "PUT" && path.startsWith("/settings/workflows/") && path.endsWith("/meta")) {
+      const rest = path.slice("/settings/workflows/".length, -"/meta".length);
+      const parts = rest.split("/").map(segment);
+      if (parts.length !== 2) {
+        return sendError(res, 400, "expected /settings/workflows/{scope}/{name}/meta");
+      }
+      return void (await handleWorkflowMeta(res, server, parts[0]!, parts[1]!, body));
+    }
+    if (method === "DELETE" && path.startsWith("/settings/workflows/")) {
+      const parts = path.slice("/settings/workflows/".length).split("/").map(segment);
+      if (parts.length !== 2) {
+        return sendError(res, 400, "expected /settings/workflows/{scope}/{name}");
+      }
+      return void (await handleWorkflowDelete(res, server, parts[0]!, parts[1]!));
+    }
+    if (method === "POST" && path.startsWith("/settings/workflows/") && path.endsWith("/move")) {
+      const rest = path.slice("/settings/workflows/".length, -"/move".length);
+      const parts = rest.split("/").map(segment);
+      if (parts.length !== 2) {
+        return sendError(res, 400, "expected /settings/workflows/{scope}/{name}/move");
+      }
+      return void (await handleWorkflowMove(res, server, parts[0]!, parts[1]!));
+    }
+    if (method === "POST" && path.startsWith("/settings/workflows/") && path.endsWith("/start")) {
+      const rest = path.slice("/settings/workflows/".length, -"/start".length);
+      const parts = rest.split("/").map(segment);
+      if (parts.length !== 2) {
+        return sendError(res, 400, "expected /settings/workflows/{scope}/{name}/start");
+      }
+      return void (await handleWorkflowStart(res, server, parts[0]!, parts[1]!, body));
+    }
+    if (
+      method === "POST" &&
+      path.startsWith("/settings/workflow-runs/") &&
+      path.endsWith("/resume")
+    ) {
+      const runId = segment(path.slice("/settings/workflow-runs/".length, -"/resume".length));
+      if (!runId || runId.includes("/")) {
+        return sendError(res, 400, "expected /settings/workflow-runs/{runId}/resume");
+      }
+      return void (await handleWorkflowResume(res, server, runId, body));
+    }
+    if (
+      method === "POST" &&
+      path.startsWith("/settings/workflow-runs/") &&
+      path.endsWith("/stop")
+    ) {
+      const runId = segment(path.slice("/settings/workflow-runs/".length, -"/stop".length));
+      if (!runId || runId.includes("/")) {
+        return sendError(res, 400, "expected /settings/workflow-runs/{runId}/stop");
+      }
+      return void (await handleWorkflowStop(res, server, runId, body));
+    }
+    // Literal segment FIRST — it would otherwise parse as `{runId}` below.
+    if (method === "POST" && path === "/settings/workflow-runs/dismiss-finished") {
+      return void (await handleWorkflowDismissFinished(res, server, body));
+    }
+    if (method === "POST" && path === "/settings/workflow-runs/dismiss-batch") {
+      return void (await handleWorkflowDismissBatch(res, server, body));
+    }
+    if (
+      method === "POST" &&
+      path.startsWith("/settings/workflow-runs/") &&
+      path.endsWith("/dismiss")
+    ) {
+      const runId = segment(path.slice("/settings/workflow-runs/".length, -"/dismiss".length));
+      if (!runId || runId.includes("/")) {
+        return sendError(res, 400, "expected /settings/workflow-runs/{runId}/dismiss");
+      }
+      return void (await handleWorkflowDismiss(res, server, runId));
+    }
+    if (
+      method === "POST" &&
+      path.startsWith("/settings/workflow-runs/") &&
+      path.endsWith("/settings")
+    ) {
+      const runId = segment(path.slice("/settings/workflow-runs/".length, -"/settings".length));
+      if (!runId || runId.includes("/")) {
+        return sendError(res, 400, "expected /settings/workflow-runs/{runId}/settings");
+      }
+      return void (await handleRunSettingsAmend(res, server, runId, body, url));
     }
     return sendError(res, 404, "not found");
   }
@@ -351,7 +606,23 @@ export function resetPendingRestartForTest(): void {
   pendingRestartWrites = 0;
 }
 
-async function handlePendingRestart(res: ServerResponse): Promise<void> {
+async function handlePendingRestart(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+): Promise<void> {
+  // Only a mount with a backend can answer this honestly. The hub is a SEPARATE
+  // process from any bridge, so its copy of the counter is never cleared by a
+  // bridge's restart: it would report "restart needed" forever, with no request
+  // the client could make to satisfy it. Point at the per-instance spelling
+  // instead, which relays to the bridge that actually served the write.
+  if (!server) {
+    sendError(
+      res,
+      409,
+      "pending-restart is per-bridge — use /api/instances/{id}/settings/pending-restart",
+    );
+    return;
+  }
   await guard(res, async () => ({
     ok: true as const,
     pendingRestart: pendingRestartWrites > 0,
@@ -361,7 +632,7 @@ async function handlePendingRestart(res: ServerResponse): Promise<void> {
 
 // ---------- reads ----------
 
-async function handleAll(res: ServerResponse): Promise<void> {
+async function handleAll(res: ServerResponse, server: ZcodeAcpServer | null): Promise<void> {
   // Local config files are the environment: a failure here means the machine's
   // ZCode install is broken, so the whole request fails rather than returning a
   // half-populated screen.
@@ -398,7 +669,93 @@ async function handleAll(res: ServerResponse): Promise<void> {
   // do. The client gets eligibility only, and calls
   // `GET /settings/reset-cards?providerId=…` for the cards themselves.
   const resetCards = await resetCardEligibility();
-  sendJson(res, 200, { ok: true, models, skills, mcp, hooks, agents, usage, resetCards });
+  // Workflow gate: an independent degrade like usage — the machine-level mount
+  // has no backend (and so no gate) and reports `{available:false}`; a mount
+  // with a bridge reports the pinned verdict for its current backend.
+  const workflow = server ? await readWorkflowGateBlock(server) : { available: false as const };
+  sendJson(res, 200, { ok: true, models, skills, mcp, hooks, agents, usage, resetCards, workflow });
+}
+
+/**
+ * The gate verdict for `/settings/all`, folded to the disabled default on any
+ * failure. A bridge whose backend was never spawned (App-only flow) gets one
+ * here: ensureBackend starts the gate fetch, so the snapshot reports the real
+ * verdict instead of a false disabled.
+ */
+async function readWorkflowGateBlock(server: ZcodeAcpServer): Promise<{
+  enabled: boolean;
+  mode: string;
+  source: string;
+  override?: "disabled" | "onDemand" | "alwaysOn";
+}> {
+  try {
+    // Local override first: it answers WITHOUT a backend (a cold App-only
+    // bridge must not boot one just to report its own switch), and the
+    // `override` field tells the App which toggle position produced this.
+    const override = workflowOverrideNow();
+    if (override) {
+      return {
+        enabled: override.enabled,
+        mode: override.mode,
+        source: override.source,
+        override: override.mode,
+      };
+    }
+    if (!server.backendWorkflowGate) {
+      await server.ensureBackend().catch((): undefined => undefined);
+    }
+    const gate = server.backendWorkflowGate ? await server.backendWorkflowGate : null;
+    return gate ?? { enabled: false, mode: "unknown", source: "default" };
+  } catch {
+    return { enabled: false, mode: "unknown", source: "default" };
+  }
+}
+
+/**
+ * PUT /settings/workflow-gate — the App settings toggle's write half (per
+ * instance mount only; the machine-level hub answers 409 via workflowGuard):
+ * persist `workflow.mode` in the user config ("auto" = delete the key, follow
+ * the remote verdict) and answer the effective verdict the NEXT gate read
+ * sees. The config is machine-level — every bridge instance on the machine
+ * picks the flip up live on its next gate consumption.
+ */
+async function handleWorkflowGateSet(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  body: Record<string, unknown>,
+): Promise<void> {
+  if (!server) {
+    // Machine-level mount: the config write itself is machine-level, but the
+    // response folds the bridge's pinned remote verdict — point the client at
+    // the per-instance spelling instead of the generic workflows hint.
+    sendError(
+      res,
+      409,
+      "workflow-gate set is per-bridge — use /api/instances/{id}/settings/workflow-gate",
+    );
+    return;
+  }
+  await workflowGuard(res, server, async (srv) => {
+    const raw = body["mode"];
+    const mode = typeof raw === "string" ? raw.trim() : "";
+    if (!WORKFLOW_GATE_SETTINGS.includes(mode as WorkflowGateModeSetting)) {
+      throw new WorkflowApiError(
+        400,
+        "invalid_mode",
+        "mode must be one of: auto, disabled, onDemand, alwaysOn",
+      );
+    }
+    try {
+      await setWorkflowGateMode(mode as WorkflowGateModeSetting);
+    } catch (e) {
+      throw new WorkflowApiError(
+        500,
+        "config_write_failed",
+        `workflow-gate config write failed: ${e instanceof Error ? e.message : String(e)}`,
+      );
+    }
+    return { ok: true as const, gate: await readWorkflowGateBlock(srv) };
+  });
 }
 
 /**
@@ -443,6 +800,13 @@ async function handleModelsPayload(): Promise<unknown> {
       modelIds: rule.config?.personalModelIds ?? [],
       baseUrl: rule.config?.api?.baseUrl,
       apiType: rule.config?.api?.type,
+      // Presence only. The key never leaves the machine it was written on:
+      // the settings payload crosses a WebSocket, may be logged by a proxy,
+      // and the client has no use for the secret — it only needs to know
+      // whether the field is already populated.
+      hasApiKey: Boolean(rule.config?.access?.apiKey),
+      // Whether this provider can be edited at all (see updateProvider).
+      editable: true,
     })),
     modelRules: [
       ...personal.config.modelConfigRules.providerModelRules,
@@ -526,17 +890,57 @@ async function handleUpdateProvider(
 ): Promise<void> {
   const enabled = bool(body, "enabled");
   const providerName = str(body, "providerName");
-  if (enabled === undefined && providerName === undefined) {
-    sendError(res, 400, "nothing to update — send enabled and/or providerName");
+  // Endpoint edits. Presence decides ("null" clears), so these read the raw
+  // value rather than going through str(): `str` folds null into undefined
+  // and would make clearing unreachable.
+  const hasBaseUrl = "baseUrl" in body;
+  const hasApiType = "apiType" in body;
+  const hasApiKey = "apiKey" in body;
+  const nullable = (key: string): string | null =>
+    typeof body[key] === "string" ? (body[key] as string) : null;
+  if (
+    enabled === undefined &&
+    providerName === undefined &&
+    !hasBaseUrl &&
+    !hasApiType &&
+    !hasApiKey
+  ) {
+    sendError(
+      res,
+      400,
+      "nothing to update — send enabled, providerName, baseUrl, apiType and/or apiKey",
+    );
     return;
   }
   await guard(res, async () => {
     await updateProvider(providerId, {
       ...(enabled !== undefined ? { enabled } : {}),
       ...(providerName !== undefined ? { providerName } : {}),
+      ...(hasBaseUrl ? { baseUrl: nullable("baseUrl") } : {}),
+      ...(hasApiType ? { apiType: nullable("apiType") } : {}),
+      ...(hasApiKey ? { apiKey: nullable("apiKey") } : {}),
     });
     return { ok: true as const, effect: "immediate" as Effect };
   });
+}
+
+/**
+ * Probe one model with a minimal request (see settings/model-connectivity.ts).
+ *
+ * A failed probe is a NORMAL answer, not a 5xx: the UI renders the provider's
+ * message inline next to the row. Only a malformed request (no ids) is a 400.
+ */
+async function handleModelTest(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
+  const providerId = str(body, "providerId");
+  const modelId = str(body, "modelId");
+  if (!providerId || !modelId) {
+    sendError(res, 400, "providerId and modelId are required");
+    return;
+  }
+  await guard(res, async () => ({
+    ok: true as const,
+    result: await testModelConnectivity(providerId, modelId),
+  }));
 }
 
 async function handleUpsertModel(
@@ -614,6 +1018,14 @@ async function handleMcpUpsert(
   name: string,
   body: Record<string, unknown>,
 ): Promise<void> {
+  // Type-check the known fields before they land: a value the runtime rejects
+  // (an `args` string where it wants an array) would take out every server on
+  // the next start, not just this one.
+  const verdict = validateMcpServer(name, body);
+  if (verdict !== true) {
+    sendError(res, 400, typeof verdict === "string" ? verdict : "invalid MCP server config");
+    return;
+  }
   await guard(res, async () => {
     await upsertMcpServer(name, body as never);
     return { ok: true as const, effect: "needs-restart" as Effect };
@@ -640,10 +1052,10 @@ async function handleHookUpdate(
 ): Promise<void> {
   const parts = rest.split("/");
   if (parts.length !== 2) {
-    sendError(res, 400, "expected /settings/hooks/{event}/{matcherIndex}/{hookIndex}");
+    sendError(res, 400, "expected /settings/hooks/{event}/{matcherIndex}");
     return;
   }
-  const event = decodeURIComponent(parts[0]!) as HookEventName;
+  const event = segment(parts[0]!) as HookEventName;
   const matcherIndex = Number(parts[1]);
   const hookIndex = num(body, "hookIndex");
   if (!Number.isInteger(matcherIndex) || hookIndex === undefined || !Number.isInteger(hookIndex)) {
@@ -695,6 +1107,13 @@ async function handleAgentUpsert(
       return { ok: true as const, effect: "needs-restart" as Effect };
     }
     const description = str(body, "description");
+    // Advanced fields: a key's PRESENCE decides whether it is written, because
+    // `null` is the documented way to clear one ("inherit"). Reading through
+    // str()/bool() would fold null into undefined and make clearing
+    // unreachable.
+    const advanced = agentAdvancedPatch(body);
+    const promptPatch =
+      "systemPrompt" in body ? { systemPrompt: nullableString(body, "systemPrompt") } : {};
     const patch = {
       ...(description !== undefined ? { description } : {}),
       ...(str(body, "color") !== undefined ? { color: str(body, "color") } : {}),
@@ -702,6 +1121,8 @@ async function handleAgentUpsert(
       ...("thoughtLevel" in body
         ? { thoughtLevel: (body["thoughtLevel"] as string | null) ?? null }
         : {}),
+      ...promptPatch,
+      ...advanced,
     };
     let agent;
     try {
@@ -717,10 +1138,61 @@ async function handleAgentUpsert(
         ...(str(body, "color") !== undefined ? { color: str(body, "color") } : {}),
         ...(typeof body["model"] === "string" ? { model: body["model"] } : {}),
         ...(typeof body["thoughtLevel"] === "string" ? { thoughtLevel: body["thoughtLevel"] } : {}),
+        ...(typeof body["systemPrompt"] === "string" ? { systemPrompt: body["systemPrompt"] } : {}),
+        ...(Array.isArray(body["tools"]) ? { tools: body["tools"] as string[] } : {}),
+        ...(Array.isArray(body["disallowedTools"])
+          ? { disallowedTools: body["disallowedTools"] as string[] }
+          : {}),
+        ...(Array.isArray(body["skills"]) ? { skills: body["skills"] as string[] } : {}),
+        ...(typeof body["permissionMode"] === "string"
+          ? { permissionMode: body["permissionMode"] }
+          : {}),
+        ...(typeof body["maxTurns"] === "number" ? { maxTurns: body["maxTurns"] } : {}),
+        ...(typeof body["background"] === "boolean" ? { background: body["background"] } : {}),
+        ...(typeof body["injectAgentsMd"] === "boolean"
+          ? { injectAgentsMd: body["injectAgentsMd"] }
+          : {}),
       });
     }
     return { ok: true as const, effect: "needs-restart" as Effect, agent };
   });
+}
+
+/** A string field where `null` is meaningful (clear) and absent is not. */
+function nullableString(body: Record<string, unknown>, key: string): string | null {
+  const value = body[key];
+  return typeof value === "string" ? value : null;
+}
+
+/**
+ * The advanced agent fields present in a request body.
+ *
+ * Presence-driven like the model/thoughtLevel pair: `null` clears (or, for the
+ * lists, empties), an omitted key is left alone. Types are checked in the
+ * config module, which is also the only caller — this function's job is to tell
+ * "not sent" apart from "sent as null".
+ */
+function agentAdvancedPatch(body: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const key of ["tools", "disallowedTools", "skills"] as const) {
+    if (!(key in body)) continue;
+    const value = body[key];
+    out[key] = value === null ? null : Array.isArray(value) ? value : undefined;
+  }
+  if ("permissionMode" in body) {
+    const value = body["permissionMode"];
+    out.permissionMode = value === null ? null : typeof value === "string" ? value : undefined;
+  }
+  if ("maxTurns" in body) {
+    const value = body["maxTurns"];
+    out.maxTurns = value === null ? null : typeof value === "number" ? value : undefined;
+  }
+  for (const key of ["background", "injectAgentsMd"] as const) {
+    if (!(key in body)) continue;
+    const value = body[key];
+    out[key] = value === null ? null : typeof value === "boolean" ? value : undefined;
+  }
+  return out;
 }
 
 async function handleAgentEnable(
@@ -790,6 +1262,23 @@ async function handleUsage(res: ServerResponse, url: URL): Promise<void> {
   }));
 }
 
+/**
+ * Platform usage (the account-level monitor data behind the desktop app's
+ * Coding Plan usage tab). The module owns its error states, so the handler is
+ * a pure translation like handleQuota.
+ */
+async function handleUsagePlatform(res: ServerResponse, url: URL): Promise<void> {
+  const requested = url.searchParams.get("range") ?? "7d";
+  if (!isPlatformUsageRange(requested)) {
+    sendError(res, 400, "range must be one of today, 7d, 30d");
+    return;
+  }
+  await guard(res, async () => ({
+    ok: true as const,
+    platformUsage: await readPlatformUsage(requested as PlatformUsageRange),
+  }));
+}
+
 async function handleQuota(res: ServerResponse): Promise<void> {
   // Quota is account-level and already has a full result model; it is passed
   // through so a settings screen and the CLI card render the same data.
@@ -824,6 +1313,16 @@ async function handleResetCards(res: ServerResponse, url: URL): Promise<void> {
  * for this provider, and the idempotency key makes a retry safe. Both are
  * required: without the nonce a stale screen could burn a card, and without the
  * key a dropped response would let a retry burn a second one.
+ *
+ * The nonce is burned only AFTER the backend call settles, never before. The
+ * backend burns the card itself keyed on the idempotency key, so a request that
+ * reached the server and failed on the way back (timeout, dropped response,
+ * credential hiccup) can be retried with the SAME nonce and the SAME key and
+ * answer the same outcome. Burning it up front left the store holding a nonce
+ * the server had already consumed: every retry answered 409 no matter how many
+ * times the user tapped, and the only escape was finding the refresh control by
+ * trial and error. A nonce that fails validation up front is still rejected
+ * untouched — the burn happens only on a nonce this process actually accepted.
  */
 async function handleResetUse(res: ServerResponse, body: Record<string, unknown>): Promise<void> {
   const providerId = str(body, "providerId");
@@ -842,14 +1341,34 @@ async function handleResetUse(res: ServerResponse, body: Record<string, unknown>
     sendError(res, 400, "nonce and idempotencyKey are required");
     return;
   }
-  if (!consumeNonce(providerId, nonce)) {
+  // Validate without burning: the burn happens once the outcome is known. A
+  // spend already in flight for this provider rejects outright — without that
+  // check the deferred burn reopens the double-spend window, because a second
+  // gesture (a double tap, or a different client) reaches useResetCard with its
+  // own idempotency key before the first one settles.
+  if (!issuedNonces.get(providerId) || issuedNonces.get(providerId) !== nonce) {
     sendError(res, 409, "nonce is stale — refresh the reset card status and try again");
     return;
   }
-  await guard(res, async () => {
-    const result = await useResetCard(providerId, resetType as ResetType, idempotencyKey);
-    return { ok: true as const, ...result };
-  });
+  if (resetSpendsInFlight.has(providerId)) {
+    sendError(res, 409, "a reset for this provider is already in progress");
+    return;
+  }
+  resetSpendsInFlight.add(providerId);
+  try {
+    await guard(res, async () => {
+      const result = await useResetCard(providerId, resetType as ResetType, idempotencyKey);
+      // Burn only now: a retry that never reached the backend (a 400/500 thrown
+      // above, or a response the client never saw) may reuse this nonce. Delete
+      // only if it is still the nonce this request validated — a status read
+      // that landed mid-spend minted a newer one, and that one is what the
+      // client will send next.
+      if (issuedNonces.get(providerId) === nonce) issuedNonces.delete(providerId);
+      return { ok: true as const, ...result };
+    });
+  } finally {
+    resetSpendsInFlight.delete(providerId);
+  }
 }
 
 async function handleResetOpportunity(
@@ -893,19 +1412,32 @@ async function handleResetHistoryRead(
  * In-memory and single-use: a restart clears them, which only costs the user a
  * refresh. There is deliberately no persistence — a nonce that survived a
  * restart would outlive the status it vouched for.
+ *
+ * The burn is DEFERRED to after the backend call settles (see `handleResetUse`)
+ * so a retry after a mid-request failure is not locked out forever. That is
+ * safe because the spend itself is idempotent server-side: the same
+ * idempotency key answers the same outcome, so re-presenting a still-valid
+ * nonce cannot burn a second card. A CONCURRENT gesture is the case the
+ * deferred burn does not cover — that one is rejected by
+ * `resetSpendsInFlight` before it can race the in-flight spend.
  */
 const issuedNonces = new Map<string, string>();
+
+/**
+ * Providers with a spend in flight right now, one entry at a time per provider.
+ *
+ * The deferred burn is safe for a RETRY of the same gesture, whose second
+ * request carries the same idempotency key and therefore cannot burn a second
+ * card. It is NOT safe for a second, independent gesture (a double tap, or
+ * another client that read the same status), which brings its own key — so
+ * while a spend is running, every other use for that provider is refused
+ * instead of racing it to the backend.
+ */
+const resetSpendsInFlight = new Set<string>();
 
 /** Record the nonce a status read just issued. */
 export function rememberResetNonce(providerId: string, nonce: string): void {
   issuedNonces.set(providerId, nonce);
-}
-
-/** Validate and burn a nonce. False when it is missing, stale, or reused. */
-function consumeNonce(providerId: string, nonce: string): boolean {
-  if (issuedNonces.get(providerId) !== nonce) return false;
-  issuedNonces.delete(providerId);
-  return true;
 }
 
 /**
@@ -930,17 +1462,496 @@ async function handleBackendRestart(
   }
   const cancelled = server.pendingTurns.size;
   server.cancelAllPendingTurns();
+  let closed = false;
   try {
     await server.backend?.close();
+    closed = true;
   } catch (error) {
     warn(
       `settings: backend restart close failed: ${error instanceof Error ? error.message : String(error)}`,
     );
   }
   // The respawned backend reads MCP servers, hooks and subagent markdown at
-  // startup, so everything this process was waiting on is now applied.
-  pendingRestartWrites = 0;
-  sendJson(res, 200, { ok: true, cancelledTurns: cancelled });
+  // startup, so everything this process was waiting on is now applied — but
+  // only if the old subprocess actually went away. A close that failed while
+  // the process survives would leave the needs-restart writes unapplied, so
+  // the flag stays armed and the client is told to retry.
+  if (closed) pendingRestartWrites = 0;
+  sendJson(res, 200, { ok: true, cancelledTurns: cancelled, closed });
+}
+
+// ---------- dynamic-workflow management (plan §7, per-instance routes) ----------
+//
+// These routes proxy the backend's saved-workflow + run surfaces and are
+// PER-INSTANCE by construction: the bridge loopback serves them directly and
+// the hub re-serves them through the per-instance proxy
+// (`/api/instances/{id}/settings/…`, already covered by the hub's settings
+// wildcard). The hub's machine-level mount has no backend and no gate, so it
+// answers 409 pointing at the per-instance spelling (the pending-restart
+// precedent). Every handler also enforces the workflow gate: the upstream v4
+// start/resume commands are NOT policy-gated backend-side, so the bridge
+// guards with 403 workflow_disabled itself.
+
+/**
+ * Run one workflow handler with the mount + gate + error translation applied.
+ * Module errors carry their own HTTP code (`WorkflowApiError.code`) and a
+ * short `reason` token; anything else is an internal error, never a silent 200.
+ */
+async function workflowGuard(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  fn: (server: ZcodeAcpServer) => Promise<OkBody>,
+): Promise<void> {
+  if (!server) {
+    sendError(
+      res,
+      409,
+      "workflow routes are per-bridge — use /api/instances/{id}/settings/workflows",
+    );
+    return;
+  }
+  try {
+    sendJson(res, 200, await fn(server));
+  } catch (error) {
+    if (error instanceof WorkflowApiError) {
+      sendJson(res, error.code, {
+        ok: false as const,
+        error: error.reason,
+        ...(error.message !== error.reason ? { message: error.message } : {}),
+      });
+      return;
+    }
+    warn(
+      `settings: workflow route failed: ${error instanceof Error ? error.message : String(error)}`,
+    );
+    if (!res.writableEnded) sendError(res, 500, "internal error");
+  }
+}
+
+/** Validate a scope value from a path segment or query parameter. */
+function requireWorkflowScope(raw: string): WorkflowScope {
+  if (raw === "project" || raw === "global") return raw;
+  throw new WorkflowApiError(400, "invalid_scope", "scope must be one of project, global");
+}
+
+/** Read an optional integer query parameter; a non-integer is a 400. */
+function intQuery(url: URL, key: string): number | undefined {
+  const raw = url.searchParams.get(key);
+  if (raw === null || raw === "") return undefined;
+  const n = Number(raw);
+  if (!Number.isInteger(n)) {
+    throw new WorkflowApiError(400, "invalid_query", `${key} must be an integer`);
+  }
+  return n;
+}
+
+/** Optional integer query parameter that must be ≥ 0 when present (a cursor). */
+function nonNegativeIntQuery(url: URL, key: string): number | undefined {
+  const n = intQuery(url, key);
+  if (n !== undefined && n < 0) {
+    throw new WorkflowApiError(400, "invalid_query", `${key} must not be negative`);
+  }
+  return n;
+}
+
+/** Read a REQUIRED integer query parameter (≥ 0 unless `positive`). */
+function requiredIntQuery(url: URL, key: string): number {
+  const n = intQuery(url, key);
+  if (n === undefined) {
+    throw new WorkflowApiError(400, "invalid_query", `${key} is required and must be an integer`);
+  }
+  if (n < 0) {
+    throw new WorkflowApiError(400, "invalid_query", `${key} must not be negative`);
+  }
+  return n;
+}
+
+async function handleWorkflowList(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  url: URL,
+): Promise<void> {
+  const scopeRaw = url.searchParams.get("scope");
+  await workflowGuard(res, server, async (srv) => {
+    const scope = scopeRaw ? requireWorkflowScope(scopeRaw) : undefined;
+    return { ok: true as const, ...(await listWorkflows(srv, scope)) };
+  });
+}
+
+async function handleWorkflowGet(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  scopeRaw: string,
+  name: string,
+): Promise<void> {
+  await workflowGuard(res, server, async (srv) => {
+    const scope = requireWorkflowScope(scopeRaw);
+    return { ok: true as const, ...(await getWorkflow(srv, scope, name)) };
+  });
+}
+
+async function handleWorkflowMeta(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  scopeRaw: string,
+  name: string,
+  body: Record<string, unknown>,
+): Promise<void> {
+  await workflowGuard(res, server, async (srv) => {
+    const scope = requireWorkflowScope(scopeRaw);
+    return { ok: true as const, ...(await updateWorkflowMeta(srv, scope, name, body)) };
+  });
+}
+
+async function handleWorkflowDelete(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  scopeRaw: string,
+  name: string,
+): Promise<void> {
+  await workflowGuard(res, server, async (srv) => {
+    const scope = requireWorkflowScope(scopeRaw);
+    return { ok: true as const, ...(await deleteWorkflow(srv, scope, name)) };
+  });
+}
+
+/**
+ * Move a saved workflow global→project (the only direction the backend
+ * supports; promoting the other way goes through SaveWorkflow in a session).
+ */
+async function handleWorkflowMove(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  scopeRaw: string,
+  name: string,
+): Promise<void> {
+  await workflowGuard(res, server, async (srv) => {
+    const scope = requireWorkflowScope(scopeRaw);
+    return { ok: true as const, ...(await moveWorkflow(srv, scope, name)) };
+  });
+}
+
+async function handleWorkflowRuns(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  url: URL,
+): Promise<void> {
+  const scopeRaw = url.searchParams.get("scope");
+  const name = url.searchParams.get("name") ?? undefined;
+  await workflowGuard(res, server, async (srv) => {
+    // intQuery runs INSIDE the guard so a malformed value answers 400, not
+    // the route-level 500 (the handleRunArtifactRead pattern).
+    const limit = intQuery(url, "limit");
+    const scope = scopeRaw ? requireWorkflowScope(scopeRaw) : undefined;
+    return { ok: true as const, ...(await listRuns(srv, { scope, name, limit })) };
+  });
+}
+
+/** List a session's runs incl. the `resumable` flag (the resume button's source). */
+async function handleConversationRuns(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  url: URL,
+): Promise<void> {
+  const sessionId = url.searchParams.get("sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    const limit = intQuery(url, "limit");
+    if (!sessionId) throw new WorkflowApiError(400, "invalid_query", "sessionId is required");
+    const zcodeSid = resolveWorkflowZcodeSid(srv, sessionId);
+    return { ok: true as const, ...(await conversationRuns(srv, zcodeSid, limit)) };
+  });
+}
+
+async function handleRunEvents(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  url: URL,
+  runId: string,
+): Promise<void> {
+  const sessionId = url.searchParams.get("sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    const afterSequence = nonNegativeIntQuery(url, "afterSequence");
+    if (!sessionId) throw new WorkflowApiError(400, "invalid_query", "sessionId is required");
+    const zcodeSid = resolveWorkflowZcodeSid(srv, sessionId);
+    return {
+      ok: true as const,
+      ...(await runEvents(srv, zcodeSid, runId, afterSequence)),
+    };
+  });
+}
+
+async function handleRunArtifacts(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  url: URL,
+  runId: string,
+): Promise<void> {
+  const sessionId = url.searchParams.get("sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    if (!sessionId) throw new WorkflowApiError(400, "invalid_query", "sessionId is required");
+    const zcodeSid = resolveWorkflowZcodeSid(srv, sessionId);
+    return { ok: true as const, ...(await runArtifacts(srv, zcodeSid, runId)) };
+  });
+}
+
+async function handleRunArtifactData(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  url: URL,
+  runId: string,
+  artifactId: string,
+): Promise<void> {
+  const sessionId = url.searchParams.get("sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    const afterSequence = nonNegativeIntQuery(url, "afterSequence");
+    const limit = intQuery(url, "limit");
+    if (!sessionId) throw new WorkflowApiError(400, "invalid_query", "sessionId is required");
+    const zcodeSid = resolveWorkflowZcodeSid(srv, sessionId);
+    return {
+      ok: true as const,
+      ...(await runArtifactData(srv, zcodeSid, runId, artifactId, afterSequence, limit)),
+    };
+  });
+}
+
+async function handleRunArtifactRead(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  url: URL,
+  runId: string,
+  artifactId: string,
+): Promise<void> {
+  const sessionId = url.searchParams.get("sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    if (!sessionId) throw new WorkflowApiError(400, "invalid_query", "sessionId is required");
+    const zcodeSid = resolveWorkflowZcodeSid(srv, sessionId);
+    const version = requiredIntQuery(url, "version");
+    const offset = requiredIntQuery(url, "offset");
+    const limit = intQuery(url, "limit");
+    return {
+      ok: true as const,
+      ...(await runArtifactRead(srv, zcodeSid, runId, artifactId, version, offset, limit)),
+    };
+  });
+}
+
+async function handleRunWorkspace(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  url: URL,
+  runId: string,
+): Promise<void> {
+  const sessionId = url.searchParams.get("sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    if (!sessionId) throw new WorkflowApiError(400, "invalid_query", "sessionId is required");
+    const zcodeSid = resolveWorkflowZcodeSid(srv, sessionId);
+    return { ok: true as const, ...(await runWorkspace(srv, zcodeSid, runId)) };
+  });
+}
+
+async function handleRunNodeResult(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  url: URL,
+  runId: string,
+  siteId: string,
+  ordinalRaw: string,
+): Promise<void> {
+  const sessionId = url.searchParams.get("sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    if (!sessionId) throw new WorkflowApiError(400, "invalid_query", "sessionId is required");
+    const zcodeSid = resolveWorkflowZcodeSid(srv, sessionId);
+    const ordinal = Number(ordinalRaw);
+    if (!Number.isInteger(ordinal) || ordinal < 0) {
+      throw new WorkflowApiError(400, "invalid_query", "ordinal must be a non-negative integer");
+    }
+    return { ok: true as const, ...(await runNodeResult(srv, zcodeSid, runId, siteId, ordinal)) };
+  });
+}
+
+/**
+ * Launch a saved workflow. No `sessionId` → the bridge creates a session the
+ * App can see and attach to; with `sessionId` → launches in that (idle)
+ * session. The response carries `acpSessionId` + the ack's `runId`/
+ * `toolCallId` so the client can join its progress card immediately.
+ */
+async function handleWorkflowStart(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  scopeRaw: string,
+  name: string,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const args = body["args"];
+  const sessionId = str(body, "sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    const scope = requireWorkflowScope(scopeRaw);
+    if (args !== undefined && (typeof args !== "object" || args === null || Array.isArray(args))) {
+      throw new WorkflowApiError(400, "invalid_request", "args must be a JSON object");
+    }
+    const started = await startSavedWorkflow(srv, {
+      scope,
+      name,
+      ...(sessionId ? { acpSessionId: sessionId } : {}),
+      ...(args !== undefined ? { args: args as Record<string, unknown> } : {}),
+    });
+    return { ok: true as const, ...started };
+  });
+}
+
+/** Resume a stopped run in the caller-named session. */
+async function handleWorkflowResume(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  runId: string,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const sessionId = str(body, "sessionId");
+  const name = str(body, "name");
+  await workflowGuard(res, server, async (srv) => {
+    if (!sessionId) {
+      throw new WorkflowApiError(400, "invalid_request", "sessionId is required");
+    }
+    await resumeWorkflowRun(srv, {
+      runId,
+      acpSessionId: sessionId,
+      ...(name ? { name } : {}),
+    });
+    return { ok: true as const };
+  });
+}
+
+/**
+ * Stop a flying run from the management page — `session/cancelBackgroundTask`
+ * reached through the hub so a run on ANY instance is stoppable, not just the
+ * one the client's ACP socket is bound to.
+ */
+async function handleWorkflowStop(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  runId: string,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const sessionId = str(body, "sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    if (!sessionId) {
+      throw new WorkflowApiError(400, "invalid_request", "sessionId is required");
+    }
+    await stopWorkflowRun(srv, { runId, acpSessionId: sessionId });
+    return { ok: true as const };
+  });
+}
+
+/**
+ * Hide one settled run from the bridge's run lists (bridge-side hide list —
+ * the journal itself has no delete and stays untouched). 409 while the run
+ * is still flying; see dismissWorkflowRun for the semantics.
+ */
+async function handleWorkflowDismiss(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  runId: string,
+): Promise<void> {
+  await workflowGuard(res, server, async (srv) => dismissWorkflowRun(srv, runId));
+}
+
+/** Hide every SETTLED run of one session (body `{sessionId}`, the ACP id). */
+async function handleWorkflowDismissFinished(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const sessionId = str(body, "sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    if (!sessionId) {
+      throw new WorkflowApiError(400, "invalid_request", "sessionId is required");
+    }
+    return dismissFinishedSessionRuns(srv, sessionId);
+  });
+}
+
+/** Batch hide by explicit ids (body `{runIds}`); still-running ids are skipped. */
+async function handleWorkflowDismissBatch(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  body: Record<string, unknown>,
+): Promise<void> {
+  const runIds = body["runIds"];
+  await workflowGuard(res, server, async (srv) => {
+    if (!Array.isArray(runIds) || runIds.some((id) => typeof id !== "string")) {
+      throw new WorkflowApiError(400, "invalid_request", "runIds (string[]) is required");
+    }
+    return dismissWorkflowRuns(srv, runIds as string[]);
+  });
+}
+
+/**
+ * Amend a run's settings (three-state per field: absent = keep, `null` =
+ * revert to default, value = set). The body carries ONLY the settings delta —
+ * the session is addressed by `?sessionId=`, the run by the path segment
+ * (the run-query family on this prefix). The response's `runId` is the run
+ * that continues the work; `supersededRunId` appears only when the amendment
+ * stopped and replaced a flying run, and the client re-points its view then.
+ */
+async function handleRunSettingsAmend(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  runId: string,
+  body: Record<string, unknown>,
+  url: URL,
+): Promise<void> {
+  const sessionId = url.searchParams.get("sessionId");
+  await workflowGuard(res, server, async (srv) => {
+    if (!sessionId) throw new WorkflowApiError(400, "invalid_query", "sessionId is required");
+    // Three-state extraction is by KEY PRESENCE — reading through str()/num()
+    // would map the documented `null` clears to "absent" and make them unreachable.
+    const hasModel = "subagentModel" in body;
+    const hasConcurrency = "maxConcurrency" in body;
+    const model = body["subagentModel"];
+    const concurrency = body["maxConcurrency"];
+    if (hasModel && model !== null && (typeof model !== "string" || model.length === 0)) {
+      throw new WorkflowApiError(
+        400,
+        "invalid_request",
+        "subagentModel must be a non-empty string or null",
+      );
+    }
+    if (
+      hasConcurrency &&
+      concurrency !== null &&
+      (typeof concurrency !== "number" || !Number.isInteger(concurrency) || concurrency < 1)
+    ) {
+      throw new WorkflowApiError(
+        400,
+        "invalid_request",
+        "maxConcurrency must be an integer >= 1 or null",
+      );
+    }
+    const amended = await amendRunSettings(srv, {
+      runId,
+      acpSessionId: sessionId,
+      ...(hasModel ? { subagentModel: model as string | null } : {}),
+      ...(hasConcurrency ? { maxConcurrency: concurrency as number | null } : {}),
+    });
+    return { ok: true as const, ...amended };
+  });
+}
+
+/**
+ * The desktop's prefilled "create via conversation" prompt — the App puts
+ * this in the composer draft; it is prefill only, never auto-sent.
+ */
+async function handleWorkflowCreatePrompt(
+  res: ServerResponse,
+  server: ZcodeAcpServer | null,
+  url: URL,
+): Promise<void> {
+  const scopeRaw = url.searchParams.get("scope");
+  await workflowGuard(res, server, async (srv) => {
+    await requireWorkflowEnabled(srv);
+    const scope = scopeRaw ? requireWorkflowScope(scopeRaw) : undefined;
+    return { ok: true as const, prompt: workflowCreatePrompt(scope) };
+  });
 }
 
 // ---------- app update (ZCode desktop) ----------

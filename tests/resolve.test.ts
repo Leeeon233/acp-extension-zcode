@@ -20,7 +20,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { resolveZcodeCommand } from "../src/backend/resolve.js";
+import { disallowedToolList, resolveZcodeCommand } from "../src/backend/resolve.js";
 
 const SAVED = {
   ZCODE_BIN: process.env.ZCODE_BIN,
@@ -134,6 +134,43 @@ describe("resolveZcodeCommand disallowed tools", () => {
   });
 });
 
+// The array form feeds the per-session `toolDenylist` param (#340) — the
+// argv flag above is parsed but never consumed by the app-server path.
+describe("disallowedToolList (array form for session/create·resume toolDenylist)", () => {
+  const CRON_DEFAULTS = ["CronCreate", "CronList", "CronUpdate", "CronDelete"];
+
+  it("is the Cron* defaults when the env var is unset", () => {
+    delete process.env.ZCODE_DISALLOWED_TOOLS;
+    delete process.env.ZCODE_ENABLE_AUTOMATION_TOOLS;
+    expect(disallowedToolList()).toEqual(CRON_DEFAULTS);
+  });
+
+  it("merges the user list first, then the defaults, deduped across both separators", () => {
+    process.env.ZCODE_DISALLOWED_TOOLS = "Bash, Write Bash\tCronList";
+    delete process.env.ZCODE_ENABLE_AUTOMATION_TOOLS;
+    expect(disallowedToolList()).toEqual([
+      "Bash",
+      "Write",
+      "CronList",
+      "CronCreate",
+      "CronUpdate",
+      "CronDelete",
+    ]);
+  });
+
+  it("is the user list alone (normalized) when automation tools are opted in", () => {
+    process.env.ZCODE_DISALLOWED_TOOLS = "Bash,Write,Bash";
+    process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
+    expect(disallowedToolList()).toEqual(["Bash", "Write"]);
+  });
+
+  it("is empty on the opt-in path with the env var unset — nothing to deny", () => {
+    delete process.env.ZCODE_DISALLOWED_TOOLS;
+    process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
+    expect(disallowedToolList()).toEqual([]);
+  });
+});
+
 describe("zcodeDataBaseDirEnv (ZCODE_HOME → ZCODE_DATA_BASE_DIR)", () => {
   // The bridge reads the data tree through ZCODE_HOME (it replaces ~/.zcode
   // outright), but the backend's contract is ZCODE_DATA_BASE_DIR — the PARENT
@@ -146,22 +183,32 @@ describe("zcodeDataBaseDirEnv (ZCODE_HOME → ZCODE_DATA_BASE_DIR)", () => {
     else process.env.ZCODE_HOME = savedHome;
   });
 
-  it("derives the parent directory of the isolated data root", async () => {
+  it("derives the parent directory when the tree is named .zcode", async () => {
     const { zcodeDataBaseDirEnv } = await import("../src/backend/resolve.js");
-    process.env.ZCODE_HOME = "/tmp/isolated-zcode-home";
+    process.env.ZCODE_HOME = "/tmp/isolated/.zcode";
     // ZCODE_HOME replaces ~/.zcode OUTRIGHT, and the backend's contract is the
     // PARENT of .zcode — so the translation is a plain dirname.
     expect(zcodeDataBaseDirEnv()).toEqual({
-      ZCODE_DATA_BASE_DIR: path.dirname("/tmp/isolated-zcode-home"),
+      ZCODE_DATA_BASE_DIR: "/tmp/isolated",
     });
   });
 
   it("resolves a relative ZCODE_HOME against the cwd", async () => {
     const { zcodeDataBaseDirEnv } = await import("../src/backend/resolve.js");
-    process.env.ZCODE_HOME = "rel-home";
+    process.env.ZCODE_HOME = "rel-home/.zcode";
     expect(zcodeDataBaseDirEnv()).toEqual({
-      ZCODE_DATA_BASE_DIR: path.dirname(path.resolve("rel-home")),
+      ZCODE_DATA_BASE_DIR: path.dirname(path.resolve("rel-home/.zcode")),
     });
+  });
+
+  it("refuses to translate a tree not named .zcode", async () => {
+    const { zcodeDataBaseDirEnv } = await import("../src/backend/resolve.js");
+    process.env.ZCODE_HOME = "/tmp/isolated-zcode-home";
+    // The backend unconditionally appends `.zcode` to the base dir, so a
+    // differently-named tree CANNOT be projected onto it — dirname would point
+    // the backend at a sibling `.zcode` that belongs to someone else. Leaving
+    // the env unset (with a warning) is the honest failure.
+    expect(zcodeDataBaseDirEnv()).toEqual({});
   });
 
   it("returns {} when ZCODE_HOME is unset (ambient ZCODE_DATA_BASE_DIR passes through)", async () => {
@@ -222,7 +269,7 @@ describe("provider startup environment", () => {
     vi.stubEnv("ZCODE_ACP_SANDBOX", "0");
     const { ZcodeAcpServer } = await import("../src/server.js");
     const server = new ZcodeAcpServer();
-    const backend = server.ensureBackend();
+    const backend = await server.ensureBackend();
     try {
       const response = await backend.request(1, "probe");
       expect(response.error).toBeUndefined();

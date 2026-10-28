@@ -33,11 +33,39 @@ export function goalModeIsBackend(env: NodeJS.ProcessEnv = process.env): boolean
   return env.ZCODE_ACP_GOAL_MODE === "backend";
 }
 
+/**
+ * Quota auto-resume (workflow runs + /auto goal loops), default ON. The user
+ * asked for the wait-and-continue behavior to survive app sleep — the bridge
+ * owns the backend process, so it performs the wait. `0`/`false` restores the
+ * old pause-for-a-human behavior.
+ */
+export function quotaAutoResumeEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
+  const file = loadUserConfig(env).quota?.autoResume;
+  if (file !== undefined) return file;
+  const raw = env.ZCODE_ACP_QUOTA_AUTO_RESUME;
+  if (raw === undefined || raw.trim() === "") return true;
+  return !/^(0|false|off|no)$/i.test(raw.trim());
+}
+
 /** Mode a newly created session starts in (default "yolo"). */
 export function initialSessionMode(env: NodeJS.ProcessEnv = process.env): string {
   const file = loadUserConfig(env).session?.mode;
   if (file !== undefined) return file;
   return env.ZCODE_ACP_MODE || "yolo";
+}
+
+/**
+ * Successful turn-end status as assistant text; warnings are unaffected.
+ * Resolves the EXPLICIT preference only — config file first, then env.
+ * `undefined` means no explicit preference, so the caller applies the
+ * client default (TUI clients keep the line, editor clients do not).
+ */
+export function showCompletionStatus(env: NodeJS.ProcessEnv = process.env): boolean | undefined {
+  const file = loadUserConfig(env).session?.showCompletionStatus;
+  if (file !== undefined) return file;
+  const explicit = (env.ZCODE_ACP_SHOW_COMPLETION_STATUS ?? "").trim();
+  if (explicit === "") return undefined;
+  return !/^(0|false|off|no)$/i.test(explicit);
 }
 
 /**
@@ -60,6 +88,18 @@ export function globalSandboxEnabled(env: NodeJS.ProcessEnv = process.env): bool
   if (file !== undefined) return file;
   const raw = env.ZCODE_ACP_SANDBOX;
   return raw === "1" || raw === "true";
+}
+
+/**
+ * Sandbox ask timeout inside unattended contexts (goal-loop round, workflow
+ * parent): ms before the ask ends no-decision so the chain keeps moving;
+ * 0 = wait forever even unattended. Default 60s.
+ */
+export function sandboxUnattendedAskTimeoutMs(env: NodeJS.ProcessEnv = process.env): number {
+  const file = loadUserConfig(env).sandbox?.unattendedAskTimeoutMs;
+  if (file !== undefined) return file;
+  const raw = Number(env.ZCODE_ACP_SANDBOX_UNATTENDED_ASK_TIMEOUT_MS ?? "60000");
+  return Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 60000;
 }
 
 /** Verbose diagnostic logging flag. */

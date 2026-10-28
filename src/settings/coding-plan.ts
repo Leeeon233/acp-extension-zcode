@@ -29,17 +29,15 @@
  * fresh status nonce before it will call it.
  */
 
-import { createDecipheriv, createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { readFile } from "node:fs/promises";
-import { homedir, platform, userInfo } from "node:os";
 
+import { decryptCredential, resolveCredentialSecret } from "../backend/credential-store.js";
 import { log, zcodeCredentialsPath } from "../utils.js";
+import { UpstreamError } from "./errors.js";
 
 /** The only provider ids that own a coding plan. */
 const CODING_PLAN_PROVIDER_PREFIX = "account:";
-
-const ENCRYPTED_PREFIX = "enc:v1:";
-const CIPHER_ALGORITHM = "aes-256-gcm";
 
 const ZCODE_JWT_KEY = "zcodejwttoken";
 const OAUTH_TOKEN_KEYS = {
@@ -80,45 +78,8 @@ export interface ResetAuthorization {
   teamContext?: { organizationId: string; projectId: string };
 }
 
-/** Machine-bound fallback secret, mirroring ZCode's credential cipher. */
-function resolveCredentialSecret(env: NodeJS.ProcessEnv): string {
-  const configured = env.ZCODE_CREDENTIAL_SECRET?.trim();
-  if (configured) return configured;
-  let username = "unknown";
-  try {
-    username = userInfo().username;
-  } catch {
-    /* sandboxed runtimes may not resolve it */
-  }
-  return `zcode-credential-fallback:${platform()}:${homedir()}:${username}`;
-}
-
 /**
- * Decrypt one `enc:v1:` credential value.
- *
- * The wire form is `enc:v1:<iv>.<authTag>.<ciphertext>`, all base64url. A value
- * without the prefix is returned as-is (plaintext entries exist in the wild).
- */
-function decryptCredential(value: string, secret: string): string {
-  if (!value.startsWith(ENCRYPTED_PREFIX)) return value;
-  const payload = value.slice(ENCRYPTED_PREFIX.length);
-  const parts = payload.split(".");
-  if (parts.length !== 3) throw new Error("credential_decrypt_malformed");
-  const [ivRaw, tagRaw, cipherRaw] = parts as [string, string, string];
-  const iv = Buffer.from(ivRaw, "base64url");
-  const authTag = Buffer.from(tagRaw, "base64url");
-  const cipherText = Buffer.from(cipherRaw, "base64url");
-  const key = createHash("sha256").update(secret).digest();
-  try {
-    const decipher = createDecipheriv(CIPHER_ALGORITHM, key, iv);
-    decipher.setAuthTag(authTag);
-    return Buffer.concat([decipher.update(cipherText), decipher.final()]).toString("utf8");
-  } catch {
-    throw new Error("credentials_unavailable");
-  }
-}
-
-/** Read and decrypt the credential store. Throws `credentials_unavailable`. */
+ * Read and decrypt the credential store. Throws `credentials_unavailable`. */
 async function loadCredentials(env: NodeJS.ProcessEnv): Promise<Record<string, string>> {
   let raw: string;
   try {
@@ -243,10 +204,10 @@ async function callReset(
   const envelope = (payload ?? {}) as Envelope;
   if (typeof envelope.code === "number" && envelope.code !== 0) {
     if (acceptedCodes.includes(envelope.code)) return envelope;
-    throw new Error(`coding_plan_reset_api_error:${envelope.code}`);
+    throw new UpstreamError(`coding_plan_reset_api_error:${envelope.code}`);
   }
   if (!response.ok) {
-    throw new Error(`coding_plan_reset_http_error:${response.status}`);
+    throw new UpstreamError(`coding_plan_reset_http_error:${response.status}`);
   }
   return envelope;
 }

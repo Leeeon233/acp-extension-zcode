@@ -81,6 +81,9 @@ export interface Messages {
   sandboxOptionAllowOnce: string;
   sandboxOptionRejectOnce: string;
   sandboxOptionRejectAlways: string;
+  /** Injected "always allow" tier for the workflow approval tools (v3 crops
+   *  the backend's own session-always option — interaction/adapter.ts). */
+  permissionAlwaysSession: string;
   sandboxPopupTitle: (path: string) => string;
   sandboxPopupDetails: (path: string) => string;
   /** Island/strictGit denies can never be overridden by an allow. */
@@ -92,6 +95,20 @@ export interface Messages {
   sandboxRejectAlwaysPersisted: (path: string) => string;
   sandboxRejectAlwaysUnpersisted: (path: string) => string;
   sandboxRejectOnceHint: (path: string) => string;
+  /** Continuation prompt sent to the model after a user REJECTION (once or
+   *  always): the turn was frozen for the ask, so it resumes with this. */
+  sandboxRejectContinuation: (path: string) => string;
+  /** Status line for the user when an unattended ask timed out no-decision. */
+  sandboxUnattendedTimeoutHint: (path: string) => string;
+  /** Continuation prompt sent to the model after an unattended timeout —
+   *  points the model at already-granted directories instead of a bare EPERM. */
+  sandboxUnattendedTimeoutContinuation: (path: string) => string;
+  /** Status line for the user when an ask died undelivered (client error /
+   *  connection drop) while clients were around — not a user decision. */
+  sandboxAskUndeliveredHint: (path: string) => string;
+  /** Continuation prompt sent to the model after an ask died undelivered:
+   *  the frozen turn must still resume; no decision was persisted or pinned. */
+  sandboxAskUndeliveredContinuation: (path: string) => string;
   /** Continuation prompt sent to the model after an allow restart (all
    *  paths granted in one restart batch are listed together). */
   sandboxContinuationPrompt: (paths: string[]) => string;
@@ -166,6 +183,12 @@ export interface Messages {
   /** Goal-loop recovery hints on session/load (ADR-0022 §6). */
   goalHintInterrupted: (objective: string) => string;
   goalHintPaused: string;
+  /** Quota wait-and-continue (5h/weekly usage cap). */
+  goalQuotaWait: (until?: string) => string;
+  goalQuotaResumed: string;
+  /** Workflow-run quota auto-resume notices (bridge-side watchdog). */
+  workflowQuotaResumed: (label: string) => string;
+  workflowQuotaResumeGaveUp: (label: string) => string;
   slashForked: (sessionId: string) => string;
   slashModelSet: (value: string) => string;
   slashTuiOnly: (cmd: string) => string;
@@ -205,6 +228,8 @@ export interface Messages {
   /** Editor slash-command menu: localized descriptions for the static
    *  commands (names and argument hints stay as-is — they are tokens). */
   slashCommandDescriptions: Record<string, string>;
+  /** /workflow · /workflows with the dynamic-workflow gate disabled/pending. */
+  workflowDisabled: string;
   /** Auto-compaction status lines. */
   autoCompactStart: (used: string, threshold: string) => string;
   autoCompactTimeout: string;
@@ -214,8 +239,13 @@ export interface Messages {
    *  session_compact_failed/cancelled) — fed into autoCompactFailed. */
   autoCompactBackendFailed: string;
   /** Prompt rejection notice: a detached auto-compact is running, the message
-   * was NOT sent — resend after the ✓ compressed line. */
+   *  was NOT sent — resend after the ✓ compressed line. Now only the bounded
+   *  fallback (a compaction that outlived its settle cap) answers this. */
   autoCompactBusy: string;
+  /** Prompt hold notice: a detached auto-compact is running, the message is
+   *  QUEUED and goes out by itself once the compaction settles — the session
+   *  stays "executing" and the user has nothing to resend. */
+  autoCompactHeld: string;
   /** Goal-loop wait note: a compaction holds the lock, the round resumes by
    * itself once it settles (no user action needed). */
   autoCompactGoalWait: string;
@@ -234,6 +264,9 @@ export interface Messages {
   slashErrArg: (cmd: string) => string;
   slashErrUnknown: (cmd: string) => string;
   slashErrFailed: (cmd: string, msg: string) => string;
+  /** authenticate method errors — editors that honor authMethods (Xcode). */
+  authErrUnknownMethod: (method: string) => string;
+  authErrNoCredentials: string;
 }
 
 const zh: Messages = {
@@ -241,6 +274,7 @@ const zh: Messages = {
   sandboxOptionAllowOnce: "仅此一次",
   sandboxOptionRejectOnce: "拒绝一次",
   sandboxOptionRejectAlways: "始终拒绝",
+  permissionAlwaysSession: "本会话始终允许",
   sandboxPopupTitle: (p) => `沙箱写入放行:${p}`,
   sandboxPopupDetails: (p) =>
     `沙箱拒绝了工作区外的写入:${p}\n“始终允许”写入配置的 allow 列表,“始终拒绝”写入 deny 列表(.zcode/acp/sandbox.json,可编辑撤销)。`,
@@ -256,6 +290,16 @@ const zh: Messages = {
     `[已拒绝 ${p}(配置不可写,未持久化,同类写入下次仍会询问。)]`,
   sandboxRejectOnceHint: (p) =>
     `[已拒绝沙箱放行 ${p},未保存任何决定,同类写入会再次询问;如需放行,可编辑 .zcode/acp/sandbox.json 的 allow 列表(由桥写入,Agent 不可改)。]`,
+  sandboxRejectContinuation: (p) =>
+    `[用户拒绝了对 ${p} 的沙箱写入授权,沙箱保持原样。请改在已授权的目录内完成写入,或调整方案后继续任务。]`,
+  sandboxUnattendedTimeoutHint: (p) =>
+    `[无人值守(auto/工作流)中沙箱授权请求超时:${p} 在本次自动运行期间视同拒绝;任务将继续,相关写入仅限已授权目录。]`,
+  sandboxUnattendedTimeoutContinuation: (p) =>
+    `[沙箱授权请求未获答复已超时:${p} 在本次自动运行期间视同拒绝,不会再弹窗询问。请改在已授权的目录内完成写入,或调整方案后继续任务。]`,
+  sandboxAskUndeliveredHint: (p) =>
+    `[沙箱授权请求未能送达客户端(客户端错误或连接中断):${p} 暂按未授权处理;未保存任何决定,冷却后同类写入会再次询问。]`,
+  sandboxAskUndeliveredContinuation: (p) =>
+    `[沙箱授权请求未能送达(客户端错误或连接中断),未获得用户决定:${p} 的写入仍被沙箱拒绝。请改在已授权的目录内完成写入,或调整方案后继续任务。]`,
   sandboxContinuationPrompt: (ps) => `[沙箱已放行 ${ps.join("、")},请继续刚才的任务。]`,
   sandboxContinuationFailed: (err) =>
     `[沙箱已放行,但自动续接失败:${err}。请重新发送一条消息(例如"继续刚才的任务")以恢复工作。]`,
@@ -313,6 +357,12 @@ const zh: Messages = {
   goalReport: (r, max, t, done) => `[goal ${r}/${max}] ${done ? "✅ 已完成" : "进行中"}：${t}`,
   goalHintInterrupted: (o) => `⏸ goal loop（${o}）上次因桥接进程重启而中断 —— /auto resume 可继续`,
   goalHintPaused: "⏸ goal loop 处于暂停状态 —— /auto resume 可继续",
+  goalQuotaWait: (until) =>
+    `⏳ 配额已用尽${until ? `（预计 ${until} 重置）` : ""}——auto 任务挂起等待，恢复后自动继续；/auto stop 可取消`,
+  goalQuotaResumed: "▶️ 配额已恢复，auto 任务自动继续…",
+  workflowQuotaResumed: (label) => `▶️ 配额已恢复，工作流 ${label} 已自动续跑`,
+  workflowQuotaResumeGaveUp: (label) =>
+    `⚠️ 工作流 ${label} 多次自动续跑失败（配额仍未恢复）——请稍后手动恢复`,
   slashForked: (id) => `✓ 已分叉新会话：${id}`,
   slashModelSet: (v) => `✓ 模型 = ${v}`,
   slashTuiOnly: (cmd) => `⚠ /${cmd} 在 ACP 模式下不可用（需要 ZCode TUI）`,
@@ -355,15 +405,19 @@ const zh: Messages = {
     resume: "在当前线程接续一个历史会话（弹窗选择）",
     mcp: "列出可用的 MCP 服务器",
     init: "创建或更新工作区 AGENTS.md 指令",
+    workflow: "描述一个动态多步工作流，交给模型执行",
+    workflows: "列出已保存的工作流与最近的运行",
   },
+  workflowDisabled: "⚠ 工作流功能当前未开放",
   autoCompactStart: (used, threshold) =>
     `🔄 自动压缩: 上下文用量 ${used} ≥ 阈值 ${threshold},正在压缩…`,
   autoCompactTimeout: "⚠ 自动压缩超时（300s）——后端可能仍在处理",
   autoCompactDone: "✓ 自动压缩: 上下文已压缩",
   autoCompactFailed: (err) => `⚠ 自动压缩失败: ${err}`,
   autoCompactBackendFailed: "后端报告压缩失败（session_compact_failed）",
-  autoCompactBusy: "🔄 自动压缩进行中，这条消息未发送；看到“✓ 自动压缩”提示后请重新发送。",
-  autoCompactGoalWait: "⏳ 自动压缩进行中，auto 任务将在压缩结束后自动继续…",
+  autoCompactBusy: "🔄 压缩进行中，这条消息未发送；压缩完成后请重新发送。",
+  autoCompactHeld: "🔄 压缩进行中，这条消息已排队，压缩完成后会自动发送。",
+  autoCompactGoalWait: "⏳ 压缩进行中，auto 任务将在压缩结束后自动继续…",
   popupTitleExitPlan: "可以开始编码了吗？",
   popupTitleToolPermission: (tool) => `工具权限 (${tool})`,
   popupTitleInteraction: "交互",
@@ -375,6 +429,9 @@ const zh: Messages = {
   slashErrArg: (cmd) => `/${cmd} 需要参数`,
   slashErrUnknown: (cmd) => `未知命令 /${cmd}`,
   slashErrFailed: (cmd, msg) => `${cmd} 失败: ${msg}`,
+  authErrUnknownMethod: (method) => `未知的认证方式: ${method}`,
+  authErrNoCredentials:
+    "未找到 ZCode 凭据：请先登录 ZCode 桌面端（或在 Settings → Model Provider 里以 API key 方式添加 Coding Plan key），或运行 zcode-acp setup 保存账号，然后重试登录。",
 };
 
 const en: Messages = {
@@ -382,6 +439,7 @@ const en: Messages = {
   sandboxOptionAllowOnce: "Allow once",
   sandboxOptionRejectOnce: "Reject once",
   sandboxOptionRejectAlways: "Always reject",
+  permissionAlwaysSession: "Always allow in this session",
   sandboxPopupTitle: (p) => `Sandbox write request: ${p}`,
   sandboxPopupDetails: (p) =>
     `The sandbox denied a write outside the workspace: ${p}\n"Always allow" persists to the config's allow list, "Always reject" to its deny list (.zcode/acp/sandbox.json, editable to undo).`,
@@ -397,6 +455,16 @@ const en: Messages = {
     `[Rejected ${p} (config not writable, nothing persisted; the same write will ask again.)]`,
   sandboxRejectOnceHint: (p) =>
     `[Sandbox grant rejected for ${p}; no decision was saved and the same write will ask again. To grant, edit the allow list in .zcode/acp/sandbox.json (bridge-written, not agent-writable).]`,
+  sandboxRejectContinuation: (p) =>
+    `[The user rejected the sandbox write grant for ${p}; the sandbox is unchanged. Write inside already-granted directories, or adjust the plan and continue the task.]`,
+  sandboxUnattendedTimeoutHint: (p) =>
+    `[Sandbox ask for ${p} timed out while unattended (auto run / workflow): it counts as denied for the rest of this run; the task continues, writing only inside granted directories.]`,
+  sandboxUnattendedTimeoutContinuation: (p) =>
+    `[The sandbox grant request for ${p} timed out unanswered; for the rest of this automated run it counts as denied (no further asks). Write inside already-granted directories, or adjust the plan and continue the task.]`,
+  sandboxAskUndeliveredHint: (p) =>
+    `[The sandbox grant request for ${p} could not be delivered (client error or connection drop); it is treated as ungranted for now — no decision was saved, and the same write will ask again after the cooldown.]`,
+  sandboxAskUndeliveredContinuation: (p) =>
+    `[The sandbox grant request for ${p} could not be delivered (client error or connection drop) — no user decision was obtained; the write stays denied. Write inside already-granted directories, or adjust the plan and continue the task.]`,
   sandboxContinuationPrompt: (ps) =>
     `[Sandbox granted ${ps.join(", ")}; please continue the previous task.]`,
   sandboxContinuationFailed: (err) =>
@@ -461,6 +529,12 @@ const en: Messages = {
   goalHintInterrupted: (o) =>
     `⏸ goal loop (${o}) was interrupted by a bridge restart — /auto resume to continue`,
   goalHintPaused: "⏸ goal loop is paused — /auto resume to continue",
+  goalQuotaWait: (until) =>
+    `⏳ usage cap reached${until ? ` (resets ~${until})` : ""} — the auto loop is waiting and will continue after the reset; /auto stop to cancel`,
+  goalQuotaResumed: "▶️ quota recovered — auto loop continuing",
+  workflowQuotaResumed: (label) => `▶️ quota recovered — workflow ${label} resumed automatically`,
+  workflowQuotaResumeGaveUp: (label) =>
+    `⚠️ workflow ${label} gave up auto-resuming (quota still exhausted) — resume it manually later`,
   slashForked: (id) => `✓ forked new session: ${id}`,
   slashModelSet: (v) => `✓ model = ${v}`,
   slashTuiOnly: (cmd) => `⚠ /${cmd} is not available in ACP mode (requires ZCode TUI)`,
@@ -505,7 +579,10 @@ const en: Messages = {
     resume: "Resume a past session into this thread (picker popup)",
     mcp: "List available MCP servers",
     init: "Create or update workspace AGENTS.md instructions",
+    workflow: "Describe a dynamic multi-step workflow for the model to run",
+    workflows: "List saved workflows and recent runs",
   },
+  workflowDisabled: "⚠ Dynamic workflows are not available on this account yet",
   autoCompactStart: (used, threshold) =>
     `🔄 auto-compact: context usage ${used} ≥ threshold ${threshold}, compressing…`,
   autoCompactTimeout: "⚠ auto-compact timed out (300s) — backend may still be processing",
@@ -513,9 +590,11 @@ const en: Messages = {
   autoCompactFailed: (err) => `⚠ auto-compact failed: ${err}`,
   autoCompactBackendFailed: "backend reported compaction failed (session_compact_failed)",
   autoCompactBusy:
-    '🔄 auto-compact in progress — this message was NOT sent; resend it after the "✓ auto-compact" notice.',
+    "🔄 compaction in progress — this message was NOT sent; resend it once the compaction finishes.",
+  autoCompactHeld:
+    "🔄 compaction in progress — this message is queued and will be sent automatically once it finishes.",
   autoCompactGoalWait:
-    "⏳ auto-compact in progress — the auto run continues automatically once it finishes…",
+    "⏳ compaction in progress — the auto run continues automatically once it finishes…",
   popupTitleExitPlan: "Ready to code?",
   popupTitleToolPermission: (tool) => `tool permission (${tool})`,
   popupTitleInteraction: "interaction",
@@ -527,6 +606,9 @@ const en: Messages = {
   slashErrArg: (cmd) => `/${cmd} requires an argument`,
   slashErrUnknown: (cmd) => `unknown /${cmd}`,
   slashErrFailed: (cmd, msg) => `${cmd} failed: ${msg}`,
+  authErrUnknownMethod: (method) => `unknown auth method: ${method}`,
+  authErrNoCredentials:
+    "No ZCode credentials found: sign in to the ZCode desktop app (or add a coding-plan API key under Settings → Model Provider), or run zcode-acp setup to save an account, then retry.",
 };
 
 /** Current message table — resolved per call so env changes/tests apply live. */

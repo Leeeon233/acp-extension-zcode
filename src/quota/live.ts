@@ -18,15 +18,18 @@ import type * as acp from "@agentclientprotocol/sdk";
 
 import { buildConfigOptions } from "../config/options.js";
 import { parseRemoteConfig } from "../remote/config.js";
+import { pushActive } from "../push/config.js";
 import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { enqueueSessionSend } from "../handlers/io.js";
 import {
   composeQuotaDock,
+  formatCpDockSegment,
   formatGoDockSegment,
   formatOcDockSegment,
   formatQuotaDock,
 } from "./format.js";
+import { queryCpUsage } from "./cliproxy/index.js";
 import { queryQuota } from "./index.js";
 import { queryOcUsage } from "./ollama-cloud/index.js";
 import { queryGoUsage } from "./opencode-go/index.js";
@@ -47,10 +50,13 @@ let state: RefresherState | null = null;
 
 /**
  * Start the refresher (idempotent). No-op unless a martty client has been
- * seen — editor-only setups never poll the quota API in the background.
+ * seen OR WeCom push is ACTIVE — editor-only setups never poll the quota API
+ * in the background, but a push-configured bridge must: quota threshold
+ * warnings (§5.7) ride the same 60s refreshes, and the dock emit itself
+ * no-ops without martty connections.
  */
 export function startQuotaRefresher(server: ZcodeAcpServer): void {
-  if (state || !server.marttyClientSeen) return;
+  if (state || (!server.marttyClientSeen && !pushActive())) return;
   const entry: RefresherState = {
     server,
     timer: setInterval(() => void refresh(entry), QUOTA_REFRESH_INTERVAL_MS),
@@ -118,9 +124,12 @@ export async function fetchDockText(env: NodeJS.ProcessEnv = process.env): Promi
       // hub absent/restarting — silent fallback below
     }
   }
-  // Go and Ollama Cloud are best-effort: not_configured / auth_error / fetch
-  // failure renders as no segment, never blocking the GLM line.
-  const [glm, go, oc] = await Promise.all([
+  // Go, Ollama Cloud, and CLIProxy are best-effort: not_configured /
+  // auth_error / fetch failure renders as no segment, never blocking the GLM
+  // line. CLIProxy's own 5-minute module TTL is the rate guard here — the
+  // fallback never turns the 60s refresher into a fast poll against the
+  // Google quota endpoint.
+  const [glm, go, oc, cp] = await Promise.all([
     queryQuota().then(formatQuotaDock),
     queryGoUsage()
       .then(formatGoDockSegment)
@@ -128,8 +137,11 @@ export async function fetchDockText(env: NodeJS.ProcessEnv = process.env): Promi
     queryOcUsage()
       .then(formatOcDockSegment)
       .catch(() => null),
+    queryCpUsage()
+      .then((cp) => formatCpDockSegment(cp.result))
+      .catch(() => null),
   ]);
-  return composeQuotaDock(glm, go, oc);
+  return composeQuotaDock(glm, go, oc, cp);
 }
 
 /**

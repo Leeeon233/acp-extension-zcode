@@ -10,7 +10,10 @@
  */
 
 import type * as acp from "@agentclientprotocol/sdk";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
+
+import * as accountProvider from "../src/config/account-provider.js";
+import { messages } from "../src/i18n.js";
 
 import { ZCODE_AUTH_METHOD_ID, ZcodeAcpServer } from "../src/server.js";
 
@@ -38,6 +41,15 @@ describe("ZcodeAcpServer.initialize", () => {
     expect(resp.agentCapabilities?.sessionCapabilities?.list).toBeDefined();
     expect(resp.agentCapabilities?.sessionCapabilities?.resume).toBeDefined();
     expect(resp.agentCapabilities?.sessionCapabilities?.fork).toBeDefined();
+  });
+
+  it("advertises embedded resources, images, and no audio transcription", async () => {
+    const resp = await new ZcodeAcpServer().initialize(initParams());
+    expect(resp.agentCapabilities?.promptCapabilities).toEqual({
+      image: true,
+      audio: false,
+      embeddedContext: true,
+    });
   });
 
   // Registry CI gate: rejects `authMethods: []` with "No authMethods in response".
@@ -82,14 +94,21 @@ describe("ZcodeAcpServer.initialize", () => {
 describe("ZcodeAcpServer.authenticate", () => {
   it("accepts the advertised agent auth method and resolves the empty response", async () => {
     const server = new ZcodeAcpServer();
-    await expect(server.authenticate({ methodId: ZCODE_AUTH_METHOD_ID })).resolves.toEqual({});
+    const credentials = vi
+      .spyOn(accountProvider, "zcodeCredentialsPresent")
+      .mockReturnValueOnce(true);
+    try {
+      await expect(server.authenticate({ methodId: ZCODE_AUTH_METHOD_ID })).resolves.toEqual({});
+    } finally {
+      credentials.mockRestore();
+    }
     expect(server.backend).toBeNull();
   });
 
   it("rejects a method that was not advertised", async () => {
     const server = new ZcodeAcpServer();
     await expect(server.authenticate({ methodId: "not-advertised" })).rejects.toThrow(
-      /Unsupported authentication method/,
+      messages().authErrUnknownMethod("not-advertised"),
     );
   });
 });

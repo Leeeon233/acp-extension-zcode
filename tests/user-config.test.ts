@@ -5,7 +5,7 @@
  */
 
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
@@ -42,6 +42,19 @@ describe("userConfigPath", () => {
 });
 
 describe("loadUserConfig", () => {
+  it("validates the successful completion-status preference without dropping session mode", () => {
+    writeConfig(JSON.stringify({ session: { mode: "build", showCompletionStatus: false } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      session: { mode: "build", showCompletionStatus: false },
+    });
+    writeConfig(JSON.stringify({ session: { showCompletionStatus: true } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      session: { showCompletionStatus: true },
+    });
+    writeConfig(JSON.stringify({ session: { mode: "build", showCompletionStatus: "false" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ session: { mode: "build" } });
+  });
+
   it("missing file reads as empty (the no-file env-only path)", () => {
     expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({});
   });
@@ -83,6 +96,7 @@ describe("loadUserConfig", () => {
           ollamaApiKey: " sk-123 ",
           opencodeGoWorkspaceId: " wrk_x ",
           opencodeGoAuthCookie: " Fe26.2**y ",
+          opencodeGoApiKey: " oc_sk_test_key_12345 ",
         },
       }),
     );
@@ -91,6 +105,7 @@ describe("loadUserConfig", () => {
         ollamaApiKey: "sk-123",
         opencodeGoWorkspaceId: "wrk_x",
         opencodeGoAuthCookie: "Fe26.2**y",
+        opencodeGoApiKey: "oc_sk_test_key_12345",
       },
     });
   });
@@ -98,6 +113,16 @@ describe("loadUserConfig", () => {
   it("quota section alongside remote; blank ollamaApiKey dropped", () => {
     writeConfig(JSON.stringify({ remote: { enabled: true }, quota: { ollamaApiKey: "  " } }));
     expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ remote: { enabled: true } });
+  });
+
+  it("parses quota.autoResume (boolean only)", () => {
+    writeConfig(JSON.stringify({ quota: { autoResume: false } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ quota: { autoResume: false } });
+    writeConfig(JSON.stringify({ quota: { autoResume: true } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ quota: { autoResume: true } });
+    // Wrong type → dropped (the section stays empty and unset).
+    writeConfig(JSON.stringify({ quota: { autoResume: "no" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({});
   });
 
   it("non-object quota section is ignored with the remote section intact", () => {
@@ -121,10 +146,38 @@ describe("loadUserConfig", () => {
           bridgePort: "not-a-number",
           token: 42, // wrong type → ignored
           hubHost: "", // blank → ignored
+          webDir: "dist", // relative → ignored (hub cwd is unpredictable)
           terminal: { app: "  ", enabled: "yes" }, // blank app + wrong type
         },
       }),
     );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ remote: { enabled: true } });
+  });
+
+  it("accepts an absolute webDir, trimmed; blank is dropped", () => {
+    writeConfig(
+      JSON.stringify({
+        remote: { enabled: true, webDir: "  /srv/web-dist  ", hubHost: " " },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      remote: { enabled: true, webDir: "/srv/web-dist" },
+    });
+  });
+
+  it("expands a leading ~ in webDir to the home dir; ~otheruser stays relative", () => {
+    writeConfig(
+      JSON.stringify({
+        remote: { enabled: true, webDir: "  ~/web-dist  " },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      remote: { enabled: true, webDir: path.join(homedir(), "web-dist") },
+    });
+    writeConfig(JSON.stringify({ remote: { enabled: true, webDir: "~" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch }).remote?.webDir).toBe(homedir());
+    // Only the CURRENT user's home is knowable without a lookup — rejected.
+    writeConfig(JSON.stringify({ remote: { enabled: true, webDir: "~root/dist" } }));
     expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ remote: { enabled: true } });
   });
 
@@ -196,5 +249,76 @@ describe("loadUserConfig", () => {
       }),
     );
     expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ sandbox: { enabled: false } });
+  });
+
+  it("parses the push section incl. the relay sub-section (trimmed, blanks dropped)", () => {
+    writeConfig(
+      JSON.stringify({
+        push: {
+          enabled: true,
+          corpId: " ww-corp ",
+          agentId: 1000009,
+          secret: " s ",
+          toUser: " william ",
+          contentDetail: "minimal",
+          relay: { url: " https://relay.example.com/wecom/ ", token: " relay-tok ", junk: 1 },
+        },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      push: {
+        enabled: true,
+        corpId: "ww-corp",
+        agentId: 1000009,
+        secret: "s",
+        toUser: "william",
+        contentDetail: "minimal",
+        relay: { url: "https://relay.example.com/wecom/", token: "relay-tok" },
+      },
+    });
+  });
+
+  it("non-object push.relay drops with the rest of push intact", () => {
+    writeConfig(JSON.stringify({ push: { enabled: true, relay: "junk" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ push: { enabled: true } });
+  });
+
+  it("parses push.notify switches; non-booleans drop, siblings survive", () => {
+    writeConfig(
+      JSON.stringify({
+        push: {
+          enabled: true,
+          quietMs: 5000,
+          askDelayMs: 45000,
+          notify: { turn: false, goal: true, run: "yes", task: false, compact: true, ask: false },
+        },
+      }),
+    );
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      push: {
+        enabled: true,
+        quietMs: 5000,
+        askDelayMs: 45000,
+        notify: { turn: false, goal: true, task: false, compact: true, ask: false },
+      },
+    });
+    writeConfig(JSON.stringify({ push: { enabled: true, notify: "junk" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({ push: { enabled: true } });
+  });
+
+  it("parses the workflow gate override mode; invalid values drop with a warn", () => {
+    writeConfig(JSON.stringify({ workflow: { mode: "alwaysOn" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({
+      workflow: { mode: "alwaysOn" },
+    });
+
+    writeConfig(JSON.stringify({ workflow: { mode: "on-demand" } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({});
+
+    writeConfig(JSON.stringify({ workflow: { mode: 42 } }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({});
+
+    writeConfig(JSON.stringify({ workflow: "junk" }));
+    expect(loadUserConfig({ XDG_CONFIG_HOME: scratch })).toEqual({});
   });
 });
