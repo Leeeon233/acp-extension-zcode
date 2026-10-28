@@ -28,6 +28,7 @@ import {
 import type { ZcodeAcpServer } from "../server.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
 import { configProviderIdFor } from "./account-provider.js";
+import { readCredentialConfig } from "./bridge-accounts.js";
 import { initialSessionMode } from "./settings.js";
 
 interface ProviderModelsJson {
@@ -36,7 +37,7 @@ interface ProviderModelsJson {
 
 /** Read the config.json contents (UTF-8). Throws on read/parse failure. */
 function readConfig(): unknown {
-  return JSON.parse(readFileSync(ZCODE_CREDS_PATH, "utf8"));
+  return readCredentialConfig(ZCODE_CREDS_PATH);
 }
 
 /** A single provider's entry in config.json (`provider.<providerId>`). */
