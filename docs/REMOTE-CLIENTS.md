@@ -867,6 +867,15 @@ auto ladder quotes. A user-intent resume always passes and clears the whole
 group; so does a bridge re-advertising any spelling one heartbeat TTL after
 the close (real use again, the same self-heal contract as above).
 
+**`session/load` carries the same intent** (`_meta.zcode.intent`, same
+spelling and default): an `"auto"` load — a client reconnect ladder
+replaying its own tab after it missed the close — of a conversation the
+BRIDGE retired still replays the history asked for, but does NOT re-arm
+discovery (no re-advertise, so the hub tombstone above stays armed), and the
+result carries `_meta.zcode.sessionClosed: true`: retire the tab locally and
+do not retry. Omitted (or `"user"`) keeps the manual-reopen behavior — a
+human picking the session on a live bridge re-arms discovery as before.
+
 Cross-instance note: if the same conversation is also registered by another
 bridge of the project, the hub's dedupe re-attaches it under that instance —
 close it there too.

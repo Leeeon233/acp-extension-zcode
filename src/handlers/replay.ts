@@ -219,6 +219,19 @@ export function readTailLimit(params: acp.LoadSessionRequest): number | null {
 }
 
 /**
+ * Read the load intent from `session/load`'s `_meta.zcode.intent`:
+ * "auto" marks a CLIENT-AUTOMATIC replay (a reconnect ladder re-attaching its
+ * own tab after it missed the remote-close broadcast); "user" — the default
+ * when the field is absent or misspelled, so old clients need no change — is
+ * a human picking the session. An auto load of a remotely closed conversation
+ * must not resurrect it (see loadSession's retirement gate).
+ */
+export function readLoadIntent(params: acp.LoadSessionRequest): "auto" | "user" {
+  const zcode = (params._meta as { zcode?: { intent?: unknown } } | undefined)?.zcode;
+  return zcode?.intent === "auto" ? "auto" : "user";
+}
+
+/**
  * Drop duplicate entries the backend can return for the same message id
  * (observed in live session/messages payloads: the same id appears at
  * multiple, non-adjacent positions with identical content). Replaying every

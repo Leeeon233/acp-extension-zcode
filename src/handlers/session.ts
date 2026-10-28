@@ -94,6 +94,7 @@ import {
   fetchMessages,
   fetchMessagesSinceAnchor,
   fullSlice,
+  readLoadIntent,
   readTailLimit,
   REPLY_READ_LIMIT,
   replayMessages,
@@ -1438,6 +1439,20 @@ export async function loadSession(
   const limit = readTailLimit(params);
   const metadataOnly = limit === 0;
 
+  // Load intent (ADR-0006 follow-up, hub intent-gate parity): "auto" marks a
+  // CLIENT-AUTOMATIC replay — a reconnect ladder re-attaching its own tab
+  // after it missed the remote-close broadcast (deep sleep, disconnect,
+  // killed process; the close side effects are invisible to it). Such a load
+  // of a RETIRED conversation replays history as asked but must not re-arm
+  // discovery: ADR-0006's re-arm exists for a HUMAN picking the session, and
+  // an auto re-arm would re-advertise the sid → the heartbeat reports it →
+  // the hub clears the close tombstone group → the conversation resurrects
+  // on every surface and the auto-409 gate disarms with it. The response
+  // discloses the suppression via `_meta.zcode.sessionClosed: true` so the
+  // client can retire its tab locally. "user" (the default — old clients)
+  // keeps the manual-reopen re-arm exactly as before.
+  const retiredForAuto = readLoadIntent(params) === "auto" && server.isDiscoveryRetired(acpSid);
+
   if (!alreadyLive) {
     // Same mcpServers contract as resume: the client may re-declare them on
     // load; a stored set keeps riding along when it doesn't (#193).
@@ -1529,7 +1544,7 @@ export async function loadSession(
     replayedHistory = settledHistory ?? (await fetchMessagesForReplay(server, zcodeSid));
     // History on disk = real interaction (covers untitled sessions resumed from
     // a previous bridge lifetime) — make the session discoverable remotely.
-    if (replayedHistory.length > 0) server.markSessionActive(acpSid);
+    if (replayedHistory.length > 0 && !retiredForAuto) server.markSessionActive(acpSid);
     slice = limit === null ? fullSlice(replayedHistory) : sliceTail(replayedHistory, limit);
     log(
       `session/load: history replay skipped (boot-resume); ${slice.meta.totalMessages} messages on record`,
@@ -1541,7 +1556,7 @@ export async function loadSession(
     slice = await withReplayBatch(acpSid, async () => {
       const history = settledHistory ?? (await replayHistoryFor());
       replayedHistory = history;
-      if (history.length > 0) server.markSessionActive(acpSid);
+      if (history.length > 0 && !retiredForAuto) server.markSessionActive(acpSid);
       const batchSlice = limit === null ? fullSlice(history) : sliceTail(history, limit);
       await replayMessages(cx, acpSid, batchSlice.batch);
       // total M always logged: a first-entry total below the session's real size
@@ -1591,6 +1606,10 @@ export async function loadSession(
     configOptions: await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx)),
     // Additive replay metadata — the anchor for load_earlier pagination.
     replayMeta: { ...slice.meta, turnActive },
+    // The auto-load retirement disclosure (see retiredForAuto above): tells
+    // the reconnecting client the conversation was closed remotely so it can
+    // retire the tab instead of re-attaching next wake.
+    ...(retiredForAuto ? { _meta: { zcode: { sessionClosed: true } } } : {}),
   };
   scheduleQuotaDockBackstop(server);
   return result as acp.LoadSessionResponse;

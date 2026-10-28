@@ -944,6 +944,17 @@ export class ZcodeAcpServer {
   }
 
   /**
+   * True when the session is currently retired from remote discovery — the
+   * remote-close stamp an AUTO `session/load` checks so a client reconnect
+   * ladder cannot resurrect the conversation (ADR-0006 follow-up): the load
+   * replays history but skips the re-arm and answers
+   * `_meta.zcode.sessionClosed: true`.
+   */
+  isDiscoveryRetired(acpSid: string): boolean {
+    return this.discoveryRetiredAt.has(acpSid);
+  }
+
+  /**
    * True when the session was retired from discovery at or after `sinceMs` —
    * the guard a turn's settle path checks (`turnStartedAt`): a turn that was
    * already running when the close retired the conversation belongs to the
