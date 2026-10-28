@@ -960,7 +960,11 @@ describe("hub terminal-TUI session resume (ADR-0017)", () => {
     // Immediate: the listing no longer offers the sid before any heartbeat.
     expect(await sidsOf()).toEqual([]);
 
-    const auto = await post(hub, { workspacePath: PROJECT, sessionId: "sess_closed", intent: "auto" });
+    const auto = await post(hub, {
+      workspacePath: PROJECT,
+      sessionId: "sess_closed",
+      intent: "auto",
+    });
     expect(auto.status).toBe(409);
     expect(await auto.text()).toBe("session closed");
     expect(spawnCalls).toHaveLength(0);
@@ -968,7 +972,11 @@ describe("hub terminal-TUI session resume (ADR-0017)", () => {
     // A heartbeat already in flight when the close landed still carries the
     // sid from its pre-close snapshot; it must not clear the fresh stone.
     expect((await advertise()).ok).toBe(true);
-    const autoAgain = await post(hub, { workspacePath: PROJECT, sessionId: "sess_closed", intent: "auto" });
+    const autoAgain = await post(hub, {
+      workspacePath: PROJECT,
+      sessionId: "sess_closed",
+      intent: "auto",
+    });
     expect(autoAgain.status).toBe(409);
 
     // User intent (the default — older clients send none) passes the gate
@@ -982,11 +990,99 @@ describe("hub terminal-TUI session resume (ADR-0017)", () => {
 
     // The stone is gone: an AUTO resume is honest again (the ladder may
     // re-incubate a session the user reopened on purpose).
-    const afterReopen = post(hub, { workspacePath: PROJECT, sessionId: "sess_closed", intent: "auto" });
+    const afterReopen = post(hub, {
+      workspacePath: PROJECT,
+      sessionId: "sess_closed",
+      intent: "auto",
+    });
     await new Promise((r) => setTimeout(r, 400));
     expect(spawnCalls).toHaveLength(2);
     await registerServeBridge(hub, "resume-repl-2", spawnCalls[1]!.env.ZCODE_ACP_SPAWN_NONCE);
     expect((await afterReopen).status).toBe(200);
+  });
+
+  it("tombstones EVERY spelling of the closed conversation, not just the URL's", async () => {
+    // The sid-alias hole (review of the close-tombstone feature): the same
+    // conversation is addressable under different spellings — discovery
+    // shows the editor alias, a reconnect ladder may quote the backend
+    // sess_ id. The close answer carries the bridge-resolved spelling set,
+    // and the tombstone, the cached-entry drop, and every clear path operate
+    // on the whole GROUP: autos are refused whichever id they quote, and a
+    // user resume under ONE spelling revives them all.
+    const hub = await startTestHub({ spawnServe: spawnServeSpy() });
+    const bridge = createServer((req, res) => {
+      req.resume();
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end('{"ok":true,"sessionIds":["acp-alias-1","sess_backend_1"]}');
+    });
+    const bridgePort = await new Promise<number>((resolve) => {
+      bridge.listen(0, "127.0.0.1", () => {
+        const addr = bridge.address();
+        resolve(typeof addr === "object" && addr ? addr.port : 0);
+      });
+    });
+    track(bridge, (s) => new Promise<void>((resolve) => s.close(() => resolve())));
+    const advertise = (sessionId: string) =>
+      fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          registerBody({
+            id: "holder",
+            workspace: PROJECT,
+            origin: "serve",
+            port: bridgePort,
+            sessions: [{ sessionId, title: "t", updatedAt: 1 }],
+          }),
+        ),
+      });
+    expect((await advertise("acp-alias-1")).ok).toBe(true);
+    const sidsOf = async () => {
+      const list = (await (await listInstances(hub)).json()) as Array<{
+        id: string;
+        sessions: Array<{ sessionId: string }>;
+      }>;
+      return list.find((e) => e.id === "holder")!.sessions.map((s) => s.sessionId);
+    };
+    expect(await sidsOf()).toEqual(["acp-alias-1"]);
+
+    // Close by the ALIAS spelling (what the listing offered); the bridge's
+    // 200 answer names the backend spelling too.
+    const closed = await fetch(
+      `http://127.0.0.1:${hub.port}/api/instances/holder/sessions/acp-alias-1/close`,
+      { method: "POST", headers: auth },
+    );
+    expect(closed.status).toBe(200);
+    expect(await sidsOf()).toEqual([]);
+
+    // The ladder quoting the OTHER spelling is still refused — the single-
+    // key tombstone used to let exactly this through.
+    expect(
+      (await post(hub, { workspacePath: PROJECT, sessionId: "sess_backend_1", intent: "auto" }))
+        .status,
+    ).toBe(409);
+    expect(
+      (await post(hub, { workspacePath: PROJECT, sessionId: "acp-alias-1", intent: "auto" }))
+        .status,
+    ).toBe(409);
+    expect(spawnCalls).toHaveLength(0);
+
+    // A user resume under the alias revives the whole group: the backend
+    // spelling is honest again for autos too.
+    const user = post(hub, { workspacePath: PROJECT, sessionId: "acp-alias-1" });
+    await new Promise((r) => setTimeout(r, 400)); // one poll tick
+    expect(spawnCalls).toHaveLength(1);
+    await registerServeBridge(hub, "resume-repl", spawnCalls[0]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await user).status).toBe(200);
+    const auto = post(hub, {
+      workspacePath: PROJECT,
+      sessionId: "sess_backend_1",
+      intent: "auto",
+    });
+    await new Promise((r) => setTimeout(r, 400));
+    expect(spawnCalls).toHaveLength(2);
+    await registerServeBridge(hub, "resume-repl-2", spawnCalls[1]!.env.ZCODE_ACP_SPAWN_NONCE);
+    expect((await auto).status).toBe(200);
   });
 
   it("carries the resume env into the .command script so the terminal shell boots into the session", () => {

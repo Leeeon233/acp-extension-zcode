@@ -212,6 +212,13 @@ async function handleClose(
     sendText(res, 404, "unknown session");
     return;
   }
+  // Every spelling this bridge knows for the conversation (editor alias(es) +
+  // backend sess_ id), captured before retirement: the $/zcode/session_closed
+  // fan-out below routes by payload sessionId, and the response's
+  // `sessionIds` lets the HUB tombstone the whole conversation — not just the
+  // one spelling the close URL happened to quote (a reconnect ladder may
+  // POST the backend id while the listing showed the alias).
+  const aliases = server.sessionAliases(sessionId);
   const zcodeSid = server.resolveSid(sessionId);
   const running =
     zcodeSid !== undefined &&
@@ -237,8 +244,10 @@ async function handleClose(
   // Retire from discovery AND stamp the retirement: a turn that outlives the
   // force-settle bound settles after this point, and its terminal activity
   // must not re-advertise the conversation (the desktop's vanished-then-
-  // resurrected row, 2026-10-22).
-  server.retireDiscovery(sessionId);
+  // resurrected row, 2026-10-22). EVERY spelling gets the stamp (hub tombstone
+  // parity): a load or close may quote the backend id while the listing showed
+  // the alias, and the auto-load retirement gate checks the quoted spelling.
+  for (const sid of aliases) server.retireDiscovery(sid);
   // Workflow-run progress pollers address this session's journal — stop them
   // with the teardown (best-effort, never throws) instead of letting them run
   // to the hard cap for a conversation nothing else references anymore.
@@ -275,14 +284,12 @@ async function handleClose(
     // wait per client, so this cannot hang the close. Clients that don't
     // know the method (old martty, editors) ignore it.
     await Promise.all(
-      server
-        .sessionAliases(sessionId)
-        .map((sid) =>
-          server.clients.notifyEach("$/zcode/session_closed", () => ({ sessionId: sid })),
-        ),
+      aliases.map((sid) =>
+        server.clients.notifyEach("$/zcode/session_closed", () => ({ sessionId: sid })),
+      ),
     );
   }
-  sendJson(res, 200, { ok: true });
+  sendJson(res, 200, { ok: true, sessionIds: aliases });
   if (terminate?.terminate) terminateAfterFlush(terminate, res);
 }
 

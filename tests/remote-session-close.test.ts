@@ -74,10 +74,32 @@ describe("session close endpoint", () => {
 
     const res = await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" });
     expect(res.status).toBe(200);
-    expect(await res.json()).toEqual({ ok: true });
+    expect(await res.json()).toEqual({ ok: true, sessionIds: [acpSid] });
 
     expect(collectStatus(server).sessions.map((s) => s.sessionId)).not.toContain(acpSid);
     expect((await collectSessions(server)).map((s) => s.sessionId)).not.toContain(acpSid);
+  });
+
+  it("the close answer reports every alias spelling of the conversation", async () => {
+    // The hub tombstones the conversation by this set (review of the
+    // close-tombstone feature): one key per spelling, so an auto reconnect
+    // ladder is refused whichever id it quotes — the backend sess_ id or the
+    // editor alias.
+    const server = new ZcodeAcpServer();
+    const { acpSid, zcodeSid } = seedSession(server, { title: "t" });
+    const acpSid2 = randomUUID();
+    server.registerSession(acpSid2, zcodeSid);
+    const base = await bootClose(server);
+
+    const res = await fetch(`${base}/sessions/${acpSid}/close`, { method: "POST" });
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as { ok: boolean; sessionIds: string[] };
+    expect(body.ok).toBe(true);
+    expect(body.sessionIds).toEqual([acpSid, acpSid2]);
+    // The retirement stamp covers every spelling too (hub tombstone parity):
+    // an auto session/load may quote either id.
+    expect(server.discoveryRetiredAt.has(acpSid)).toBe(true);
+    expect(server.discoveryRetiredAt.has(acpSid2)).toBe(true);
   });
 
   it("a turn that settles after the close does not re-advertise the conversation", async () => {

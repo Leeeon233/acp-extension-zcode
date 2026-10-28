@@ -828,7 +828,7 @@ Two layers (ADR-0005), both plain HTTP — no ACP connection needed:
 ## Closing a session
 
 ```text
-POST {hub}/api/instances/{id}/sessions/{sessionId}/close   → 200 { "ok": true }
+POST {hub}/api/instances/{id}/sessions/{sessionId}/close   → 200 { "ok": true, "sessionIds": ["…"] }
 ```
 
 Retires a conversation from remote discovery. This addresses a protocol gap:
@@ -860,9 +860,12 @@ records the sid hub-side, and `POST /api/instances` refuses an **auto**
 resume of it with `409 session closed` (the `intent` field under
 [Creating / resuming a session](#creating--resuming-a-session)) — a client's
 reconnect ladder must not resurrect a session the user closed from another
-surface. A user-intent resume always passes and clears the tombstone; so does
-a bridge re-advertising the sid one heartbeat TTL after the close (real use
-again, the same self-heal contract as above).
+surface. The stone covers EVERY id spelling of the conversation: the close
+answer reports the bridge-resolved set (the requested sid plus the backend
+`sess_…` id and local aliases), so the `409` holds whichever spelling an
+auto ladder quotes. A user-intent resume always passes and clears the whole
+group; so does a bridge re-advertising any spelling one heartbeat TTL after
+the close (real use again, the same self-heal contract as above).
 
 Cross-instance note: if the same conversation is also registered by another
 bridge of the project, the hub's dedupe re-attaches it under that instance —

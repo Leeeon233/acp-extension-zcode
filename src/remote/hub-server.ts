@@ -1267,13 +1267,37 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
    * close retires, it never deletes, so manual re-launch stays open (the
    * same self-heal contract as the bridge's markSessionActive).
    */
-  const closedSessions = new Map<string, number>();
+  /**
+   * One tombstoned conversation: closed-at plus EVERY id spelling the closing
+   * bridge reported (the requested sid, its backend `sess_…` id, and local
+   * aliases — the same conversation is addressable under different spellings
+   * per bridge). All map keys share ONE entry; every clear path (user resume,
+   * TTL expiry, a heartbeat re-advertise past the heartbeat TTL) removes the
+   * whole group, or a user resume under one spelling would leave the others
+   * refused while the conversation is alive again.
+   */
+  interface ClosedSessionEntry {
+    closedAt: number;
+    spellings: string[];
+  }
+  const closedSessions = new Map<string, ClosedSessionEntry>();
   const CLOSED_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+  const clearClosedSession = (sid: string): void => {
+    const entry = closedSessions.get(sid);
+    if (!entry) return;
+    for (const s of entry.spellings) closedSessions.delete(s);
+  };
+  const stampClosedSession = (spellings: string[]): void => {
+    // A fresh stamp replaces any stale group that shares a spelling.
+    for (const s of spellings) clearClosedSession(s);
+    const entry: ClosedSessionEntry = { closedAt: Date.now(), spellings };
+    for (const s of spellings) closedSessions.set(s, entry);
+  };
   const isSessionClosed = (sid: string): boolean => {
-    const closedAt = closedSessions.get(sid);
-    if (closedAt === undefined) return false;
-    if (Date.now() - closedAt > CLOSED_TOMBSTONE_TTL_MS) {
-      closedSessions.delete(sid);
+    const entry = closedSessions.get(sid);
+    if (!entry) return false;
+    if (Date.now() - entry.closedAt > CLOSED_TOMBSTONE_TTL_MS) {
+      clearClosedSession(sid);
       return false;
     }
     return true;
@@ -2321,7 +2345,9 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         return;
       }
       if (resumeSid && intent === "user") {
-        closedSessions.delete(resumeSid);
+        // Whole spelling group: the conversation is open again, so every
+        // id spelling of it must stop being refused.
+        clearClosedSession(resumeSid);
       }
       // Desktop Presence (amendment to ADR-0016): the desktop app is the
       // presenting surface, so no window opens — and with no window to be the
@@ -2662,25 +2688,48 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           method: "POST",
         },
         (up) => {
-          if (op === "close" && up.statusCode === 200) {
-            // The bridge retired the session: stamp the hub-side tombstone
-            // and drop the sid from the cached entry NOW, instead of serving
-            // it for up to one more heartbeat (≤10s) to discovery clients —
-            // and to the desktop ladder looking for something to re-incubate.
-            closedSessions.set(sid!, Date.now());
-            const cached = instances.get(instId!);
-            if (cached) {
-              instances.set(instId!, {
-                ...cached,
-                sessions: cached.sessions.filter((s) => s.sessionId !== sid),
-              });
-            }
-          }
           const headers = { ...up.headers };
           delete headers["transfer-encoding"];
           delete headers.connection;
           res.writeHead(up.statusCode ?? 502, headers);
-          up.pipe(res);
+          if (op !== "close" || up.statusCode !== 200) {
+            up.pipe(res);
+            return;
+          }
+          // Close-200: tee the (tiny) JSON body to learn EVERY spelling of
+          // the closed conversation — the bridge answers
+          // {ok, sessionIds}; older bridges without the field fall back to
+          // the requested sid alone. The tombstone and the cached-entry drop
+          // then cover the whole group, so an auto ladder is refused
+          // whichever spelling it quotes (alias vs backend id) and the
+          // listing stops offering the conversation, not one spelling of it.
+          const chunks: Buffer[] = [];
+          up.on("data", (chunk: Buffer) => chunks.push(chunk));
+          up.on("end", () => {
+            let spellings = [sid!];
+            try {
+              const body = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+                sessionIds?: unknown;
+              };
+              if (Array.isArray(body.sessionIds)) {
+                const extra = body.sessionIds.filter(
+                  (s): s is string => typeof s === "string" && s.length > 0 && s !== sid,
+                );
+                if (extra.length > 0) spellings = [sid!, ...extra];
+              }
+            } catch {
+              // non-JSON body — the requested sid alone (conservative)
+            }
+            stampClosedSession(spellings);
+            const cached = instances.get(instId!);
+            if (cached) {
+              instances.set(instId!, {
+                ...cached,
+                sessions: cached.sessions.filter((s) => !spellings.includes(s.sessionId)),
+              });
+            }
+            res.end(Buffer.concat(chunks));
+          });
         },
       );
       upstream.on("error", () => {
@@ -2811,11 +2860,13 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         // refused off stale history. Guarded by the heartbeat TTL: a
         // heartbeat already in flight when the close landed can still carry
         // the sid from a pre-close snapshot, and that must NOT clear the
-        // stone the close just stamped.
+        // stone the close just stamped. The clear is per GROUP: a
+        // re-advertised spelling revives the whole conversation, so every
+        // spelling of it stops being refused.
         for (const s of sessions) {
-          const closedAt = closedSessions.get(s.sessionId);
-          if (closedAt !== undefined && Date.now() - closedAt > HEARTBEAT_TIMEOUT_MS) {
-            closedSessions.delete(s.sessionId);
+          const entry = closedSessions.get(s.sessionId);
+          if (entry && Date.now() - entry.closedAt > HEARTBEAT_TIMEOUT_MS) {
+            clearClosedSession(s.sessionId);
           }
         }
       } else {
