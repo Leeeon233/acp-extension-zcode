@@ -109,6 +109,26 @@ describe("builtinProviderEnv", () => {
     });
   });
 
+  it.each(["bin/zcode.js", "zcode.js"])(
+    "finds the npm vendor provider table through a symlink to %s",
+    (entryPath) => {
+      const root = path.join(scratch, "zcode-app-cli");
+      const entry = path.join(root, entryPath);
+      const builtin = path.join(root, "vendor", "provider", "zcode-builtin.json");
+      mkdirSync(path.dirname(entry), { recursive: true });
+      mkdirSync(path.dirname(builtin), { recursive: true });
+      writeFileSync(entry, "// fake npm CLI");
+      writeFileSync(builtin, "{}");
+      const bin = path.join(scratch, "zcode");
+      symlinkSync(entry, bin);
+
+      expect(builtinProviderEnv(bin)).toEqual({
+        [BUILTIN_PROVIDER_ENV]: builtin,
+        [PERSONAL_PROVIDER_ENV]: personal,
+      });
+    },
+  );
+
   it("honors ZCODE_BIN as the entry when no explicit entry is passed", () => {
     const root = scratch;
     const entry = makeAppBundle(root);

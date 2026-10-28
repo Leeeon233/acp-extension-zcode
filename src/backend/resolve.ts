@@ -174,6 +174,8 @@ export function builtinProviderEnv(entryArg?: string): NodeJS.ProcessEnv {
   const candidates = [
     path.join(dir, "provider", PROVIDER_CONFIG_NAME),
     path.join(dir, "..", "config", "provider", PROVIDER_CONFIG_NAME),
+    path.join(dir, "..", "vendor", "provider", PROVIDER_CONFIG_NAME),
+    path.join(dir, "vendor", "provider", PROVIDER_CONFIG_NAME),
   ];
   const found = candidates.find((c) => existsSync(c));
   if (!found) return {};
