@@ -1255,6 +1255,29 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
   const webRoot = webDir ? resolveWebRoot(webDir) : null;
 
   const instances = new Map<string, InstanceEntry>();
+  /**
+   * Remote-close tombstones (ADR-0006 follow-up): sessionId → closed-at. A
+   * proxied close the bridge answered 200 lands here, so the HUB — not just
+   * the bridge's next heartbeat — knows the session is closed. Two jobs:
+   * the cached instance entry drops the sid immediately (the ≤10s heartbeat
+   * window used to keep serving it to discovery clients), and an AUTO
+   * resume (a client reconnect ladder re-incubating its own tab) is refused
+   * with 409 instead of resurrecting what the user closed from another
+   * surface. A user-intent resume always passes and clears the stone —
+   * close retires, it never deletes, so manual re-launch stays open (the
+   * same self-heal contract as the bridge's markSessionActive).
+   */
+  const closedSessions = new Map<string, number>();
+  const CLOSED_TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000;
+  const isSessionClosed = (sid: string): boolean => {
+    const closedAt = closedSessions.get(sid);
+    if (closedAt === undefined) return false;
+    if (Date.now() - closedAt > CLOSED_TOMBSTONE_TTL_MS) {
+      closedSessions.delete(sid);
+      return false;
+    }
+    return true;
+  };
   const proxyPairs = new Set<{ client: WebSocket; bridge: WebSocket }>();
   /**
    * Desktop Presence (amendment to ADR-0016): proxy pairs whose client
@@ -2281,6 +2304,25 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         res.end("session deleted");
         return;
       }
+      // Remote-close tombstone gate (ADR-0006 follow-up): `intent` separates
+      // a client's own reconnect ladder ("auto" — a tab re-incubating itself
+      // after its bridge left discovery) from a human picking the session
+      // ("user", the default — older clients and every manual re-launch keep
+      // working). Auto never resurrects a session the user closed from
+      // another surface; user always may, and clears the stone so later
+      // autos track the reopened truth. Ordered before the Desktop Presence
+      // reuse on purpose: for an auto, closed beats any holder the stale
+      // cache still names.
+      const intent =
+        (body as { intent?: unknown } | undefined)?.intent === "auto" ? "auto" : "user";
+      if (resumeSid && intent === "auto" && isSessionClosed(resumeSid)) {
+        res.writeHead(409, { "Content-Type": "text/plain" });
+        res.end("session closed");
+        return;
+      }
+      if (resumeSid && intent === "user") {
+        closedSessions.delete(resumeSid);
+      }
       // Desktop Presence (amendment to ADR-0016): the desktop app is the
       // presenting surface, so no window opens — and with no window to be the
       // feature, the pre-amendment reuse is right again: the workspace's live
@@ -2620,6 +2662,20 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           method: "POST",
         },
         (up) => {
+          if (op === "close" && up.statusCode === 200) {
+            // The bridge retired the session: stamp the hub-side tombstone
+            // and drop the sid from the cached entry NOW, instead of serving
+            // it for up to one more heartbeat (≤10s) to discovery clients —
+            // and to the desktop ladder looking for something to re-incubate.
+            closedSessions.set(sid!, Date.now());
+            const cached = instances.get(instId!);
+            if (cached) {
+              instances.set(instId!, {
+                ...cached,
+                sessions: cached.sessions.filter((s) => s.sessionId !== sid),
+              });
+            }
+          }
           const headers = { ...up.headers };
           delete headers["transfer-encoding"];
           delete headers.connection;
@@ -2749,6 +2805,19 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
             ? { tuiPid: body.tuiPid }
             : {}),
         });
+        // A registration advertising a tombstoned session again is fresh
+        // evidence the session is genuinely alive (a client resumed it and
+        // the bridge re-advertised) — clear the stone so later autos are not
+        // refused off stale history. Guarded by the heartbeat TTL: a
+        // heartbeat already in flight when the close landed can still carry
+        // the sid from a pre-close snapshot, and that must NOT clear the
+        // stone the close just stamped.
+        for (const s of sessions) {
+          const closedAt = closedSessions.get(s.sessionId);
+          if (closedAt !== undefined && Date.now() - closedAt > HEARTBEAT_TIMEOUT_MS) {
+            closedSessions.delete(s.sessionId);
+          }
+        }
       } else {
         instances.delete(id);
         idleSince = null; // re-arm the idle clock on membership change

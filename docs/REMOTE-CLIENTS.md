@@ -350,6 +350,14 @@ POST {hub}/api/instances  body {"workspacePath":"/Users/me/proj",
   incubation. Desktop Presence changes both rules — no window opens, and the
   live bridge that already holds (or can host) the session answers instead
   (see the Desktop Presence bullet under session-create).
+- **`intent` (optional body field)**: `"auto"` marks the POST as a client's
+  own reconnect ladder (a tab re-incubating itself after its bridge left
+  discovery); `"user"` — the default when omitted, so older clients need no
+  change — marks a human picking the session. An auto resume of a session the
+  hub tombstoned via [Closing a session](#closing-a-session) is refused with
+  `409 session closed`; a user resume always passes and clears the tombstone.
+  Reconnect ladders should send `"auto"` and treat `409` as "closed
+  remotely — retire the tab, do not retry".
 - `sessionId` here is the backend store id (`sess_…`), which `session/load`
   accepts as-is (pass-through resume). The same conversation may also appear
   in discovery under a different (ACP) id — treat discovery as the
@@ -843,8 +851,18 @@ visibility changes. Two guards shape the semantics (ADR-0006):
 
 Errors: `401` bad token, `404` unknown session (or instance), `409` running,
 `502` bridge unreachable. Takes effect immediately in
-`/api/instances/{id}/status` and within one heartbeat (≤10s) in
-`/api/instances`.
+`/api/instances/{id}/status` — and, on a 200, the hub also drops the sid from
+its cached `/api/instances` entry at once, so the listing stops offering it
+before the bridge's next heartbeat.
+
+**The hub keeps a close tombstone (24h).** A proxied close that answered 200
+records the sid hub-side, and `POST /api/instances` refuses an **auto**
+resume of it with `409 session closed` (the `intent` field under
+[Creating / resuming a session](#creating--resuming-a-session)) — a client's
+reconnect ladder must not resurrect a session the user closed from another
+surface. A user-intent resume always passes and clears the tombstone; so does
+a bridge re-advertising the sid one heartbeat TTL after the close (real use
+again, the same self-heal contract as above).
 
 Cross-instance note: if the same conversation is also registered by another
 bridge of the project, the hub's dedupe re-attaches it under that instance —
@@ -864,7 +882,9 @@ TERMINATES the CLI that hosts it:
 - A **headless serve** bridge exits immediately (its idle timeout pulled
   forward to zero).
 
-The instance disappears from `/api/instances` within one heartbeat. The
+The instance disappears from `/api/instances` as soon as the exiting bridge
+unregisters (the orderly shutdown path; the heartbeat TTL stays the fallback
+for a bridge that died without one). The
 conversation itself is still resumable later via
 `POST /api/instances` / `GET /api/projects/sessions` — closing ends the
 process, not the history. If other advertised conversations (or remote-created

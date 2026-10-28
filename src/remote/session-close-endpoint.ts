@@ -170,7 +170,17 @@ function terminateAfterFlush(decision: ServeTerminateDecision, res: ServerRespon
         }
       }
     }
-    setTimeout(() => process.exit(0), SELF_EXIT_MS);
+    // Self-exit through the orderly path: signalling ourselves runs the
+    // index.ts SIGTERM handler (unregister with the hub, reap the backend
+    // group) — a bare process.exit(0) left the hub serving a corpse row for
+    // up to its 30s heartbeat TTL and the desktop's ladder dialing the dead
+    // id until the probe pruned it (2026-10-28), and it skipped the backend
+    // teardown the orderly shutdown owns. The hard exit stays as the
+    // backstop for a wedged orderly path (bounded like the unregister).
+    setTimeout(() => {
+      process.kill(process.pid, "SIGTERM");
+      setTimeout(() => process.exit(0), SELF_EXIT_MS).unref();
+    }, SELF_EXIT_MS);
   };
   // 'finish' fires asynchronously after end(), so attaching here never misses.
   if (res.writableEnded) res.once("finish", run);
