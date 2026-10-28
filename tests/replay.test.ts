@@ -572,6 +572,45 @@ describe("replayMessages tool history parts", () => {
     expect(u.content).toBeUndefined();
     expect(u.title).toBe("TodoWrite");
   });
+
+  it("replays prose-less tool messages without messageId so adjacent calls coalesce", async () => {
+    // The backend stores one tool part per message; a run of adjacent calls
+    // is many tool-only messages. Stamping each card with its own messageId
+    // made clients mint one bare card message per call (one-by-one cards),
+    // while the same calls live coalesce into one run card — live tool_calls
+    // carry no messageId, so replayed prose-less ones must not either.
+    const { cx, updates } = collectCx();
+    const toolMsg = (id: string, partId: string): ZcodeMessage => ({
+      info: { id, role: "assistant" },
+      parts: [
+        { type: "tool", id: partId, tool: "Bash", state: { status: "completed", title: id } },
+      ],
+    });
+    await replayMessages(cx, "s", [toolMsg("m1", "part_1"), toolMsg("m2", "part_2")]);
+    const cards = updates.map((p) => p.update as Record<string, unknown>);
+    expect(cards).toHaveLength(2);
+    expect(cards[0]!.messageId).toBeUndefined();
+    expect(cards[1]!.messageId).toBeUndefined();
+  });
+
+  it("keeps messageId on a tool card whose message also carries text", async () => {
+    const { cx, updates } = collectCx();
+    await replayMessages(cx, "s", [
+      {
+        info: { id: "m1", role: "assistant" },
+        parts: [
+          { type: "text", text: "checking" },
+          { type: "tool", id: "part_1", tool: "Bash", state: { status: "completed" } },
+        ],
+      },
+    ]);
+    const text = updates[0]!.update as Record<string, unknown>;
+    expect(text.sessionUpdate).toBe("agent_message_chunk");
+    expect(text.messageId).toBe("m1");
+    const card = updates[1]!.update as Record<string, unknown>;
+    expect(card.sessionUpdate).toBe("tool_call");
+    expect(card.messageId).toBe("m1");
+  });
 });
 
 describe("replayMessages toolTurnWindow (TUI condensation)", () => {

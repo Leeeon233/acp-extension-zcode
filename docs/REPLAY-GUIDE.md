@@ -64,6 +64,11 @@ differently:
   and dedupe on every insert.
 - One message = several chunks (text, thoughts, tool calls). Group chunks by
   `messageId`/`toolCallId`, not by arrival order alone.
+- A replayed `tool_call` carries `messageId` ONLY when its history message also
+  carries text — the card then groups with that text's bubble. Tool-only step
+  messages (the common shape: the backend stores one tool part per message)
+  replay id-less, exactly like live tool calls, so a run of adjacent calls
+  coalesces into one merged card the same way it did live.
 - Ordering rule: replay batches and `load_earlier` pages arrive **oldest →
   newest and must be prepended**; live-turn updates arrive newest-last and
   append. The bridge serializes a replay batch against the live turn for the

@@ -535,6 +535,11 @@ export async function replayMessages(
     const info = m.info ?? {};
     const role = info.role;
     const mid = info.id ?? `hist_${randomUUID().slice(0, 12)}`;
+    // Only a message that also emits a text chunk under `mid` should key its
+    // tool cards to that id (see the tool branch below).
+    const carriesText = (m.parts ?? []).some(
+      (p) => p?.type === "text" && Boolean((p as { text?: string }).text),
+    );
     for (const p of m.parts ?? []) {
       if (!p || typeof p !== "object") continue;
       const ptype = (p as { type?: string }).type;
@@ -629,13 +634,19 @@ export async function replayMessages(
             status: (st.status as acp.ToolCallStatus) ?? "completed",
             ...(content.length > 0 ? { content } : {}),
             ...(histToolName ? { _meta: { claudeCode: { toolName: histToolName } } } : {}),
-            // Key the card to its own history message so clients group it
-            // with that message's text — their id-less-card fallback now
-            // mints a separate card message (right for live sub-agent cards,
-            // wrong for stored per-message tool parts). The SDK's ToolCall
-            // type predates the field (upstream ACP added messageId to
-            // tool_call); the spread keeps the rest of the literal checked.
-            ...({ messageId: mid } as { messageId: string }),
+            // Key the card to its history message ONLY when that message also
+            // carries text: clients then group the card with the text they
+            // build under the same id. A prose-less tool-only step message
+            // (the common shape — the backend stores one tool part per
+            // message) must stay id-less: stamping `mid` makes clients mint one
+            // bare card message per backend message, un-merging a run of
+            // adjacent calls into one-by-one cards, while the same calls live
+            // (no messageId on live tool_calls) coalesce into one run card.
+            // Id-less replayed cards ride that live fallback — appended to a
+            // trailing run of cards — so replay matches the live rendering.
+            // The SDK's ToolCall type predates the field (upstream ACP added
+            // messageId to tool_call); the spread keeps the literal checked.
+            ...(carriesText ? ({ messageId: mid } as { messageId: string }) : {}),
           }),
         });
       }
