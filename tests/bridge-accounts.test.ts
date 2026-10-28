@@ -16,6 +16,16 @@ import type { ReadStream } from "node:tty";
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+const taskInserts: unknown[][] = [];
+vi.mock("node:sqlite", () => ({
+  DatabaseSync: class {
+    prepare() {
+      return { run: (...args: unknown[]) => taskInserts.push(args) };
+    }
+    close() {}
+  },
+}));
+
 import { readHiddenApiKey, runAccountSetup } from "../src/account-setup.js";
 import { loadZcodeCredentials } from "../src/backend/credentials.js";
 import {
@@ -30,6 +40,7 @@ import {
 } from "../src/config/bridge-accounts.js";
 import { loadAllModels, modelContextWindow } from "../src/config/options.js";
 import { fetchQuotaResponse } from "../src/quota/client.js";
+import { upsertSessionTask } from "../src/tasks-index.js";
 import { ZCODE_CREDS_PATH } from "../src/utils.js";
 
 let root: string;
@@ -173,6 +184,15 @@ describe("standalone plan integration", () => {
     await fetchQuotaResponse(fetch);
     expect(authorized).toBe(true);
     expect(existsSync(ZCODE_CREDS_PATH)).toBe(false);
+  });
+  it("names the bridge plan's model in App task rows from a bridge-only home", async () => {
+    await saveBridgeAccount("zai", KEY);
+    writeFileSync(path.join(root, "tasks-index.sqlite"), "");
+    taskInserts.length = 0;
+    expect(await upsertSessionTask({ workspaceKey: "/ws", taskId: "sess_1", title: "t" })).toBe(
+      true,
+    );
+    expect(taskInserts[0]).toContain("builtin:zai-coding-plan/SYNTHETIC-MODEL");
   });
   it("answers with the bridge key when the Desktop configuration is unreadable", async () => {
     await saveBridgeAccount("zai", KEY);

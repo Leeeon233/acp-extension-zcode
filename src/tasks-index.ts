@@ -16,10 +16,11 @@
  * swallowed so they never break the session/create path.
  */
 
-import { existsSync, readFileSync, statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { readCredentialConfig } from "./config/bridge-accounts.js";
 import { DEFAULT_MODEL_ID } from "./config/options.js";
 import { warn, zcodeHomeDir, ZCODE_CREDS_PATH } from "./utils.js";
 
@@ -124,7 +125,9 @@ async function withSqliteRetry<T>(
  */
 function resolveProviderModel(): { providerId: string; modelRef: string } {
   try {
-    const cfg = JSON.parse(readFileSync(ZCODE_CREDS_PATH, "utf8")) as {
+    // Includes accounts saved by `zcode-acp setup`, so a bridge-only home
+    // names its plan instead of falling back to the default model.
+    const cfg = readCredentialConfig(ZCODE_CREDS_PATH) as {
       provider?: Record<string, { enabled?: boolean; models?: Record<string, unknown> }>;
     };
     for (const [providerKey, p] of Object.entries(cfg.provider ?? {})) {
