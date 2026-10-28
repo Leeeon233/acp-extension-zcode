@@ -264,6 +264,9 @@ export interface Messages {
   slashErrArg: (cmd: string) => string;
   slashErrUnknown: (cmd: string) => string;
   slashErrFailed: (cmd: string, msg: string) => string;
+  /** authenticate method errors — editors that honor authMethods (Xcode). */
+  authErrUnknownMethod: (method: string) => string;
+  authErrNoCredentials: string;
 }
 
 const zh: Messages = {
@@ -426,6 +429,9 @@ const zh: Messages = {
   slashErrArg: (cmd) => `/${cmd} 需要参数`,
   slashErrUnknown: (cmd) => `未知命令 /${cmd}`,
   slashErrFailed: (cmd, msg) => `${cmd} 失败: ${msg}`,
+  authErrUnknownMethod: (method) => `未知的认证方式: ${method}`,
+  authErrNoCredentials:
+    "未找到 ZCode 凭据：请先登录 ZCode 桌面端（或在 Settings → Model Provider 里以 API key 方式添加 Coding Plan key），或运行 zcode-acp setup 保存账号，然后重试登录。",
 };
 
 const en: Messages = {
@@ -600,6 +606,9 @@ const en: Messages = {
   slashErrArg: (cmd) => `/${cmd} requires an argument`,
   slashErrUnknown: (cmd) => `unknown /${cmd}`,
   slashErrFailed: (cmd, msg) => `${cmd} failed: ${msg}`,
+  authErrUnknownMethod: (method) => `unknown auth method: ${method}`,
+  authErrNoCredentials:
+    "No ZCode credentials found: sign in to the ZCode desktop app (or add a coding-plan API key under Settings → Model Provider), or run zcode-acp setup to save an account, then retry.",
 };
 
 /** Current message table — resolved per call so env changes/tests apply live. */

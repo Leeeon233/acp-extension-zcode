@@ -213,7 +213,9 @@ ZCode protocol types into ACP notifications directly — always translate.
   (see `~/.zcode/agents/*.md`); `parseModelValue` accepts it. Entitlement
   comes from `coding-plan-cache.json`
   (desktop's resolved availability verdict) → legacy `config.json`
-  (`builtin:*` enabled + apiKey); `setting.json`'s
+  (`builtin:*` enabled + apiKey) → manual plan keys in `provider_config.json`
+  (access.type `zhipu-coding-plan-api-key`, family by official baseUrl —
+  `manualCodingPlanKeys`, the source-2 tier, #344); `setting.json`'s
   `modelProviderFamilySelectedKeys` is a _selection_ record, not an
   entitlement — only as a last resort when both are empty. A bridge account
   (`acp-accounts.json`, `zcode-acp setup`) entitles its own family's
@@ -221,7 +223,10 @@ ZCode protocol types into ACP notifications directly — always translate.
   verdict, and never counts as a verdict. It entitles only when the overlay
   applied (`bridgeOverlays`), so a family the installed catalog lacks gains
   nothing. The #320 store fallback must still
-  see only the raw desktop files (`desktopEntitledBuiltinProviders`). (2) `session/setModel`
+  see only the raw desktop files (`desktopEntitledBuiltinProviders`) — the
+  provider_config rung lives in the `entitledBuiltinProviders` wrapper, not
+  the raw view. `authenticate` (#344) answers Xcode's sign-in call via
+  `zcodeCredentialsPresent` (handlers/authenticate.ts). (2) `session/setModel`
   is now strict: `{sessionId, model:{providerId, modelId, options?}, persistAsWorkspaceLastUsed}`,
   NO `runtimeModel` (`Unrecognized key`), and the OBJECT form requires
   `options.reasoningLevel` for level-bearing models ("Reasoning level is

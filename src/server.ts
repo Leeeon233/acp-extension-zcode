@@ -1212,16 +1212,18 @@ export class ZcodeAcpServer {
         // old and new spellings (#311) — see TURN_STATE_METHODS.
         _meta: { zcode: { fs: true, turnState: [...TURN_STATE_METHODS] } },
       },
-      // The GLM API key is read from ~/.zcode/v2/config.json by the ZCode
-      // backend subprocess; the editor never needs to supply credentials.
-      // Declared as AuthMethodAgent (no `type` field → defaults to "agent"),
-      // which the ACP registry CI accepts as "agent self-handles auth".
+      // Credentials come from the ZCode side — the desktop app's config.json
+      // / provider_config.json, or `zcode-acp setup`'s saved accounts — and
+      // the editor never supplies any. Declared as AuthMethodAgent (no `type`
+      // field → defaults to "agent"), which the ACP registry CI accepts as
+      // "agent self-handles auth". `authenticate` (the readiness check behind
+      // this declaration) lives in handlers/authenticate.ts.
       authMethods: [
         {
           id: "zcode-credentials",
           name: "ZCode built-in credentials",
           description:
-            "Reads the GLM API key from ~/.zcode/v2/config.json managed by the ZCode desktop app. No editor-side credentials required.",
+            "Reads the GLM API key from the ZCode desktop app's credential files (~/.zcode/v2) or a saved zcode-acp account. No editor-side credentials required.",
         },
       ],
     };

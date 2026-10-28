@@ -22,6 +22,7 @@ import { mkdirSync, mkdtempSync, renameSync, utimesSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import path from "node:path";
 
+import { RequestError } from "@agentclientprotocol/sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { resolveCredentialSecret } from "../src/backend/credential-store.js";
@@ -45,6 +46,7 @@ vi.mock("../src/utils.js", async (importOriginal) => {
       return zcodeCfgPath.value;
     },
     zcodeCredentialsPath: () => zcodeStorePath.value,
+    zcodePersonalProviderPath: () => path.join(dataRoot.value, "provider_config.json"),
   };
 });
 
@@ -60,8 +62,11 @@ import {
   codingPlanRequestAuthFor,
   configProviderIdFor,
   readBuiltinTable,
+  zcodeCredentialsPresent,
 } from "../src/config/account-provider.js";
 import { saveBridgeAccount } from "../src/config/bridge-accounts.js";
+import { authenticate } from "../src/handlers/authenticate.js";
+import { messages } from "../src/i18n.js";
 
 /** Minimal bundled table with two coding-plan providers (one zai, one bigmodel). */
 const TABLE = {
@@ -102,6 +107,14 @@ const TABLE = {
 
 let root: string;
 let tablePath: string;
+
+/** Write provider_config.json's provider rules into the fixture v2 dir. */
+function writePersonalRules(rules: unknown[]): void {
+  writeFileSync(
+    path.join(dataRoot.value, "provider_config.json"),
+    JSON.stringify({ config: { providerConfigRules: { providerRules: rules } } }),
+  );
+}
 
 beforeEach(() => {
   root = mkdtempSync(path.join(tmpdir(), "acct-provider-"));
@@ -428,5 +441,135 @@ describe("fresh desktop-only layout — encrypted store entitlement (#320)", () 
   it("never serves a team plan key from the store", () => {
     writeCredentialStore({ [TEAM_KEY]: "stored-team-key" });
     expect(codingPlanRequestAuthFor("account:bigmodel-team-coding-plan")).toBeNull();
+  });
+});
+
+describe("manual coding-plan keys from provider_config.json (#344)", () => {
+  // The desktop's Settings → "Use API key" flow writes the plan key as a
+  // personal rule with access type zhipu-coding-plan-api-key while OAuth
+  // login writes no config.json key at all — without this rung, a 3.12+
+  // desktop-only machine had no entitlement source and every account switch
+  // failed with "Provider Registry 中不存在 Model".
+  const zaiRule = (overrides: Record<string, unknown> = {}) => ({
+    providerId: "zai-api",
+    providerName: "Z.AI",
+    config: {
+      access: { type: "zhipu-coding-plan-api-key", apiKey: "manual-zai-key" },
+      api: { type: "anthropic-messages", baseUrl: "https://api.z.ai/api/anthropic" },
+    },
+    ...overrides,
+  });
+
+  it("entitles the family and serves the manual key without any config.json", () => {
+    writePersonalRules([zaiRule()]);
+    const { providers } = buildAccountProviderConfig()!;
+    expect(providers["account:zai-individual-coding-plan"]!.access.entitled).toBe(true);
+    expect(providers["account:bigmodel-individual-coding-plan"]!.access.entitled).toBe(false);
+    expect(codingPlanRequestAuthFor("account:zai-individual-coding-plan")).toEqual({
+      apiKey: "manual-zai-key",
+    });
+  });
+
+  it("ranks the manual key above the encrypted store and below config.json", () => {
+    writeCredentialStore({
+      "account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:108:api-key":
+        "stored-individual-key",
+    });
+    // Trailing slash on purpose: the endpoint match normalizes it away.
+    writePersonalRules([
+      {
+        providerId: "bigmodel-api",
+        config: {
+          access: { type: "zhipu-coding-plan-api-key", apiKey: "manual-bigmodel-key" },
+          api: { baseUrl: "https://open.bigmodel.cn/api/anthropic/" },
+        },
+      },
+    ]);
+    expect(codingPlanRequestAuthFor("account:bigmodel-individual-coding-plan")).toEqual({
+      apiKey: "manual-bigmodel-key",
+    });
+    writeFileSync(
+      zcodeCfgPath.value,
+      JSON.stringify({
+        provider: {
+          "builtin:bigmodel-coding-plan": { enabled: true, options: { apiKey: "legacy-key" } },
+        },
+      }),
+    );
+    expect(codingPlanRequestAuthFor("account:bigmodel-individual-coding-plan")).toEqual({
+      apiKey: "legacy-key",
+    });
+  });
+
+  it("ignores disabled rules, plain api-key rules, and unrecognized baseUrls", () => {
+    writePersonalRules([
+      zaiRule({ enabled: false }),
+      {
+        providerId: "plain",
+        config: {
+          access: { type: "api-key", apiKey: "k" },
+          api: { baseUrl: "https://api.z.ai/api/anthropic" },
+        },
+      },
+      {
+        providerId: "proxy",
+        config: {
+          access: { type: "zhipu-coding-plan-api-key", apiKey: "k" },
+          api: { baseUrl: "https://proxy.example/api/anthropic" },
+        },
+      },
+    ]);
+    expect(
+      buildAccountProviderConfig()!.providers["account:zai-individual-coding-plan"]!.access
+        .entitled,
+    ).toBe(false);
+    expect(codingPlanRequestAuthFor("account:zai-individual-coding-plan")).toBeNull();
+  });
+
+  it("falls back to the frozen official endpoints when the table is absent", () => {
+    // Headless Linux has no desktop bundle to read — the endpoint → family
+    // mapping must still resolve (frozen pair), and the individual-plan
+    // detection falls back to the id-shape check.
+    builtinProviderEnv.mockReturnValue({
+      ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: path.join(root, "absent-table.json"),
+    });
+    delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
+    writePersonalRules([zaiRule()]);
+    expect(codingPlanRequestAuthFor("account:zai-individual-coding-plan")).toEqual({
+      apiKey: "manual-zai-key",
+    });
+  });
+});
+
+describe("authenticate (#344)", () => {
+  it("answers {} when any credential source exists", () => {
+    writePersonalRules([
+      {
+        providerId: "zai-api",
+        config: {
+          access: { type: "zhipu-coding-plan-api-key", apiKey: "manual-zai-key" },
+          api: { baseUrl: "https://api.z.ai/api/anthropic" },
+        },
+      },
+    ]);
+    expect(zcodeCredentialsPresent()).toBe(true);
+    expect(authenticate({ methodId: "zcode-credentials" })).toEqual({});
+  });
+
+  it("errors with sign-in guidance when no credential source exists", () => {
+    expect(zcodeCredentialsPresent()).toBe(false);
+    expect(() => authenticate({ methodId: "zcode-credentials" })).toThrowError(
+      messages().authErrNoCredentials,
+    );
+  });
+
+  it("rejects an unknown auth method id with -32602", () => {
+    let code: number | undefined;
+    try {
+      authenticate({ methodId: "someone-elses-method" });
+    } catch (e) {
+      code = (e as RequestError).code;
+    }
+    expect(code).toBe(-32602);
   });
 });

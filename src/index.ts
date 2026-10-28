@@ -18,6 +18,7 @@ import * as acp from "@agentclientprotocol/sdk";
 import { z } from "zod";
 
 import { accountUsageStatsViaHub } from "./handlers/account.js";
+import { authenticate } from "./handlers/authenticate.js";
 import { installCrashGuards } from "./crash-guards.js";
 import {
   cancel,
@@ -172,6 +173,10 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
     acp
       .agent({ name: AGENT_INFO.name })
       .onRequest("initialize", (ctx) => server.initialize(ctx.params, ctx.client))
+      // Spec auth method (#344): Xcode calls it on sign-in; without a handler
+      // it answered -32601. Readiness check only — the bridge never takes
+      // editor-side credentials (see handlers/authenticate.ts).
+      .onRequest("authenticate", (ctx) => authenticate(ctx.params))
       .onRequest("session/new", async (ctx) => {
         const result = await newSession(server, ctx.params, ctx.client);
         for (const sid of server.sessionAliases(result.sessionId)) {
@@ -233,9 +238,7 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       // 0002). Pull-only, no session required; errors carry the failure kind in
       // `data.kind` so clients can hide the quota UI. Hub-first: converge on
       // the hub's cached /api/quota when remote is on, local query otherwise.
-      .onRequest("account/usage_stats", z.object({}).passthrough(), () =>
-        accountUsageStatsViaHub(),
-      )
+      .onRequest("account/usage_stats", z.object({}).passthrough(), () => accountUsageStatsViaHub())
       .onRequest("session/prompt", (ctx) => {
         // Mirror the user's message to every other client before the turn
         // starts — the prompting client renders it locally, the others only
