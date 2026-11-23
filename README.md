@@ -367,7 +367,7 @@ Thanks to everyone who has contributed (updated automatically from the
 <a href="https://github.com/Leeeon233/acp-extension-zcode/graphs/contributors">
   <!-- release-please re-stamps &v= on every release: the new URL busts the
        contrib.rocks and GitHub camo image caches. -->
-  <img src="https://contrib.rocks/image?repo=Leeeon233/acp-extension-zcode&v=0.90.1" alt="Contributors" /> <!-- x-release-please-version -->
+  <img src="https://contrib.rocks/image?repo=Leeeon233/acp-extension-zcode&v=0.91.0" alt="Contributors" /> <!-- x-release-please-version -->
 </a>
 
 ## Related Projects
