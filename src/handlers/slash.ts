@@ -43,7 +43,8 @@ import type * as acp from "@agentclientprotocol/sdk";
 
 import { RequestError } from "@agentclientprotocol/sdk";
 import { backendCapabilities } from "../backend/adapter.js";
-import { applyModelSwitch } from "../config/runtime-model.js";
+import { applyModelSwitch, lastSwitchedModelValue } from "../config/runtime-model.js";
+import { parseModelRefValue } from "../config/model-resolution.js";
 import { emitConfigOptionUpdate, rememberModelChoice } from "../config/options.js";
 import {
   formatMcpServerHealth,
@@ -57,11 +58,13 @@ import { goalModeIsBackend } from "../config/settings.js";
 import { effectiveWorkflowGateNow } from "../config/workflow-gate.js";
 import { messages } from "../i18n.js";
 import { formatQuota, queryQuota } from "../quota/index.js";
+import { fetchMcpHealth } from "../settings/mcp-status.js";
 import { CONFIG_DISPATCH, SLASH_COMMANDS, warn } from "../utils.js";
 import type { ZcodeResponse } from "../backend/types.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { sendTextChunk } from "./io.js";
 import { compact, fork, goal } from "./extensions.js";
+import { renameSessionCore } from "./session-titles.js";
 import { listSessions, resumeIntoSession } from "./session.js";
 import { askSessionPick, type SessionPickItem } from "./server-requests.js";
 
@@ -237,58 +240,16 @@ async function autoFlow(
 
 /**
  * Fetch per-server MCP health from the backend `mcp/list` RPC with
- * `mode:"status"` (params `{workspace:{workspacePath, workspaceKey}}` —
- * workspace-level, no sessionId; result `statuses` keyed by server name).
- *
- * Best-effort: returns null on ANY failure (older backend answering -32601,
- * timeout, malformed result, empty status map) after at most one warn, and
- * the caller falls back to the local-discovery card unchanged.
+ * `mode:"status"` — the shared fetch lives in src/settings/mcp-status.ts
+ * (the settings route asks the same question). Best-effort: null on ANY
+ * failure, and the caller falls back to the local-discovery card unchanged.
  */
 async function fetchMcpStatuses(
   server: ZcodeAcpServer,
   acpSid: string,
 ): Promise<Record<string, McpServerHealth> | null> {
   const cwd = server.sessionCwds.get(acpSid) ?? server.projectCwd();
-  try {
-    const resp = await (
-      await server.ensureBackend()
-    ).request(
-      server.nextId(),
-      "mcp/list",
-      { workspace: { workspacePath: cwd, workspaceKey: cwd }, mode: "status" },
-      15000,
-    );
-    if (resp.error) {
-      warn(`/mcp: mcp/list failed (${resp.error.message}) — using local discovery`);
-      return null;
-    }
-    const raw = (resp.result as { statuses?: unknown } | null)?.statuses;
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      warn("/mcp: mcp/list returned no statuses — using local discovery");
-      return null;
-    }
-    const out: Record<string, McpServerHealth> = {};
-    for (const [name, entry] of Object.entries(raw as Record<string, unknown>)) {
-      if (!entry || typeof entry !== "object") continue;
-      const o = entry as Record<string, unknown>;
-      const health: McpServerHealth = {
-        status: typeof o["status"] === "string" ? o["status"] : "unknown",
-        toolCount: typeof o["toolCount"] === "number" ? o["toolCount"] : 0,
-      };
-      if (typeof o["failureKind"] === "string") health.failureKind = o["failureKind"];
-      const authUrl = (o["authorization"] as { authorizationUrl?: unknown } | undefined)
-        ?.authorizationUrl;
-      if (typeof authUrl === "string" && authUrl) health.authorizationUrl = authUrl;
-      out[name] = health;
-    }
-    // An empty map carries no health information — keep the local card.
-    return Object.keys(out).length > 0 ? out : null;
-  } catch (e) {
-    warn(
-      `/mcp: mcp/list threw (${e instanceof Error ? e.message : String(e)}) — using local discovery`,
-    );
-    return null;
-  }
+  return fetchMcpHealth(server, cwd, "/mcp");
 }
 
 /** `/workflows` run-row timestamp: epoch ms → "YYYY-MM-DD HH:mm" (UTC). */
@@ -447,6 +408,16 @@ export async function handleSlashCommand(
         const statuses = await fetchMcpStatuses(server, acpSid);
         return ok(statuses ? formatMcpServerHealth(statuses) : formatMcpServers(servers));
       }
+      case "rename": {
+        // Manual rename — the only title change after the one-shot auto
+        // title. Applies to every surface via the shared core (alias pins,
+        // backend v4 renameSession, tasks-index, session_info_update); a
+        // placeholder session is pinned in memory and persisted at its
+        // materialization (ensureRealSession).
+        if (!arg) throw new RequestError(-32602, messages().slashErrRenameArg);
+        const { title } = await renameSessionCore(server, acpSid, arg);
+        return ok(messages().slashRenamed(title));
+      }
       case "compact": {
         // `/compact <focus…>` forwards the argument as compact instructions.
         const result = (await compact(
@@ -560,9 +531,15 @@ export async function handleSlashCommand(
         // without it a switch made here is invisible to the post-resume
         // re-assert, which would roll the session back to an older remembered
         // model — and the TUI's ONLY switch path would have no stickiness.
-        rememberModelChoice(server, acpSid, zcodeSid, { model: arg });
+        // Record the registry-dialect identity the switch landed on (#403) —
+        // the typed arg may be a stale-dialect spelling that only resolved
+        // via model-resolution.
+        const landed = lastSwitchedModelValue(server, zcodeSid) ?? arg;
+        rememberModelChoice(server, acpSid, zcodeSid, { model: landed });
         await emitConfigOptionUpdate(server, cx, acpSid, zcodeSid, "model");
-        return ok(messages().slashModelSet(arg));
+        // Ack with the landed MODEL id — the user typed a short form, and the
+        // full `provider\model` encoding reads as noise in the TUI.
+        return ok(messages().slashModelSet(parseModelRefValue(landed).modelId));
       }
       case "mode":
       case "thought": {

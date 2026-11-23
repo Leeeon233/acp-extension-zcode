@@ -88,6 +88,18 @@ export interface RemoteUserConfig {
    */
   projectRoots?: string[];
   terminal?: TerminalPrefs;
+  /**
+   * Remote Terminal execution (app ADR-0011): manual command wiring from
+   * remote clients into the desktop workbench's session terminal. Default
+   * false — an explicit opt-in, because while it is on a token holder can
+   * execute arbitrary commands on the machine (outside the agent sandbox).
+   */
+  exec?: RemoteExecUserConfig;
+}
+
+/** The `remote.exec` sub-section of the user config file. */
+export interface RemoteExecUserConfig {
+  enabled?: boolean;
 }
 
 /** The `quota` section of the user config file. */
@@ -101,14 +113,6 @@ export interface QuotaUserConfig {
   autoResume?: boolean;
   /** Ollama Cloud API key for the `zcode-acp quota` card (cloud.ollama.ai). */
   ollamaApiKey?: string;
-  /** CLIProxyAPI management base URL (`https://host:port`) — the remote proxy
-   *  fronting Gemini/Codex/… OAuth accounts. No trailing path: the management
-   *  route prefix is appended per request. */
-  cliproxyUrl?: string;
-  /** CLIProxyAPI management key (`remote-management.secret-key` in the
-   *  server's config.yaml) — MUST go over HTTPS; the key can drive
-   *  credential-bearing upstream calls (`/api-call`). */
-  cliproxyManagementKey?: string;
   /** Opencode Go workspace id (`wrk_…`) — see the quota CLI docs. */
   opencodeGoWorkspaceId?: string;
   /** Opencode Go `auth` cookie value (`Fe26.2**…`). */
@@ -128,6 +132,15 @@ export interface SessionUserConfig {
   mode?: string;
   /** Show successful turn-end status as assistant text (default true). */
   showCompletionStatus?: boolean;
+  /**
+   * Pin a new session to the model its `session/new` menu advertised before
+   * the backend session existed (default true). Without the pin, the backend
+   * starts the session on its own default (e.g. the desktop's active account
+   * family), which can differ from the advertised `currentValue` — and an ACP
+   * client that skipped its model switch on equality then runs the wrong
+   * model. Set false to restore the inherit-the-backend-default behavior.
+   */
+  pinDefaultModel?: boolean;
 }
 
 /** The `autoCompact` section: threshold-based context compaction. */
@@ -164,15 +177,15 @@ export interface TuiUserConfig {
   stats?: string;
 }
 
-/** The `sandbox` section: global Seatbelt arming switch (per-project stays in sandbox.json). */
+/** The `sandbox` section: global Seatbelt arming switch (path grants live in the global sandbox.json). */
 export interface SandboxUserConfig {
   /** true = arm the sandbox globally (same as ZCODE_ACP_SANDBOX=1). */
   enabled?: boolean;
   /**
    * Milliseconds a sandbox ask waits inside an unattended context (goal-loop
    * round, workflow-run parent session) before ending no-decision so the
-   * chain keeps moving. 0 = wait forever even unattended. Per-project
-   * allow/deny content stays in sandbox.json — this is pacing, not content.
+   * chain keeps moving. 0 = wait forever even unattended. Allow/deny content
+   * lives in the machine-global sandbox.json — this is pacing, not content.
    */
   unattendedAskTimeoutMs?: number;
 }
@@ -198,6 +211,8 @@ export interface PushNotifyUserConfig {
   workflowStage?: boolean;
   /** Quota threshold warnings (5h/weekly windows at 60/80/90/95/98/exhausted). */
   quota?: boolean;
+  /** Remote Terminal turn completion (app ADR-0011): fired by the hub relay. */
+  terminal?: boolean;
 }
 
 /** The `push` section: offline WeCom notifications (push-backend-requirements §8). */
@@ -231,6 +246,19 @@ export interface WorkflowUserConfig {
   mode?: "disabled" | "onDemand" | "alwaysOn";
 }
 
+/** The `delete` section: destructive-delete opt-ins. */
+export interface DeleteUserConfig {
+  /**
+   * true = the remote delete endpoints may PHYSICALLY delete session bytes
+   * through the upstream v4 deletion face (3.18+ `storage/sessionData/
+   * deletionPreview|Execute`) when a request asks for `{"purge": true}`.
+   * Default false — a delete stays a reversible list-hide and the request
+   * flag alone never purges (a stolen token must not be able to destroy
+   * bytes). Machine-level arming: the per-request opt-in comes from the App.
+   */
+  purge?: boolean;
+}
+
 export interface UserConfig {
   remote?: RemoteUserConfig;
   quota?: QuotaUserConfig;
@@ -246,6 +274,7 @@ export interface UserConfig {
   tui?: TuiUserConfig;
   push?: PushUserConfig;
   workflow?: WorkflowUserConfig;
+  delete?: DeleteUserConfig;
 }
 
 /** Resolve the config file path: $XDG_CONFIG_HOME/zcode-acp or ~/.config/zcode-acp. */
@@ -334,8 +363,6 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
       const q: QuotaUserConfig = {};
       for (const [jsonKey, prop] of [
         ["ollamaApiKey", "ollamaApiKey"],
-        ["cliproxyUrl", "cliproxyUrl"],
-        ["cliproxyManagementKey", "cliproxyManagementKey"],
         ["opencodeGoWorkspaceId", "opencodeGoWorkspaceId"],
         ["opencodeGoAuthCookie", "opencodeGoAuthCookie"],
         ["opencodeGoSessionToken", "opencodeGoSessionToken"],
@@ -376,6 +403,11 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
     if (showCompletionStatus !== undefined) {
       if (typeof showCompletionStatus === "boolean") s.showCompletionStatus = showCompletionStatus;
       else warn(`config: ${label}.showCompletionStatus is not a boolean — ignoring`);
+    }
+    const pinDefaultModel = body["pinDefaultModel"];
+    if (pinDefaultModel !== undefined) {
+      if (typeof pinDefaultModel === "boolean") s.pinDefaultModel = pinDefaultModel;
+      else warn(`config: ${label}.pinDefaultModel is not a boolean — ignoring`);
     }
     return s;
   });
@@ -445,6 +477,16 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
     return w;
   });
 
+  result.delete = parseSection(parsed, "delete", file, (body, label) => {
+    const d: DeleteUserConfig = {};
+    const purge = body["purge"];
+    if (purge !== undefined) {
+      if (typeof purge === "boolean") d.purge = purge;
+      else warn(`config: ${label}.purge=${JSON.stringify(purge)} is not a boolean — ignoring`);
+    }
+    return d;
+  });
+
   result.push = parseSection(parsed, "push", file, (body, label) => {
     const p: PushUserConfig = {};
     if (body["enabled"] === undefined) {
@@ -509,6 +551,7 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
           "ask",
           "workflowStage",
           "quota",
+          "terminal",
         ] as const) {
           const v = notify[key];
           if (v === undefined) continue;
@@ -529,6 +572,19 @@ export function loadUserConfig(env: NodeJS.ProcessEnv = process.env): UserConfig
     }
   }
   return result;
+}
+
+/**
+ * Whether hard delete (physical purge) is ARMED on this machine: config-file
+ * `delete.purge` > env `ZCODE_ACP_DELETE_PURGE` > default false. Read LIVE per
+ * delete request — the hub and serve bridges are long-lived processes whose
+ * birth env rotates between launchd GUI spawns and interactive shells.
+ */
+export function hardDeleteArmed(env: NodeJS.ProcessEnv = process.env): boolean {
+  const fromFile = loadUserConfig(env).delete?.purge;
+  if (fromFile !== undefined) return fromFile;
+  const v = (env.ZCODE_ACP_DELETE_PURGE ?? "").trim().toLowerCase();
+  return v === "1" || v === "true";
 }
 
 /**
@@ -596,6 +652,14 @@ function parseRemoteSection(remote: Record<string, unknown>, file: string): Remo
     if (roots.length > 0) out.projectRoots = roots;
   } else if (remote["projectRoots"] !== undefined) {
     warn(`config: remote.projectRoots in ${file} is not an array of paths — ignoring`);
+  }
+  const exec = remote["exec"];
+  if (isPlainObject(exec)) {
+    const e: RemoteExecUserConfig = {};
+    if (typeof exec["enabled"] === "boolean") e.enabled = exec["enabled"];
+    if (Object.keys(e).length > 0) out.exec = e;
+  } else if (exec !== undefined) {
+    warn(`config: remote.exec in ${file} is not an object — ignoring`);
   }
   const terminal = remote["terminal"];
   if (isPlainObject(terminal)) {

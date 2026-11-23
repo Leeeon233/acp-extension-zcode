@@ -41,6 +41,8 @@ import {
 } from "./handlers/extensions.js";
 import { echoUserPromptToOthers, sendAvailableCommandsDeferred } from "./handlers/io.js";
 import { loadEarlier } from "./handlers/replay.js";
+import { editUserMessage, retryTurn } from "./handlers/rewind.js";
+import { steering } from "./handlers/steering.js";
 import { resendPendingInteractions } from "./handlers/server-requests.js";
 import { loadPluginCommands } from "./config/plugin-commands.js";
 import { loadSkillCommands } from "./config/skill-discovery.js";
@@ -164,7 +166,10 @@ export async function main(): Promise<void> {
  * the stdio server (`main`) and the headless serve bridge (`runHeadless`) —
  * one build, two transports.
  */
-function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof buildAllCommands>) {
+export function buildAgentApp(
+  server: ZcodeAcpServer,
+  allCommands: ReturnType<typeof buildAllCommands>,
+) {
   // Exposed for the gate-aware menu catch-up (resendMenuAfterGateSettled in
   // handlers/session.ts) — a cold bridge's menu snapshot predates the verdict.
   server.allCommands = allCommands;
@@ -271,8 +276,15 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       // zod parser so all param fields survive into the handler.
       // session/steer, session/rewind, session/rewindCascade were removed in
       // zcode app-server 0.16+ (steer/rewind moved to the v4 conversation API);
-      // the bridge dropped its passthroughs accordingly.
+      // the bridge dropped its passthroughs accordingly. Steer came back over
+      // v4 sendText (#352, `_session/steering`); rewind comes back as
+      // edit-and-resend / regenerate over v4 editUserQuery / retryTurn
+      // (handlers/rewind.ts), capability-gated by `_meta.zcode.rewind`.
       .onRequest("session/fork", extParams, (ctx) => fork(server, ctx.params, ctx.client))
+      .onRequest("session/edit_user_message", extParams, (ctx) =>
+        editUserMessage(server, ctx.params),
+      )
+      .onRequest("session/retry_turn", extParams, (ctx) => retryTurn(server, ctx.params))
       .onRequest("session/goal", extParams, (ctx) => goal(server, ctx.params))
       .onRequest("session/compact", extParams, (ctx) =>
         compact(server, ctx.params, server.clients.broadcast()),
@@ -299,6 +311,10 @@ function buildAgentApp(server: ZcodeAcpServer, allCommands: ReturnType<typeof bu
       .onRequest("session/set_mode", extParams, (ctx) =>
         setMode(server, ctx.params, server.clients.broadcast()),
       )
+      // Cross-adapter steering extension (codex-acp / claude-agent-acp
+      // convention, #352): inject text into the running turn via the v4
+      // command API — the successor to the v3 session/steer removed in 0.16+.
+      .onRequest("_session/steering", extParams, (ctx) => steering(server, ctx.params, ctx.client))
       .onNotification("session/cancel", (ctx) => cancel(server, ctx.params))
   );
 }

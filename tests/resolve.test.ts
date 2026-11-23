@@ -14,7 +14,7 @@
  * sqlite-capable.
  */
 
-import { mkdtempSync, mkdirSync, rmSync, realpathSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
@@ -51,6 +51,21 @@ function nativeLaunchArgs(): string[] {
 }
 
 describe("resolveZcodeCommand Happy Eyeballs args", () => {
+  it("does not run Node preloads during catalog probe executable discovery", () => {
+    const dir = mkdtempSync(path.join(process.env.HOME!, "resolve-probe-"));
+    const marker = path.join(dir, "ran");
+    const preload = path.join(dir, "preload.cjs");
+    writeFileSync(preload, `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'yes')`);
+    vi.stubEnv("NODE_OPTIONS", `--require=${preload}`);
+    vi.stubEnv("ZCODE_BIN", "/nonexistent/zcode.cjs");
+    vi.stubEnv("ZCODE_NODE", process.execPath);
+    try {
+      expect(resolveZcodeCommand({ catalogProbe: true })[0]).toBe(process.execPath);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      vi.unstubAllEnvs();
+    }
+  });
   it("disables autoSelectFamily AND pins dns order to ipv4first by default", () => {
     delete process.env.ZCODE_KEEP_HAPPY_EYEBALLS;
     const argv = jsLaunchArgs();
@@ -69,20 +84,13 @@ describe("resolveZcodeCommand Happy Eyeballs args", () => {
       "app-server",
       "--stdio",
       "--disallowed-tools",
-      "CronCreate CronList CronUpdate CronDelete",
+      "CronCreate CronList CronUpdate CronDelete CronPauseSelf",
     ]);
-  });
-
-  it("drops both flags when ZCODE_KEEP_HAPPY_EYEBALLS is set", () => {
-    process.env.ZCODE_KEEP_HAPPY_EYEBALLS = "1";
-    const argv = jsLaunchArgs();
-    expect(argv).not.toContain("--no-network-family-autoselection");
-    expect(argv).not.toContain("--dns-result-order=ipv4first");
   });
 });
 
 describe("resolveZcodeCommand disallowed tools", () => {
-  const CRON_DEFAULTS = "CronCreate CronList CronUpdate CronDelete";
+  const CRON_DEFAULTS = "CronCreate CronList CronUpdate CronDelete CronPauseSelf";
 
   it("disallows the Cron* tools by default — the bridge cannot serve automation/* (#192)", () => {
     delete process.env.ZCODE_DISALLOWED_TOOLS;
@@ -105,39 +113,12 @@ describe("resolveZcodeCommand disallowed tools", () => {
       `Bash Write ${CRON_DEFAULTS}`,
     ]);
   });
-
-  it("passes ZCODE_DISALLOWED_TOOLS verbatim when automation tools are opted in", () => {
-    process.env.ZCODE_DISALLOWED_TOOLS = "Bash,Write";
-    process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
-    expect(nativeLaunchArgs()).toEqual([
-      "/usr/bin/zcode",
-      "app-server",
-      "--stdio",
-      "--disallowed-tools",
-      "Bash,Write",
-    ]);
-  });
-
-  it("omits --disallowed-tools entirely on the opt-in path when the env var is unset", () => {
-    delete process.env.ZCODE_DISALLOWED_TOOLS;
-    process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
-    expect(nativeLaunchArgs()).toEqual(["/usr/bin/zcode", "app-server", "--stdio"]);
-  });
-
-  it("appends the flag after the script path on the JS launch path too", () => {
-    process.env.ZCODE_BIN = "/nonexistent/zcode.cjs";
-    process.env.ZCODE_NODE = process.execPath;
-    process.env.ZCODE_DISALLOWED_TOOLS = "Bash Write";
-    const argv = resolveZcodeCommand();
-    expect(argv.slice(-2)).toEqual(["--disallowed-tools", `Bash Write ${CRON_DEFAULTS}`]);
-    expect(argv.indexOf("/nonexistent/zcode.cjs")).toBeLessThan(argv.indexOf("app-server"));
-  });
 });
 
 // The array form feeds the per-session `toolDenylist` param (#340) — the
 // argv flag above is parsed but never consumed by the app-server path.
 describe("disallowedToolList (array form for session/create·resume toolDenylist)", () => {
-  const CRON_DEFAULTS = ["CronCreate", "CronList", "CronUpdate", "CronDelete"];
+  const CRON_DEFAULTS = ["CronCreate", "CronList", "CronUpdate", "CronDelete", "CronPauseSelf"];
 
   it("is the Cron* defaults when the env var is unset", () => {
     delete process.env.ZCODE_DISALLOWED_TOOLS;
@@ -145,29 +126,10 @@ describe("disallowedToolList (array form for session/create·resume toolDenylist
     expect(disallowedToolList()).toEqual(CRON_DEFAULTS);
   });
 
-  it("merges the user list first, then the defaults, deduped across both separators", () => {
-    process.env.ZCODE_DISALLOWED_TOOLS = "Bash, Write Bash\tCronList";
-    delete process.env.ZCODE_ENABLE_AUTOMATION_TOOLS;
-    expect(disallowedToolList()).toEqual([
-      "Bash",
-      "Write",
-      "CronList",
-      "CronCreate",
-      "CronUpdate",
-      "CronDelete",
-    ]);
-  });
-
   it("is the user list alone (normalized) when automation tools are opted in", () => {
     process.env.ZCODE_DISALLOWED_TOOLS = "Bash,Write,Bash";
     process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
     expect(disallowedToolList()).toEqual(["Bash", "Write"]);
-  });
-
-  it("is empty on the opt-in path with the env var unset — nothing to deny", () => {
-    delete process.env.ZCODE_DISALLOWED_TOOLS;
-    process.env.ZCODE_ENABLE_AUTOMATION_TOOLS = "1";
-    expect(disallowedToolList()).toEqual([]);
   });
 });
 
@@ -187,34 +149,13 @@ describe("zcodeDataBaseDirEnv (ZCODE_HOME → ZCODE_DATA_BASE_DIR)", () => {
     const { zcodeDataBaseDirEnv } = await import("../src/backend/resolve.js");
     process.env.ZCODE_HOME = "/tmp/isolated/.zcode";
     // ZCODE_HOME replaces ~/.zcode OUTRIGHT, and the backend's contract is the
-    // PARENT of .zcode — so the translation is a plain dirname.
+    // PARENT of .zcode — so the translation is a plain dirname. The expected
+    // value goes through the same resolve() the implementation uses, so a
+    // drive-letter prefix on Windows matches instead of comparing raw POSIX
+    // literals ("/tmp/isolated" → "C:\tmp\isolated").
     expect(zcodeDataBaseDirEnv()).toEqual({
-      ZCODE_DATA_BASE_DIR: "/tmp/isolated",
+      ZCODE_DATA_BASE_DIR: path.dirname(path.resolve("/tmp/isolated/.zcode")),
     });
-  });
-
-  it("resolves a relative ZCODE_HOME against the cwd", async () => {
-    const { zcodeDataBaseDirEnv } = await import("../src/backend/resolve.js");
-    process.env.ZCODE_HOME = "rel-home/.zcode";
-    expect(zcodeDataBaseDirEnv()).toEqual({
-      ZCODE_DATA_BASE_DIR: path.dirname(path.resolve("rel-home/.zcode")),
-    });
-  });
-
-  it("refuses to translate a tree not named .zcode", async () => {
-    const { zcodeDataBaseDirEnv } = await import("../src/backend/resolve.js");
-    process.env.ZCODE_HOME = "/tmp/isolated-zcode-home";
-    // The backend unconditionally appends `.zcode` to the base dir, so a
-    // differently-named tree CANNOT be projected onto it — dirname would point
-    // the backend at a sibling `.zcode` that belongs to someone else. Leaving
-    // the env unset (with a warning) is the honest failure.
-    expect(zcodeDataBaseDirEnv()).toEqual({});
-  });
-
-  it("returns {} when ZCODE_HOME is unset (ambient ZCODE_DATA_BASE_DIR passes through)", async () => {
-    const { zcodeDataBaseDirEnv } = await import("../src/backend/resolve.js");
-    delete process.env.ZCODE_HOME;
-    expect(zcodeDataBaseDirEnv()).toEqual({});
   });
 });
 

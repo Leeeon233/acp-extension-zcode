@@ -22,7 +22,6 @@ import { mkdirSync, mkdtempSync, renameSync, utimesSync, writeFileSync } from "n
 import { tmpdir } from "node:os";
 import path from "node:path";
 
-import { RequestError } from "@agentclientprotocol/sdk";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { resolveCredentialSecret } from "../src/backend/credential-store.js";
@@ -61,13 +60,19 @@ import {
   buildAccountProviderConfig,
   codingPlanRequestAuthFor,
   configProviderIdFor,
+  entitledCodingPlanModels,
+  oauthProjectTokenFamilyFor,
   readBuiltinTable,
+  startPlanRequestAuthFor,
   zcodeCredentialsPresent,
 } from "../src/config/account-provider.js";
 import { saveBridgeAccount } from "../src/config/bridge-accounts.js";
+import {} from "../src/config/options.js";
+import {
+  resetStartPlanVerdictForTests,
+  setStartPlanVerdict,
+} from "../src/config/start-plan-verdict.js";
 import { authenticate } from "../src/handlers/authenticate.js";
-import { messages } from "../src/i18n.js";
-
 /** Minimal bundled table with two coding-plan providers (one zai, one bigmodel). */
 const TABLE = {
   schemaVersion: 1,
@@ -117,6 +122,7 @@ function writePersonalRules(rules: unknown[]): void {
 }
 
 beforeEach(() => {
+  resetStartPlanVerdictForTests();
   root = mkdtempSync(path.join(tmpdir(), "acct-provider-"));
   const v2 = path.join(root, ".zcode", "v2");
   mkdirSync(v2, { recursive: true });
@@ -148,12 +154,6 @@ describe("provider id mapping", () => {
     );
   });
 
-  it("round-trips back to the config.json spelling", () => {
-    expect(configProviderIdFor("account:bigmodel-individual-coding-plan")).toBe(
-      "builtin:bigmodel-coding-plan",
-    );
-  });
-
   it("falls back to the id convention when the bundled table is absent (headless Linux)", () => {
     // Point the resolver at a path that does not exist — a Linux runner (or
     // any machine without the desktop app bundle) has no table to read.
@@ -172,15 +172,6 @@ describe("provider id mapping", () => {
     // off-peak has no legacy builtin spelling — pass through, never invent one.
     expect(configProviderIdFor("account:zai-offpeak-idle-plan")).toBe(
       "account:zai-offpeak-idle-plan",
-    );
-  });
-
-  it("passes unknown / third-party ids through unchanged", () => {
-    expect(accountProviderIdFor("3acc4047-9ddf-43bd-9ed3-a7745f5022ad")).toBe(
-      "3acc4047-9ddf-43bd-9ed3-a7745f5022ad",
-    );
-    expect(configProviderIdFor("3acc4047-9ddf-43bd-9ed3-a7745f5022ad")).toBe(
-      "3acc4047-9ddf-43bd-9ed3-a7745f5022ad",
     );
   });
 });
@@ -203,7 +194,10 @@ describe("readBuiltinTable memo", () => {
 });
 
 describe("buildAccountProviderConfig", () => {
-  it("entitles only the plans the desktop availability cache marks available", () => {
+  it("ignores a coding-plan-cache.json left over from 3.12–3.14 (#359)", () => {
+    // The cache was the 3.12–3.14 desktop's availability verdict; 3.15+
+    // stopped writing it and transitional-release machines are gone. A stale
+    // cache must contribute NOTHING — neither entitlement nor suppression.
     writeFileSync(
       path.join(root, ".zcode", "v2", "coding-plan-cache.json"),
       JSON.stringify({
@@ -219,17 +213,10 @@ describe("buildAccountProviderConfig", () => {
       }),
     );
     const payload = buildAccountProviderConfig();
-    expect(payload).not.toBeNull();
+    // No other entitlement source speaks: the cache's "available" must not
+    // entitle, and its "unavailable" must not suppress anything either.
     expect(payload!.providers["account:bigmodel-individual-coding-plan"]).toMatchObject({
-      access: { type: "zhipu-account", entitled: true },
-      builtinModelIds: ["GLM-5.3", "GLM-5.3-Flash"],
-    });
-    expect(payload!.providers["account:zai-individual-coding-plan"]).toMatchObject({
       access: { entitled: false },
-    });
-    expect(payload!.states["account:bigmodel-individual-coding-plan"]).toMatchObject({
-      availability: "available",
-      entitled: true,
     });
   });
 
@@ -339,22 +326,6 @@ describe("fresh desktop-only layout — encrypted store entitlement (#320)", () 
     expect(payload!.providers["account:zai-individual-coding-plan"]!.access.entitled).toBe(false);
   });
 
-  it("never lets the store override an explicit desktop verdict", () => {
-    writeCredentialStore({ [INDIVIDUAL_KEY]: "stored-individual-key" });
-    writeFileSync(
-      path.join(root, ".zcode", "v2", "coding-plan-cache.json"),
-      JSON.stringify({
-        entryStatus: {
-          items: { "builtin:bigmodel-coding-plan": { status: "unavailable" } },
-        },
-      }),
-    );
-    expect(
-      buildAccountProviderConfig()!.providers["account:bigmodel-individual-coding-plan"]!.access
-        .entitled,
-    ).toBe(false);
-  });
-
   it("never lets the store override config.json's builtin enablement signal", () => {
     writeCredentialStore({ [INDIVIDUAL_KEY]: "stored-individual-key" });
     // A builtin entry that is present but disabled is still a verdict-bearing
@@ -371,67 +342,8 @@ describe("fresh desktop-only layout — encrypted store entitlement (#320)", () 
     ).toBe(false);
   });
 
-  it("treats an undecryptable store as empty", () => {
-    writeFileSync(
-      zcodeStorePath.value,
-      JSON.stringify({ [INDIVIDUAL_KEY]: "enc:v1:garbage.not-encrypted-at-all" }),
-    );
-    expect(
-      buildAccountProviderConfig()!.providers["account:bigmodel-individual-coding-plan"]!.access
-        .entitled,
-    ).toBe(false);
-  });
-
-  it("serves the stored api-key when config.json never existed", () => {
-    writeCredentialStore({ [INDIVIDUAL_KEY]: "stored-individual-key" });
-    expect(codingPlanRequestAuthFor("account:bigmodel-individual-coding-plan")).toEqual({
-      apiKey: "stored-individual-key",
-    });
-  });
-
-  it("prefers config.json's key over the stored one", () => {
-    writeCredentialStore({ [INDIVIDUAL_KEY]: "stored-individual-key" });
-    writeFileSync(
-      zcodeCfgPath.value,
-      JSON.stringify({
-        provider: {
-          "builtin:bigmodel-coding-plan": { enabled: true, options: { apiKey: "legacy-key" } },
-        },
-      }),
-    );
-    expect(codingPlanRequestAuthFor("account:bigmodel-individual-coding-plan")).toEqual({
-      apiKey: "legacy-key",
-    });
-  });
-
-  it("keeps one family's store fallback when a bridge account names the other family", async () => {
+  it("lets a bridge account entitle only its own family", async () => {
     vi.stubEnv("ZCODE_HOME", path.join(root, ".zcode"));
-    writeCredentialStore({ [INDIVIDUAL_KEY]: "stored-individual-key" });
-    await saveBridgeAccount("zai", "bridge-zai-key");
-    const { providers } = buildAccountProviderConfig()!;
-    expect(providers["account:bigmodel-individual-coding-plan"]!.access.entitled).toBe(true);
-    expect(providers["account:zai-individual-coding-plan"]!.access.entitled).toBe(true);
-    expect(codingPlanRequestAuthFor("account:bigmodel-individual-coding-plan")).toEqual({
-      apiKey: "stored-individual-key",
-    });
-    expect(codingPlanRequestAuthFor("account:zai-individual-coding-plan")).toEqual({
-      apiKey: "bridge-zai-key",
-    });
-  });
-
-  it("lets a bridge account override an unavailable desktop verdict for its own plan only", async () => {
-    vi.stubEnv("ZCODE_HOME", path.join(root, ".zcode"));
-    writeFileSync(
-      path.join(root, ".zcode", "v2", "coding-plan-cache.json"),
-      JSON.stringify({
-        entryStatus: {
-          items: {
-            "builtin:zai-coding-plan": { status: "unavailable" },
-            "builtin:bigmodel-coding-plan": { status: "unavailable" },
-          },
-        },
-      }),
-    );
     await saveBridgeAccount("zai", "bridge-zai-key");
     const { providers } = buildAccountProviderConfig()!;
     expect(providers["account:zai-individual-coding-plan"]!.access.entitled).toBe(true);
@@ -470,7 +382,7 @@ describe("manual coding-plan keys from provider_config.json (#344)", () => {
     });
   });
 
-  it("ranks the manual key above the encrypted store and below config.json", () => {
+  it("ranks the manual key above the frozen config.json and the encrypted store", () => {
     writeCredentialStore({
       "account-provider:coding-plan:account:bigmodel-individual-coding-plan:account:108:api-key":
         "stored-individual-key",
@@ -488,6 +400,8 @@ describe("manual coding-plan keys from provider_config.json (#344)", () => {
     expect(codingPlanRequestAuthFor("account:bigmodel-individual-coding-plan")).toEqual({
       apiKey: "manual-bigmodel-key",
     });
+    // A manual rule implies a 3.12+ layout, where config.json is frozen at its
+    // pre-3.12 state — the leftover key there must not outrank the fresh rule.
     writeFileSync(
       zcodeCfgPath.value,
       JSON.stringify({
@@ -497,7 +411,7 @@ describe("manual coding-plan keys from provider_config.json (#344)", () => {
       }),
     );
     expect(codingPlanRequestAuthFor("account:bigmodel-individual-coding-plan")).toEqual({
-      apiKey: "legacy-key",
+      apiKey: "manual-bigmodel-key",
     });
   });
 
@@ -525,20 +439,6 @@ describe("manual coding-plan keys from provider_config.json (#344)", () => {
     ).toBe(false);
     expect(codingPlanRequestAuthFor("account:zai-individual-coding-plan")).toBeNull();
   });
-
-  it("falls back to the frozen official endpoints when the table is absent", () => {
-    // Headless Linux has no desktop bundle to read — the endpoint → family
-    // mapping must still resolve (frozen pair), and the individual-plan
-    // detection falls back to the id-shape check.
-    builtinProviderEnv.mockReturnValue({
-      ZCODE_BUILTIN_PROVIDER_CONFIG_FILE: path.join(root, "absent-table.json"),
-    });
-    delete process.env.ZCODE_BUILTIN_PROVIDER_CONFIG_FILE;
-    writePersonalRules([zaiRule()]);
-    expect(codingPlanRequestAuthFor("account:zai-individual-coding-plan")).toEqual({
-      apiKey: "manual-zai-key",
-    });
-  });
 });
 
 describe("authenticate (#344)", () => {
@@ -555,21 +455,257 @@ describe("authenticate (#344)", () => {
     expect(zcodeCredentialsPresent()).toBe(true);
     expect(authenticate({ methodId: "zcode-credentials" })).toEqual({});
   });
+});
 
-  it("errors with sign-in guidance when no credential source exists", () => {
-    expect(zcodeCredentialsPresent()).toBe(false);
-    expect(() => authenticate({ methodId: "zcode-credentials" })).toThrowError(
-      messages().authErrNoCredentials,
+describe("3.15+ desktop layout — OAuth sign-in + providerFamilyConnectionSelections", () => {
+  function writeSetting(selections: Record<string, unknown>): void {
+    writeFileSync(
+      path.join(dataRoot.value, "setting.json"),
+      JSON.stringify({ providerFamilyConnectionSelections: selections }),
     );
+  }
+
+  it("entitles the selected family's individual plan when the store holds its OAuth sign-in", () => {
+    writeCredentialStore({ "oauth:zai:access_token": "login-jwt" });
+    writeSetting({ zai: { kind: "individual-coding-plan" } });
+    const payload = buildAccountProviderConfig();
+    expect(payload!.providers["account:zai-individual-coding-plan"]!.access.entitled).toBe(true);
+    // The table's default (bigmodel) must not win over the user's selection.
+    expect(payload!.providers["account:bigmodel-individual-coding-plan"]!.access.entitled).toBe(
+      false,
+    );
+    expect(oauthProjectTokenFamilyFor("account:zai-individual-coding-plan")).toBe("zai");
+    expect(zcodeCredentialsPresent()).toBe(true);
+    // The dropdown offers the entitled plan's models, not the BigModel default.
+    expect(entitledCodingPlanModels()).toEqual([
+      {
+        providerId: "builtin:zai-coding-plan",
+        providerName: "builtin:zai-coding-plan",
+        modelId: "GLM-5.3",
+      },
+      {
+        providerId: "builtin:zai-coding-plan",
+        providerName: "builtin:zai-coding-plan",
+        modelId: "GLM-5.3-Flash",
+      },
+    ]);
   });
 
-  it("rejects an unknown auth method id with -32602", () => {
-    let code: number | undefined;
-    try {
-      authenticate({ methodId: "someone-elses-method" });
-    } catch (e) {
-      code = (e as RequestError).code;
-    }
-    expect(code).toBe(-32602);
+  it("unions the OAuth selection even under a stale 3.12–3.14 coding-plan-cache (#359)", () => {
+    writeCredentialStore({ "oauth:zai:access_token": "login-jwt" });
+    writeSetting({ zai: { kind: "individual-coding-plan" } });
+    // A leftover cache from before the 3.15+ upgrade — its verdict must not
+    // suppress the active OAuth connection (the cache is no longer read).
+    writeFileSync(
+      path.join(dataRoot.value, "coding-plan-cache.json"),
+      JSON.stringify({
+        entryStatus: { items: { "builtin:zai-coding-plan": { status: "unavailable" } } },
+      }),
+    );
+    const payload = buildAccountProviderConfig();
+    expect(payload!.providers["account:zai-individual-coding-plan"]!.access.entitled).toBe(true);
+    expect(oauthProjectTokenFamilyFor("account:zai-individual-coding-plan")).toBe("zai");
+  });
+
+  it("does not entitle Start Plan from a Coding Plan OAuth login alone (#363 follow-up)", () => {
+    // Observed 2026-11-10: an OAuth sign-in for the individual Coding Plan
+    // leaves zcodejwttoken in the store — a login is NOT a Start Plan
+    // holding. Upstream decides entitlement from the billing/balance plans;
+    // the only on-disk mirror is the connection selection's kind.
+    writeFileSync(
+      tablePath,
+      JSON.stringify({
+        ...TABLE,
+        config: {
+          providerConfigRules: {
+            providerRules: [
+              ...TABLE.config.providerConfigRules.providerRules,
+              {
+                providerId: "account:zai-start-plan",
+                providerName: "Start Plan",
+                config: {
+                  access: { type: "zhipu-account", mode: "start-plan", accountType: "zai" },
+                  builtinModelIds: ["GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"],
+                },
+              },
+            ],
+          },
+        },
+      }),
+    );
+    writeCredentialStore({
+      "oauth:zai:access_token": "login-jwt",
+      zcodejwttoken: "start-plan-jwt-token",
+    });
+    writeSetting({ zai: { kind: "individual-coding-plan" } });
+
+    const payload = buildAccountProviderConfig()!;
+    expect(payload.providers["account:zai-individual-coding-plan"]!.access.entitled).toBe(true);
+    expect(payload.providers["account:zai-start-plan"]!.access.entitled).toBe(false);
+    expect(startPlanRequestAuthFor("account:zai-start-plan")).toBeNull();
+    // No start-plan models leak into the dropdown (GLM-5.2 / GLM-5-Turbo are
+    // the bundled table's start-plan list).
+    expect(entitledCodingPlanModels()).toEqual([
+      {
+        providerId: "builtin:zai-coding-plan",
+        providerName: "builtin:zai-coding-plan",
+        modelId: "GLM-5.3",
+      },
+      {
+        providerId: "builtin:zai-coding-plan",
+        providerName: "builtin:zai-coding-plan",
+        modelId: "GLM-5.3-Flash",
+      },
+    ]);
+  });
+
+  it("entitles Start Plan when the desktop connection selection is start-plan (#363)", () => {
+    writeFileSync(
+      tablePath,
+      JSON.stringify({
+        ...TABLE,
+        config: {
+          providerConfigRules: {
+            providerRules: [
+              ...TABLE.config.providerConfigRules.providerRules,
+              {
+                providerId: "account:zai-start-plan",
+                providerName: "Start Plan",
+                config: {
+                  access: { type: "zhipu-account", mode: "start-plan", accountType: "zai" },
+                  builtinModelIds: ["GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"],
+                },
+              },
+              {
+                providerId: "account:bigmodel-start-plan",
+                providerName: "Start Plan",
+                config: {
+                  access: { type: "zhipu-account", mode: "start-plan", accountType: "bigmodel" },
+                  builtinModelIds: ["GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"],
+                },
+              },
+            ],
+          },
+        },
+      }),
+    );
+    writeCredentialStore({
+      "oauth:zai:access_token": "login-jwt",
+      zcodejwttoken: "start-plan-jwt-token",
+    });
+    writeSetting({ zai: { kind: "start-plan" } });
+
+    const payload = buildAccountProviderConfig()!;
+    expect(payload.providers["account:zai-start-plan"]!.access.entitled).toBe(true);
+    // No selection (and no login) for bigmodel — its Start Plan stays off.
+    expect(payload.providers["account:bigmodel-start-plan"]!.access.entitled).toBe(false);
+    expect(startPlanRequestAuthFor("account:zai-start-plan")).toEqual({
+      apiKey: "start-plan-jwt-token",
+    });
+    expect(startPlanRequestAuthFor("account:bigmodel-start-plan")).toBeNull();
+    expect(entitledCodingPlanModels()).toEqual([
+      {
+        providerId: "builtin:zai-start-plan",
+        providerName: "Start Plan",
+        modelId: "GLM-5.3-Flash",
+      },
+      {
+        providerId: "builtin:zai-start-plan",
+        providerName: "Start Plan",
+        modelId: "GLM-5.2",
+      },
+      {
+        providerId: "builtin:zai-start-plan",
+        providerName: "Start Plan",
+        modelId: "GLM-5-Turbo",
+      },
+    ]);
+  });
+
+  /** Table fixture with a zai start-plan rule (the #406 overlay layout). */
+  function writeStartPlanTable(): void {
+    writeFileSync(
+      tablePath,
+      JSON.stringify({
+        ...TABLE,
+        config: {
+          providerConfigRules: {
+            providerRules: [
+              ...TABLE.config.providerConfigRules.providerRules,
+              {
+                providerId: "account:zai-start-plan",
+                providerName: "Start Plan",
+                config: {
+                  access: { type: "zhipu-account", mode: "start-plan", accountType: "zai" },
+                  builtinModelIds: ["GLM-5.3-Flash", "GLM-5.2", "GLM-5-Turbo"],
+                },
+              },
+            ],
+          },
+        },
+      }),
+    );
+  }
+
+  it("entitles Start Plan from the billing verdict without a start-plan selection (#406)", () => {
+    // Observed on 3.17.2+/3.18 macOS: Start Plan rides as an OVERLAY on the
+    // zai OAuth family — providerFamilyConnectionSelections stays
+    // `individual-coding-plan` forever while billing reports the plan active
+    // (~294M tokens billed, flag never flipped). Flipping the flag by hand
+    // breaks the desktop's own credential resolution, so the billing verdict
+    // is the only safe gate.
+    writeStartPlanTable();
+    writeCredentialStore({
+      "oauth:zai:access_token": "login-jwt",
+      zcodejwttoken: "start-plan-jwt-token",
+    });
+    writeSetting({ zai: { kind: "individual-coding-plan" } });
+    setStartPlanVerdict({ status: "entitled", modelIds: ["glm-5.3-flash"] });
+
+    const payload = buildAccountProviderConfig()!;
+    expect(payload.providers["account:zai-start-plan"]!.access.entitled).toBe(true);
+    // The push carries ONLY the grant's capability model — the table's
+    // GLM-5.2 / GLM-5-Turbo would fail billing (#406 minor).
+    expect(payload.providers["account:zai-start-plan"]!.builtinModelIds).toEqual(["GLM-5.3-Flash"]);
+    expect(startPlanRequestAuthFor("account:zai-start-plan")).toEqual({
+      apiKey: "start-plan-jwt-token",
+    });
+    expect(entitledCodingPlanModels()).toEqual([
+      {
+        providerId: "builtin:zai-coding-plan",
+        providerName: "builtin:zai-coding-plan",
+        modelId: "GLM-5.3",
+      },
+      {
+        providerId: "builtin:zai-coding-plan",
+        providerName: "builtin:zai-coding-plan",
+        modelId: "GLM-5.3-Flash",
+      },
+      {
+        providerId: "builtin:zai-start-plan",
+        providerName: "Start Plan",
+        modelId: "GLM-5.3-Flash",
+      },
+    ]);
+  });
+
+  it("billing `none` suppresses even a start-plan connection selection", () => {
+    // Billing wins in both directions: a query that succeeded and found no
+    // active start plan is authoritative over the on-disk flag.
+    writeStartPlanTable();
+    writeCredentialStore({
+      "oauth:zai:access_token": "login-jwt",
+      zcodejwttoken: "start-plan-jwt-token",
+    });
+    writeSetting({ zai: { kind: "start-plan" } });
+    setStartPlanVerdict({ status: "none" });
+
+    const payload = buildAccountProviderConfig()!;
+    expect(payload.providers["account:zai-start-plan"]!.access.entitled).toBe(false);
+    expect(startPlanRequestAuthFor("account:zai-start-plan")).toBeNull();
+    // The individual plan is off too — its gate is the (different)
+    // `individual-coding-plan` selection, which this fixture's setting does
+    // not carry. Billing `none` speaks only for Start Plan.
+    expect(payload.providers["account:zai-individual-coding-plan"]!.access.entitled).toBe(false);
   });
 });

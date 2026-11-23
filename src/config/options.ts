@@ -14,7 +14,7 @@ import { readFileSync } from "node:fs";
 import type * as acp from "@agentclientprotocol/sdk";
 
 import { backendCapabilities } from "../backend/adapter.js";
-import type { ZcodeReadResult } from "../backend/types.js";
+import type { ZcodeCreateResult, ZcodeReadResult } from "../backend/types.js";
 import { recordModelChoice } from "../lazy-sessions.js";
 import {
   clientConnectionRoot,
@@ -27,7 +27,12 @@ import {
 } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { isBroadcastSource, sendSessionUpdate, sendSessionUpdateToOthers } from "../handlers/io.js";
-import { configProviderIdFor } from "./account-provider.js";
+import {
+  accountProviderIdFor,
+  configProviderIdFor,
+  entitledCodingPlanModels,
+  readBuiltinTable,
+} from "./account-provider.js";
 import { readCredentialConfig } from "./bridge-accounts.js";
 import { initialSessionMode } from "./settings.js";
 
@@ -200,12 +205,32 @@ export interface ModelRef {
  *     local baseURL (llama.cpp/ollama-style providers work keyless).
  */
 export function providerSelectable(pid: string, p: ProviderEntry | undefined): boolean {
-  if (!p) return false;
-  if (isBuiltinProvider(pid)) return p.enabled === true && Boolean(p.options?.apiKey);
-  if (p.enabled === false) return false;
-  if (p.options?.apiKey) return true;
-  if (p.options?.apiKeyRequired === false) return true;
-  return isLocalBaseURL(p.options?.baseURL);
+  return providerUnselectableReason(pid, p) === null;
+}
+
+/**
+ * Why a provider entry is NOT selectable (null = selectable) — the reason
+ * taxonomy exported to ACP clients as `unselectableReason` in
+ * `_meta.zcode.providers` (#400), so a client can render "link account in the
+ * desktop app" instead of silently omitting the provider.
+ */
+export type ProviderUnselectableReason = "disabled" | "keyless-builtin" | "non-local-keyless";
+
+export function providerUnselectableReason(
+  pid: string,
+  p: ProviderEntry | undefined,
+): ProviderUnselectableReason | null {
+  if (!p) return "disabled";
+  if (isBuiltinProvider(pid)) {
+    if (p.enabled !== true) return "disabled";
+    if (!p.options?.apiKey) return "keyless-builtin";
+    return null;
+  }
+  if (p.enabled === false) return "disabled";
+  if (p.options?.apiKey) return null;
+  if (p.options?.apiKeyRequired === false) return null;
+  if (isLocalBaseURL(p.options?.baseURL)) return null;
+  return "non-local-keyless";
 }
 
 /** localhost-style baseURL (llama.cpp / Ollama / LM Studio run keyless). */
@@ -217,6 +242,50 @@ function isLocalBaseURL(url: string | undefined): boolean {
   } catch {
     return false;
   }
+}
+
+/** Synthesize a config.json-shaped provider entry from a personal rule. */
+function personalRuleEntry(rule: PersonalProviderRule): ProviderEntry {
+  return {
+    name: rule.providerName,
+    enabled: rule.enabled,
+    options: {
+      apiKey: rule.config?.access?.apiKey,
+      baseURL: rule.config?.api?.baseUrl,
+    },
+  };
+}
+
+/**
+ * A config.json entry with the 3.12+ personal rule overlaid — custom
+ * providers toggled/updated in the desktop app write their new `enabled` /
+ * `apiKey` / `baseUrl` only to provider_config.json, leaving legacy
+ * config.json frozen at its pre-3.12 state. Without the overlay a provider
+ * disabled in 3.12+ stays selectable via config.json.
+ */
+function effectiveProviderEntry(
+  pid: string,
+  p: ProviderEntry | undefined,
+  personal: PersonalModels | null,
+): ProviderEntry | undefined {
+  const personalRule = !isBuiltinProvider(pid)
+    ? personal?.providers.find((entry) => entry.pid === pid)?.rule
+    : undefined;
+  if (!p || !personalRule) return p;
+  return {
+    ...p,
+    name: personalRule.providerName ?? p.name,
+    enabled: personalRule.enabled ?? p.enabled,
+    options: {
+      ...p.options,
+      ...(personalRule.config?.access?.apiKey !== undefined
+        ? { apiKey: personalRule.config.access.apiKey }
+        : {}),
+      ...(personalRule.config?.api?.baseUrl !== undefined
+        ? { baseURL: personalRule.config.api.baseUrl }
+        : {}),
+    },
+  };
 }
 
 /**
@@ -234,18 +303,47 @@ function appendPersonalOnlyProviders(
   for (const { pid, rule } of personal.providers) {
     if (known.has(pid)) continue;
     if (pinned && pid !== pinned) continue;
-    const synthesized: ProviderEntry = {
-      name: rule.providerName,
-      enabled: rule.enabled,
-      options: {
-        apiKey: rule.config?.access?.apiKey,
-        baseURL: rule.config?.api?.baseUrl,
-      },
-    };
-    if (!providerSelectable(pid, synthesized)) continue;
+    if (!providerSelectable(pid, personalRuleEntry(rule))) continue;
     const providerName = rule.providerName ?? pid;
     for (const modelId of personal.modelsByProvider.get(pid) ?? []) {
       out.push({ providerId: pid, providerName, modelId });
+    }
+  }
+}
+
+/**
+ * Append entitled coding-plan models (from the bundled table via the account
+ * entitlement ladder) for any coding-plan provider not already added from
+ * config.json. On 3.12+/3.15+ layouts where entitlement comes from OAuth
+ * (`setting.json` + `credentials.json`), the encrypted store (#320), or a
+ * manual coding-plan key in `provider_config.json` (#344), the plan's models
+ * do not live in `config.json` — appending them here keeps them selectable
+ * even when `config.json` still holds legacy entries or `provider_config.json`
+ * also defines custom providers.
+ */
+function appendEntitledCodingPlanModels(
+  out: ModelRef[],
+  personal: PersonalModels | null,
+  pinned: string | undefined,
+): void {
+  const known = new Set(out.map((m) => m.providerId));
+  const byProvider = new Map<string, { providerName: string; models: Set<string> }>();
+  for (const m of entitledCodingPlanModels()) {
+    if (known.has(m.providerId)) continue;
+    if (pinned && m.providerId !== pinned) continue;
+    let group = byProvider.get(m.providerId);
+    if (!group) {
+      group = { providerName: m.providerName, models: new Set() };
+      byProvider.set(m.providerId, group);
+    }
+    group.models.add(m.modelId);
+  }
+  for (const [pid, group] of byProvider) {
+    for (const extra of personal?.modelsByProvider.get(pid) ?? []) {
+      group.models.add(extra);
+    }
+    for (const modelId of group.models) {
+      out.push({ providerId: pid, providerName: group.providerName, modelId });
     }
   }
 }
@@ -255,20 +353,23 @@ function appendPersonalOnlyProviders(
  * provider_config.json (3.12+): models the user added in the desktop app land
  * there and never reach legacy config.json, so without the merge the dropdown
  * silently misses them (observed 2026-09). config.json stays authoritative for
- * provider enablement/credentials; the personal config contributes model ids
- * per provider, plus whole providers it describes and config.json does not.
+ * provider enablement/credentials unless overridden by a custom provider's
+ * rule in provider_config.json (3.12+ writes custom provider toggles there,
+ * never back to config.json); the personal config contributes model ids per
+ * provider, plus whole providers it describes and config.json does not.
  */
 export function loadAllModels(): ModelRef[] {
   const personal = loadPersonalModels();
+  const pinned = process.env.ZCODE_PROVIDER;
   try {
     const cfg = readConfig() as ConfigShape;
     const out: ModelRef[] = [];
     // ZCODE_PROVIDER pins the dropdown to one provider id.
-    const pinned = process.env.ZCODE_PROVIDER;
     for (const [pid, p] of Object.entries(cfg.provider ?? {})) {
       if (pinned && pid !== pinned) continue;
-      if (!providerSelectable(pid, p)) continue;
-      const providerName = p.name ?? pid;
+      const effective = effectiveProviderEntry(pid, p, personal);
+      if (!providerSelectable(pid, effective)) continue;
+      const providerName = effective?.name ?? pid;
       // Custom providers: once the personal config tracks the provider's
       // models, THAT list is authoritative. Additions AND deletions land only
       // there (config.json stopped syncing), and the backend registry knows no
@@ -285,6 +386,7 @@ export function loadAllModels(): ModelRef[] {
         out.push({ providerId: pid, providerName, modelId });
       }
     }
+    appendEntitledCodingPlanModels(out, personal, pinned);
     if (personal) appendPersonalOnlyProviders(out, personal, pinned);
     // The default-provider fallback applies only to a MISSING/empty provider
     // map (fresh install). When providers ARE configured but none is usable
@@ -292,29 +394,134 @@ export function loadAllModels(): ModelRef[] {
     // re-advertise exactly the unusable provider — or one absent from the
     // user's config — and switching to it fails in applyModelSwitch.
     if (out.length === 0 && Object.keys(cfg.provider ?? {}).length === 0) {
-      return [
-        {
-          providerId: DEFAULT_PROVIDER_ID,
-          providerName: DEFAULT_PROVIDER_NAME,
-          modelId: DEFAULT_MODEL_ID,
-        },
-      ];
+      return entitledOrDefaultModels(pinned);
     }
     return out;
   } catch {
-    // config.json unreadable — a personal-config-only setup still advertises
-    // its providers before the fresh-install default kicks in.
+    // config.json unreadable — a personal-config-only or OAuth setup still
+    // advertises its providers before the fresh-install default kicks in.
     const out: ModelRef[] = [];
-    if (personal) appendPersonalOnlyProviders(out, personal, process.env.ZCODE_PROVIDER);
+    appendEntitledCodingPlanModels(out, personal, pinned);
+    if (personal) appendPersonalOnlyProviders(out, personal, pinned);
     if (out.length > 0) return out;
-    return [
-      {
-        providerId: DEFAULT_PROVIDER_ID,
-        providerName: DEFAULT_PROVIDER_NAME,
-        modelId: DEFAULT_MODEL_ID,
-      },
-    ];
+    return entitledOrDefaultModels(pinned);
   }
+}
+
+/**
+ * No usable config.json provider: advertise the coding plans the account
+ * ladder entitles (a 3.15+ desktop-only layout), and only then the
+ * fresh-install default.
+ */
+function entitledOrDefaultModels(pinned: string | undefined): ModelRef[] {
+  const entitled = entitledCodingPlanModels().filter((m) => !pinned || m.providerId === pinned);
+  if (entitled.length > 0) return entitled;
+  return [
+    {
+      providerId: DEFAULT_PROVIDER_ID,
+      providerName: DEFAULT_PROVIDER_NAME,
+      modelId: DEFAULT_MODEL_ID,
+    },
+  ];
+}
+
+// ---------- ACP provider metadata (`_meta.zcode`, #400) ----------
+
+/** One provider entry in the ACP-facing `_meta.zcode.providers` list. */
+export interface ProviderMetadataEntry {
+  /**
+   * Config-dialect provider id (`builtin:…` slug / custom UUID) — NOT the
+   * registry's `account:` spelling, so it matches the other config.json-sourced
+   * fields a client sees.
+   */
+  id: string;
+  /** Display name (the desktop app's providerName; the raw id when unnamed). */
+  name: string;
+  /** Whether the model dropdown offers this provider's models. */
+  selectable: boolean;
+  /** Present only when selectable is false — why the dropdown skips it. */
+  unselectableReason?: ProviderUnselectableReason;
+  /**
+   * The modelId the dropdown lists first for the provider — what a session
+   * started on it actually runs (`loadZcodeCredentials` dispatches the first
+   * config.json key, same order the dropdown derives from).
+   */
+  defaultModel?: string;
+}
+
+/** The `_meta.zcode` payload on the model configOption and session/new responses. */
+export interface ProviderMetaPayload {
+  providers: ProviderMetadataEntry[];
+  /** Config dialect of the current provider (`account:` refs fold to `builtin:`). */
+  currentProviderId: string;
+}
+
+/**
+ * The provider list ACP clients render a provider picker from (#400) —
+ * without mirroring `providerSelectable` and the config scan in their own
+ * code. Selectable providers come FIRST, derived from the SAME
+ * `loadAllModels()` output the model dropdown offers (pass `models` when the
+ * caller already holds it), so metadata and dropdown can never disagree —
+ * including the ZCODE_PROVIDER pin and entitled coding plans. Unselectable
+ * config.json / personal-only entries follow with a reason code, so a client
+ * can render "keyless — link account in the desktop app" instead of a
+ * silent gap.
+ */
+export function providerMetadataList(
+  models: ModelRef[] = loadAllModels(),
+): ProviderMetadataEntry[] {
+  const pinned = process.env.ZCODE_PROVIDER;
+  const out: ProviderMetadataEntry[] = [];
+  const seen = new Set<string>();
+  for (const m of models) {
+    if (seen.has(m.providerId)) continue;
+    seen.add(m.providerId);
+    out.push({ id: m.providerId, name: m.providerName, selectable: true, defaultModel: m.modelId });
+  }
+  const personal = loadPersonalModels();
+  const appendConfigDialect = (
+    pid: string,
+    entry: ProviderEntry | undefined,
+    name: string,
+  ): void => {
+    if (seen.has(pid)) return;
+    seen.add(pid);
+    const reason = providerUnselectableReason(pid, entry);
+    // A "selectable" verdict here means the provider is usable but carries no
+    // models (empty models map) — loadAllModels never listed it. Stay honest
+    // rather than inventing a reason.
+    out.push(
+      reason === null
+        ? { id: pid, name, selectable: true }
+        : { id: pid, name, selectable: false, unselectableReason: reason },
+    );
+  };
+  try {
+    const cfg = readConfig() as ConfigShape;
+    for (const [pid, p] of Object.entries(cfg.provider ?? {})) {
+      if (pinned && pid !== pinned) continue;
+      const effective = effectiveProviderEntry(pid, p, personal);
+      appendConfigDialect(pid, effective, effective?.name ?? pid);
+    }
+  } catch {
+    // unreadable config.json — the selectable set from loadAllModels stands alone
+  }
+  for (const { pid, rule } of personal?.providers ?? []) {
+    if (pinned && pid !== pinned) continue;
+    appendConfigDialect(pid, personalRuleEntry(rule), rule.providerName ?? pid);
+  }
+  return out;
+}
+
+/** Assemble the `_meta.zcode` payload; the current provider id normalizes to the config dialect. */
+export function buildProviderMeta(
+  currentProviderId: string,
+  models: ModelRef[] = loadAllModels(),
+): ProviderMetaPayload {
+  return {
+    providers: providerMetadataList(models),
+    currentProviderId: configProviderIdFor(currentProviderId),
+  };
 }
 
 /** Look up a provider entry by id (any provider, not just enabled).
@@ -386,7 +593,15 @@ function buildModelSelectOptions(models: ModelRef[]): Array<{ value: string; nam
     const value = formatModelValue(model.providerId, model.modelId);
     if (seen.has(value)) continue;
     seen.add(value);
-    const qualify = collidingIds.has(model.modelId) || !isBuiltinProvider(model.providerId);
+    // An `account:`-spelled coding plan is a builtin in disguise (the
+    // registry dialect of the same config provider) — it must not qualify
+    // just for its spelling, or every snapshot-sourced builtin reads as a
+    // `providerId › model` pair. Collisions still qualify (same model id on
+    // two providers needs the provider in the label).
+    const builtin =
+      isBuiltinProvider(model.providerId) ||
+      isBuiltinProvider(configProviderIdFor(model.providerId));
+    const qualify = collidingIds.has(model.modelId) || !builtin;
     options.push({
       value,
       name: qualify ? `${model.providerName} › ${model.modelId}` : model.modelId,
@@ -439,7 +654,9 @@ export async function buildModes(
   let currentMode = initialSessionMode();
   if (zcodeSid !== null) {
     try {
+      const generation = server.backendGeneration;
       const read = await sessionRead(server, zcodeSid);
+      if (generation !== server.backendGeneration) throw new Error("backend generation changed");
       const settings = (read.settings ?? {}) as Record<string, unknown>;
       const modeSet = (settings.mode as Record<string, unknown>) ?? {};
       currentMode = (modeSet.current as string) ?? currentMode;
@@ -556,19 +773,33 @@ export async function buildConfigOptions(
 
   if (zcodeSid !== null) {
     try {
+      const generation = server.backendGeneration;
+      const identityBeforeRead = server.currentModelIdentity.get(zcodeSid);
       const read = await sessionRead(server, zcodeSid);
+      if (generation !== server.backendGeneration) throw new Error("backend generation changed");
       const settings = (read.settings ?? {}) as Record<string, unknown>;
       const modeSet = (settings.mode as Record<string, unknown>) ?? {};
       currentMode = (modeSet.current as string) ?? currentMode;
       const modelSet = (settings.model as Record<string, unknown>) ?? {};
       // settings.model.current is { providerId, modelId, variant? } — read BOTH so
-      // we can disambiguate same-named models across providers. Normalize the
-      // provider spelling (3.12+ registries answer `account:<family>-<plan>`;
-      // config.json and the dropdown use `builtin:<family>-<plan>`) so the
-      // current value matches a dropdown entry instead of duplicating it.
+      // we can disambiguate same-named models across providers. Preserve the
+      // registry identity: legacy config aliases can collapse distinct plans.
       const cur = (modelSet.current as { providerId?: string; modelId?: string }) ?? {};
-      if (cur.providerId) currentProviderId = configProviderIdFor(cur.providerId);
-      if (cur.modelId) currentModelId = cur.modelId;
+      if (
+        cur.providerId &&
+        cur.modelId &&
+        server.currentModelIdentity.get(zcodeSid) === identityBeforeRead
+      ) {
+        server.currentModelIdentity.set(zcodeSid, {
+          providerId: cur.providerId,
+          modelId: cur.modelId,
+        });
+      }
+      const identity = server.currentModelIdentity.get(zcodeSid);
+      if (identity) {
+        currentProviderId = identity.providerId;
+        currentModelId = identity.modelId;
+      }
       const tlSet = (settings.thoughtLevel as Record<string, unknown>) ?? {};
       // `current` is absent right after session/create — fall back to the
       // backend's defaultLevel (the level the session actually runs at).
@@ -603,11 +834,47 @@ export async function buildConfigOptions(
   // currentValue encodes provider+model so the switch handler can locate the
   // right provider (and its apiKey). Fall back to the first enabled provider
   // when settings omits providerId (legacy sessions).
-  const allModels = loadAllModels();
+  if (zcodeSid !== null && !currentProviderId) {
+    const identity = server.currentModelIdentity.get(zcodeSid);
+    if (identity) {
+      currentProviderId = identity.providerId;
+      currentModelId = identity.modelId;
+    }
+  }
+  const snapshot = zcodeSid === null ? undefined : server.modelAvailability.get(zcodeSid);
+  // The materialized snapshot speaks the REGISTRY dialect (`account:…`
+  // provider ids) and carries no display names. The VALUES must stay in that
+  // dialect — it is the only key that keeps same-named models of colliding
+  // legacy plans distinct, and the switch round-trip depends on it — but the
+  // provider NAME a choice shows must not be the raw registry id: a
+  // coding-plan choice would read as the full
+  // `account:<family>-individual-coding-plan › <model>` pair, an unreadable
+  // id string where every client (phone AND desktop panel) wants the display
+  // name. Resolve the name through the config dialect (configProviderIdFor
+  // folds the alias); ids the config cannot name keep the raw id as the
+  // label — distinct, if ugly.
+  const localModels = loadAllModels();
+  const providerNames = providerDisplayNames(localModels);
+  const allModels =
+    snapshot === undefined
+      ? localModels
+      : snapshot
+          .filter((m): m is typeof m & { providerId: string; modelId: string } =>
+            Boolean(m.providerId && m.modelId),
+          )
+          .map((m) => ({
+            providerId: m.providerId,
+            providerName:
+              providerNames.get(configProviderIdFor(m.providerId)) ??
+              providerNames.get(m.providerId) ??
+              m.providerId,
+            modelId: m.modelId,
+          }));
   const currentProvider = currentProviderId || allModels[0]?.providerId || DEFAULT_PROVIDER_ID;
   const currentModel = formatModelValue(currentProvider, currentModelId);
 
-  // Model options: config.json enabled providers are authoritative. Values
+  // Materialized snapshots are authoritative for display; before one exists,
+  // fall back to config.json. Values
   // are always providerId\modelId. Builtin labels stay the bare modelId
   // unless two providers ship the same id; third-party labels always qualify.
   let modelOptions = buildModelSelectOptions(allModels);
@@ -627,6 +894,11 @@ export async function buildConfigOptions(
       type: "select",
       currentValue: currentModel,
       options: modelOptions,
+      // Provider metadata for ACP clients (#400). The model option is the
+      // refresh vehicle: every rebuild (switch, credential change, config_
+      // option_update) re-attaches it, so the provider list stays live for
+      // the whole session lifetime. See docs/CONFIG-OPTIONS.md.
+      _meta: { zcode: buildProviderMeta(currentProvider, localModels) },
     },
     {
       id: "mode",
@@ -651,6 +923,9 @@ export async function buildConfigOptions(
     },
   ];
 
+  // Do not invent a provider/model pair when a materialized read lacks identity.
+  if (zcodeSid !== null && !currentProviderId) options.shift();
+
   // Read-only quota pseudo-option (ADR-0021): martty-only, no category (never
   // lands in a settings menu), string type per the probe-verified shape — the
   // SDK's union stops at select/boolean, so the cast carries the agent-owned
@@ -674,6 +949,112 @@ export async function buildConfigOptions(
   return options;
 }
 
+function providerDisplayNames(localModels: ModelRef[]): Map<string, string> {
+  const names = new Map<string, string>();
+  for (const rule of readBuiltinTable()?.table.config?.providerConfigRules?.providerRules ?? []) {
+    if (!rule.providerId || !rule.providerName) continue;
+    names.set(rule.providerId, rule.providerName);
+    names.set(configProviderIdFor(rule.providerId), rule.providerName);
+  }
+  for (const m of localModels) {
+    names.set(m.providerId, m.providerName);
+  }
+  return names;
+}
+
+/**
+ * Promote fallback `builtin:*` coding-plan models onto the backend's `account:*`
+ * registry dialect when `zcode-builtin.json` is present, merging any additional
+ * entitled models for already-enabled providers so `session/new` matches
+ * `session/set_config_option` synchronously before the cold probe finishes.
+ */
+function canonicalizeInitialModelOption(
+  options: acp.SessionConfigOption[],
+): acp.SessionConfigOption[] {
+  const localModels = loadAllModels();
+  if (localModels.length === 0) return options.filter((option) => option.id !== "model");
+  if (!readBuiltinTable()) return options;
+  const index = options.findIndex((option) => option.id === "model");
+  const existing = options[index];
+  if (index < 0 || existing?.type !== "select") return options;
+
+  const enabledConfigPids = new Set(localModels.map((m) => configProviderIdFor(m.providerId)));
+  const names = providerDisplayNames(localModels);
+  const models: ModelRef[] = [];
+  const seen = new Set<string>();
+  const push = (providerId: string, providerName: string, modelId: string): void => {
+    const key = formatModelValue(providerId, modelId);
+    if (seen.has(key)) return;
+    seen.add(key);
+    models.push({ providerId, providerName, modelId });
+  };
+  for (const m of localModels) {
+    const pid = accountProviderIdFor(m.providerId);
+    push(pid, names.get(configProviderIdFor(pid)) ?? names.get(pid) ?? m.providerName, m.modelId);
+  }
+  for (const m of entitledCodingPlanModels()) {
+    if (!enabledConfigPids.has(configProviderIdFor(m.providerId))) continue;
+    const pid = accountProviderIdFor(m.providerId);
+    push(pid, names.get(configProviderIdFor(pid)) ?? names.get(pid) ?? m.providerName, m.modelId);
+  }
+
+  const choices = buildModelSelectOptions(models);
+  const parsedCurrent = parseModelValue(String(existing.currentValue ?? ""));
+  const mappedCurrent = formatModelValue(
+    accountProviderIdFor(parsedCurrent.providerId),
+    parsedCurrent.modelId,
+  );
+  const currentValue = choices.some((choice) => choice.value === mappedCurrent)
+    ? mappedCurrent
+    : (choices[0]?.value ?? existing.currentValue);
+  options[index] = { ...existing, currentValue, options: choices };
+  return options;
+}
+
+/** Apply a validated, ephemeral create snapshot to a lazy session's initial menu. */
+export async function buildInitialConfigOptions(
+  server: ZcodeAcpServer,
+  receiverRoot: unknown,
+  result: ZcodeCreateResult | null,
+): Promise<acp.SessionConfigOption[]> {
+  const options = await buildConfigOptions(server, null, receiverRoot);
+  const model = result?.settings?.model;
+  const current = model?.current;
+  const available = model?.available;
+  if (
+    !Array.isArray(available) ||
+    available.some((entry) => !entry?.ref?.providerId || !entry.ref.modelId)
+  )
+    return canonicalizeInitialModelOption(options);
+  // ACP requires a currentValue. A registry that has no current selection
+  // cannot safely claim the locally configured default is active.
+  if (!current?.providerId || !current.modelId) return canonicalizeInitialModelOption(options);
+  // Same naming rule as buildConfigOptions' snapshot path: values stay in the
+  // create result's registry dialect (identity-preserving), names resolve
+  // through the config dialect so the raw provider id never reads as a label.
+  const names = providerDisplayNames(loadAllModels());
+  const models = available.map((entry) => {
+    const pid = entry.ref!.providerId!;
+    return {
+      providerId: pid,
+      providerName: names.get(configProviderIdFor(pid)) ?? names.get(pid) ?? pid,
+      modelId: entry.ref!.modelId!,
+    };
+  });
+  const currentValue = formatModelValue(current.providerId, current.modelId);
+  const choices = buildModelSelectOptions(models);
+  if (!choices.some((choice) => choice.value === currentValue)) {
+    // A current model absent from the registry snapshot is not a verified
+    // selectable option. Do not advertise it as switchable.
+    return canonicalizeInitialModelOption(options);
+  }
+  const index = options.findIndex((option) => option.id === "model");
+  const existing = options[index];
+  if (index >= 0 && existing?.type === "select")
+    options[index] = { ...existing, currentValue, options: choices };
+  return options;
+}
+
 /**
  * Dispatch session/set_config_option. mode/thought forward to setMode/
  * setThoughtLevel; model routes through applyModelSwitch (runtime-model.ts).
@@ -689,11 +1070,16 @@ export async function setConfigOption(
   acpSid?: string,
 ): Promise<{ kind: "model" | "mode" | "thought"; currentValue: string } | null> {
   if (configId === "model") {
-    const { applyModelSwitch } = await import("./runtime-model.js");
+    const { applyModelSwitch, lastSwitchedModelValue } = await import("./runtime-model.js");
     const ok = await applyModelSwitch(server, zcodeSid, value);
     if (!ok) return null;
-    rememberModelChoice(server, acpSid, zcodeSid, { model: value });
-    return { kind: "model", currentValue: value };
+    // Remember the registry-dialect identity the switch LANDED on (#403) —
+    // the inbound value may be a stale-dialect ref that only resolved via
+    // model-resolution, and the post-resume re-assert replays this record.
+    rememberModelChoice(server, acpSid, zcodeSid, {
+      model: lastSwitchedModelValue(server, zcodeSid) ?? value,
+    });
+    return { kind: "model", currentValue: lastSwitchedModelValue(server, zcodeSid) ?? value };
   }
   const dispatch = CONFIG_DISPATCH[configId];
   if (!dispatch) return null;

@@ -16,6 +16,7 @@
 import { basename } from "node:path";
 import process from "node:process";
 
+import { catalogProbeDiagnostic } from "./config/deferred-probe-capability.js";
 import { runAccountSetup } from "./account-setup.js";
 import { main as runHub } from "./bin/hub.js";
 import { main as runQuota } from "./bin/quota.js";
@@ -25,6 +26,7 @@ import { AGENT_INFO } from "./utils.js";
 
 /** What the dispatcher decided to run. `args` are the tokens after the subcommand. */
 export type Invocation =
+  | { kind: "doctor" }
   | { kind: "help" }
   | { kind: "server" }
   | { kind: "serve" }
@@ -66,6 +68,8 @@ export function resolveInvocation(invokedAs: string, argv: readonly string[]): I
     return { kind: "help" };
   }
   switch (sub) {
+    case "doctor":
+      return { kind: "doctor" };
     case "server":
       return { kind: "server" };
     case "serve":
@@ -90,6 +94,7 @@ Commands:
   (none) | server    The editor-facing ACP bridge over stdio (was
                       zcode-acp-server; editors normally launch it via the
                       acp-extension-zcode bin without this subcommand).
+  doctor            Show read-only model catalog pin diagnostics.
   setup --provider zai|bigmodel
                     Save an individual Coding Plan API key (hidden terminal input).
   quota [args...]   Plan usage cards (was the zcode-quota bin): -w watch,
@@ -117,10 +122,18 @@ async function main(): Promise<void> {
   // Long-running surfaces hand over to `bun --smol` when available (idle RSS
   // ~47 MB vs ~81 MB on Node); the instant paths (help/version/unknown) skip
   // the re-exec hop entirely.
-  if (invocation.kind !== "help" && invocation.kind !== "unknown" && invocation.kind !== "setup") {
+  if (
+    invocation.kind !== "help" &&
+    invocation.kind !== "unknown" &&
+    invocation.kind !== "setup" &&
+    invocation.kind !== "doctor"
+  ) {
     if (await reexecToBunIfEligible(process.argv[1] ?? "", process.argv.slice(2))) return;
   }
   switch (invocation.kind) {
+    case "doctor":
+      process.stdout.write(catalogProbeDiagnostic() + "\n");
+      return;
     case "help":
       process.stdout.write(HELP_TEXT + "\n");
       return;

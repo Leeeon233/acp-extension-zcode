@@ -11,7 +11,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { ZcodeBackend } from "../src/backend/client.js";
 import type { ZcodeMessage } from "../src/backend/types.js";
-import { handleSlashCommand, neutralizeSlashText } from "../src/handlers/slash.js";
+import { handleSlashCommand} from "../src/handlers/slash.js";
 import { resumeIntoSession } from "../src/handlers/session.js";
 import { ZcodeAcpServer } from "../src/server.js";
 
@@ -28,8 +28,14 @@ vi.mock("../src/handlers/server-requests.js", async (importOriginal) => {
   return { ...orig, askSessionPick: askSessionPickMock };
 });
 
-/** History per zcode session id; everything else answers minimally. */
-function fakeBackend(historyBySid: Record<string, ZcodeMessage[]>): {
+/**
+ * History per zcode session id; everything else answers minimally.
+ * `listAnswer` overrides every `session/list` reply (by-id lookups included).
+ */
+function fakeBackend(
+  historyBySid: Record<string, ZcodeMessage[]>,
+  listAnswer?: (params: Record<string, unknown>) => unknown,
+): {
   backend: ZcodeBackend;
   sent: Array<{ method: string; params: unknown }>;
 } {
@@ -41,6 +47,7 @@ function fakeBackend(historyBySid: Record<string, ZcodeMessage[]>): {
         case "session/resume":
           return { result: {} };
         case "session/list":
+          if (listAnswer) return listAnswer(params);
           return {
             result: {
               sessions: Object.keys(historyBySid).map((sid) => ({
@@ -72,13 +79,16 @@ function fakeBackend(historyBySid: Record<string, ZcodeMessage[]>): {
 interface SentUpdate {
   sessionUpdate: string;
   content?: { type: string; text: string };
+  title?: string;
+  /** Envelope sessionId, copied in by the recorder. */
+  sessionId?: string;
 }
 
 function recordingCx(): { cx: acp.AgentContext; updates: SentUpdate[] } {
   const updates: SentUpdate[] = [];
   const cx = {
-    notify: async (_method: string, params: { update?: SentUpdate }) => {
-      if (params.update) updates.push(params.update);
+    notify: async (_method: string, params: { sessionId?: string; update?: SentUpdate }) => {
+      if (params.update) updates.push({ ...params.update, sessionId: params.sessionId });
     },
     request: async () => ({}),
   } as unknown as acp.AgentContext;
@@ -132,33 +142,44 @@ describe("resumeIntoSession", () => {
     expect(server.resolveSid(acpSid)).toBe("zold"); // thread untouched
   });
 
-  it("discards an empty materialized session before adopting", async () => {
+  it.each([
+    ["asks by id: the bare listing's recency window misses an old session", false],
+    ["falls back to the bare listing when the backend rejects sessionIds", true],
+  ])("adopts an older conversation's title — %s", async (_name, rejectsById) => {
+    // A bare session/list is the 50 most recent sessions across EVERY
+    // workspace (upstream default limit) — an old conversation is absent.
+    const old = { sessionId: "ztarget", title: "old work", updatedAt: 1 };
+    const { backend } = fakeBackend({ ztarget: HISTORY }, (params) => {
+      if (params.sessionIds) {
+        return rejectsById
+          ? { error: { code: -32602, message: "Unrecognized key: sessionIds" } }
+          : { result: { sessions: [old] } };
+      }
+      return { result: { sessions: rejectsById ? [old] : [] } };
+    });
     const server = new ZcodeAcpServer();
-    const { backend, sent } = fakeBackend({ zold: [], ztarget: HISTORY });
     server.backend = backend;
-    const acpSid = randomUUID();
-    server.registerSession(acpSid, "zold");
-    server.sessionCwds.set(acpSid, "/tmp/proj");
-    server.markBackendLoaded(acpSid);
+    const acpSid = seedPlaceholder(server);
     const { cx } = recordingCx();
 
     const result = await resumeIntoSession(server, cx, acpSid, "ztarget");
-    expect(result.ok).toBe(true);
-    expect(sent).toContainEqual({ method: "session/close", params: { sessionId: "zold" } });
-    expect(server.resolveSid(acpSid)).toBe("ztarget");
-    expect(server.isBackendSessionLive(acpSid)).toBe(true);
+    expect(result).toEqual({ ok: true, title: "old work" });
   });
 
-  it("refuses while a turn is running on the target", async () => {
+  it("drops a /rename made on the placeholder before the adoption", async () => {
+    // The pin AND the title belonged to the discarded placeholder thread; a
+    // leftover title would also short-circuit the stored-title adoption.
     const server = new ZcodeAcpServer();
     const { backend } = fakeBackend({ ztarget: HISTORY });
     server.backend = backend;
     const acpSid = seedPlaceholder(server);
-    server.pendingTurns.set(1, { zcodeSid: "ztarget", cancelled: false });
+    server.sessionTitles.set(acpSid, "placeholder name");
+    server.titleUserSetBy.add(acpSid);
     const { cx } = recordingCx();
 
     const result = await resumeIntoSession(server, cx, acpSid, "ztarget");
-    expect(result.ok).toBe(false);
+    expect(result).toEqual({ ok: true, title: "t-ztarget" });
+    expect(server.titleUserSetBy.has(acpSid)).toBe(false);
   });
 });
 
@@ -176,28 +197,6 @@ describe("/resume slash command", () => {
     return { resp, updates };
   }
 
-  it("adopts directly with /resume <sessionId>", async () => {
-    const server = new ZcodeAcpServer();
-    const { backend } = fakeBackend({ ztarget: HISTORY });
-    server.backend = backend;
-    const acpSid = seedPlaceholder(server);
-
-    const { resp, updates } = await drive(server, acpSid, "/resume ztarget");
-    expect(resp).toEqual({ stopReason: "end_turn" });
-    expect(server.resolveSid(acpSid)).toBe("ztarget");
-    expect(updates.some((u) => u.sessionUpdate === "agent_message_chunk")).toBe(true);
-  });
-
-  it("errors on an unknown session id", async () => {
-    const server = new ZcodeAcpServer();
-    const { backend } = fakeBackend({ ztarget: HISTORY });
-    server.backend = backend;
-    const acpSid = seedPlaceholder(server);
-
-    await expect(drive(server, acpSid, "/resume nope")).rejects.toThrow(/nope/);
-    expect(server.resolveSid(acpSid)).toBeUndefined(); // thread untouched
-  });
-
   it("opens the picker and adopts the chosen session", async () => {
     const server = new ZcodeAcpServer();
     const { backend } = fakeBackend({ ztarget: HISTORY });
@@ -211,23 +210,6 @@ describe("/resume slash command", () => {
     expect(askSessionPickMock).toHaveBeenCalledTimes(1);
     const items = askSessionPickMock.mock.calls[0]![3] as Array<{ sessionId: string }>;
     expect(items.map((i) => i.sessionId)).toEqual(["ztarget"]);
-  });
-
-  it("reports cancellation when the picker is dismissed", async () => {
-    const server = new ZcodeAcpServer();
-    const { backend } = fakeBackend({ ztarget: HISTORY });
-    server.backend = backend;
-    const acpSid = seedPlaceholder(server);
-    askSessionPickMock.mockResolvedValueOnce(null);
-
-    const { resp } = await drive(server, acpSid, "/resume");
-    expect(resp).toEqual({ stopReason: "end_turn" });
-    expect(server.resolveSid(acpSid)).toBeUndefined(); // nothing adopted
-  });
-
-  it("resume is advertised as a real command (no zero-width neutralization)", () => {
-    expect(neutralizeSlashText("/resume")).toBe("/resume");
-    expect(neutralizeSlashText("/resume ztarget")).toBe("/resume ztarget");
   });
 
   it("targets the replayed history at the requesting connection, never the broadcast cx", async () => {

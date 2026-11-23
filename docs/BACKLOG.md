@@ -177,6 +177,178 @@ exactly the bridge's existing override-over-verdict rule (local
 `workflow.mode` > remote verdict, unset = follow the verdict), so upstream
 moved toward the bridge; nothing to change.
 
+**3.17.1 audit (2026-11-02, commit `a60ba6a7` / source `73158b64` — one
+bridge fix + the lifecycle alignment)**: the desktop moved 3.16.3 → 3.17.1 and its `zcode.cjs`
+self-reports CLI `0.17.1` — the checkout's exact CLI (root `3.17.1`,
+`apps/zcode-cli` `0.17.1`), so for the first time since 3.16.2 the public
+tree IS the running backend with no unseen delta. Protocol schema diff
+`packages/shared/src/zcode-protocol/index.ts` +160/−11, additive from the
+bridge's seat: new `session/lifecycle/{changed,getState,ensureReady,stop,
+restart}` family (runtime-instance lifecycle, `SessionLifecycleController`;
+**alignment landed the same day** — the bridge consumes exactly getState +
+changed: `ensureBackendResident` (handlers/session.ts) probes getState when a
+backend-loaded stamp goes stale, `ready` refreshes the stamp and skips the
+blind full-resume reload, "Session not found: <sid>" throws the evicted error
+before any reload, everything else keeps the reload — whose resume carries
+mcpServers #193 + toolDenylist #340, which is why `ensureReady` must NOT
+replace it — and on a still-resident session that reload was always a config
+no-op anyway (upstream `activateSessionRuntime` early-returns the existing
+record without re-applying resume params); the standalone `changed`
+NOTIFICATION (full snapshot payload,
+not a session/event) is routed at `ZcodeBackend.onLifecycleChanged` into
+`applyLifecycleSnapshot` (server.ts) as INVALIDATION only — any non-`ready`
+transition (starting/stopping/unloaded/faulted) voids the stamps of ALL ACP
+aliases of the backend session, so resident-pool evictions surface immediately
+instead of at the 5-min TTL boundary, while `ready` deliberately never
+re-stamps (instance-ready ≠ projection-applied upstream, and a foreign
+activation — the v4 gateway's cold-resume behind renameSession, an automation
+wake — rebuilds the runtime without the bridge's per-load config; blessing it
+would let session/load skip its resume flight + settle and replay a possibly
+mid-hydration prefix — the replay-race hole); the
+availability verdict is pinned per generation (`server.backendLifecycleApi`,
+reset on respawn — pre-0.17.1 builds answer -32601 once and never again);
+`stop`/`restart` stay unused, the bridge's own close/reload semantics are
+already correct). Other additive surface: `workspace/mcp/trust` +
+`workspaceTrust` on mcp status snapshots
+(the bridge injects servers explicitly on create/resume = trusted, no
+impact), `automation/pause`, `turn.started` payload + `automationId`/
+`offPeakTaskId`/`offPeakRunType` (bridge ignores unknown payload fields),
+mcpServer schema + optional `scope`/`cwd` (passthrough unaffected),
+`session/requestRuntimePreferences` + optional `workspace`/
+`directorySessionId` (bridge sends neither), and a `-32032` provider-config
+error family for the request-verification edition — NULL in the open tree
+(`packages/shared/src/request-security-edition/verification-policy.ts`
+returns false/null everywhere), so the bridge's runtime-headers answerer is
+unchanged. Gotchas invariants re-verified at source: `activeAbortController`
+at accept + `-32010 "A prompt is already running"` + `session_compacted`
+reasons (server-operations.ts sendPrompt/compact), provider revision
+`zcode-builtin:<rev>:<sha256(PATH)>` (zcode-builtin-provider-config-source.ts
+`sourceKey` = sha256 of the resolved path; the +32-line diff there only adds
+an in-process last-known-good cache for a deleted bundled dir), `Reasoning
+level is required for <p>/<m>` (provider-registry-selection.ts:136),
+`session-mapper.ts` ZERO diff (plan-mode fold + dynamic_workflow stripping
+intact), v4 `command.ts` sendText payload union ZERO diff (the `_session/
+steering` envelope is untouched; session-flow.ts only added GenUI input
+normalization and dropped `inputPresentation` plumbing — neither is in the
+bridge's payload). The ONE bridge action: `CronPauseSelf` joined the
+always-registered automation tool set (`automationPort` stays unconditional,
+server-operations.ts; core registers it whenever the port exists). Upstream
+HIDES it from ordinary turns (`turn-tool-visibility.ts` — "非执行轮隐藏",
+deliberately NOT in `AUTOMATION_MUTATION_TOOL_NAMES`) and its handler
+hard-rejects without a port call when the turn carries no `automationId`
+(cron.ts "only available while running a scheduled automation") — but it
+stays in the ToolSearch directory, and upstream itself adds it to remote
+workspaces' session denylist (`REMOTE_AUTOMATION_TOOL_NAMES`). The bridge's
+enumerated `AUTOMATION_TOOL_DEFAULTS` therefore gained `CronPauseSelf`
+(src/backend/resolve.ts) — a headless bridge session never carries a run's
+`automationId`, so the tool can never do anything there.
+
+**3.18.1 + 3.18.2 audit (2026-11-14, commits `c5904686`/`fec97590` — protocol
+schema UNCHANGED both hops, no bridge change owed)**: the machine's desktop
+auto-updated 3.18.0 → 3.18.2 (`zcode.cjs` sha256 `08726b5e…` — matches the
+catalog-probe pin); the checkout had an un-audited 3.18.1 sync in between.
+`packages/shared/src/zcode-protocol/index.ts` is byte-identical across BOTH
+hops — zero wire drift; every Gotchas-cited behavior file verified 0-diff
+(`server-operations.ts`, `prompt-turn.ts`, `execution-state.ts`,
+`session-mode-port.ts`, `verification-policy.ts`, `session-mapper.ts`,
+`permanent-deletion.ts`, and the provider env/registry quartet).
+3.18.1 (`c5904686`, 111 files) is telemetry only: memory-diagnostics cadence
+(`zcode-protocol/server.ts` — `collectMemoryDiagnostics({includeEventStats})`,
+the 15s inspector pass skips the event-store scan), a resource-sampler
+inspector hook, and +4 v4-gateway diagnostics counters. 3.18.2 (`fec97590`,
+46 files) has exactly two bridge-relevant surfaces, both host-side:
+(1) credential security (`systemCredentialCipher.ts` +178/−26): the
+`enc:v2:os` path the bridge mirrors since 0.84.0 is byte-identical (seal/open
+layout, fingerprint = hex(sha256(key)).slice(0,24) — now the
+`keyFingerprint()` helper, service name, per-path account keying, the
+`.keyring` file lock); the parity tests stand unchanged. New host-only
+features: `shareKeyWithCopiedCredentials` (desktop data-root copy repair,
+ZCT-2120723935487688704) and `enablePrivateFileKeyFallback` (Linux Desktop
+Main only, default off): Secret Service unavailable + unbound directory →
+the host publishes a 0600 `credential-secret` sibling file and future values
+carry source `env` (`enc:v2:env:…`, key = digest of that file per
+`resolveManagedSecret`, systemCredentialCipher.ts:141-150). The bridge's
+reader declines `enc:v2:env` and does not read the sibling file — that
+population (Linux desktop without a keyring) degrades gracefully on
+Start-Plan credential reads; pre-3.18.2 those machines could not save logins
+at all, so it is a NEW population, not a regression. Mirroring the
+sibling-file read is an optional follow-up.
+(2) Start-Plan identity split (`accountProviderConnectionResolver.ts` +117):
+CN unlinked logins now get Start models without a BigModel link (Start
+identity decoupled from the paid-plan family identity,
+`isStartPlanFamilyCurrent`). `zcodejwttoken` and the runtime-headers
+protocol are untouched — the bridge's `startPlanRequestAuthFor`/entitlement
+ladder is unaffected; at most a model-list divergence on
+CN-unlinked-Start machines (host lists Start models the bridge's snapshot
+does not). The CLI still self-reports `0.17.1` (apps/zcode-cli/package.json).
+
+**3.17.2 + 3.18.0 audit (2026-11-11, commits `a9fe401e`/`b95ebaff` — checkout
+synced, purely additive protocol, ONE follow-up = #371)**: the machine's
+desktop auto-updated 3.17.1 → 3.17.2 (runtime provider sync already ran; its
+`zcode.cjs` still self-reports CLI `0.17.1`). 3.17.2's schema diff is +4
+lines: the `sessionLifecycleWorkspace` runtime capability and a new
+`sessionLifecycleActivationParamsSchema` (optional `workspace`) that
+`lifecycle/ensureReady`/`restart` now parse — `getState` and the `changed`
+notification are untouched, and the bridge consumes only those two, so 3.17.2
+is a zero-impact ride for the running bridge.
+
+3.18.0 (`b95ebaff`, 5,099 files) is the NEXT desktop update target; audited
+from the synced checkout. The shared protocol schema
+(`packages/shared/src/zcode-protocol/index.ts`) is +107/−0 — purely additive:
+new runtime capability bits (`highspeedCardOwner`, `pluginDiscoveryUi`,
+`worktreeCwd`, `extensionInputSource`, `conversationQuoteComment`,
+`pluginExtensionSummary`), new methods (`session/releaseUnderDirectory`,
+`plugins/readUserOptions`, `plugins/mentionItems`, the `appControl*` family,
+`interaction/requestCredentialCipher`), optional params (`session/messages`
+`direction`, `session/send` `modelSelectionBasis`, plugins overview
+`includeExtensionSummary`, `pluginInfo.dataPath`), the
+`startup/pluginsDegraded` notification, and defensive optional fields on
+strict event payloads (`turn.started` `workflowLaunch`/`epilogueStart`/
+`inputOrigin`, `turn.steerQueued` `inputPresentation`/`automationId` — the
+bridge ignores unknown payload fields). The dispatch switch only GROWS (no
+method removed). The new server→client ask
+`interaction/requestCredentialCipher` is a desktop login-flow request
+(docs/design/v2/auth-login.md; no app-server emission on the bridge's paths)
+— the unhandled-request error path covers it regardless. `session-mapper.ts`
+strips MORE v4-only fields from legacy payloads (`toolCall.started`
+`readOnly`/`sideEffectScope`, permission `fullAccessSupported`) — protection
+FOR old clients, the bridge included. Verified zero-diff on every
+Gotchas-cited behavior file: `verification-policy.ts` (request-security
+stubs), `provider-runtime-env.ts`, `registry-service.ts`,
+`execution-state.ts` (the plan-mode fold), `model-catalog-port.ts` (the
+reasoning ladder), the toolDenylist projection, and the compact/setModel/
+send-busy semantics in `server-operations.ts` (its 614-line diff is
+refactoring: goal-continuation extraction + unified legacy/V4 model admission
+
+- `releaseUnderDirectory` wiring — no hunk touches stop/compact/-32010), the
+  lifecycle `getState` schema, and the v4 surfaces the bridge consumes
+  (`renameSession`/`resumeWorkflowRun`/`workflowRuns` queries: 0 changes; v4
+  rows gained a per-line `unreadable` degradation row + worktree rows —
+  display-layer only).
+
+The ONE substantive follow-up — ADR-0031's "no physical delete path"
+premise is GONE in 3.18.0: upstream added a real two-phase permanent
+deletion face (`bootstrap/src/zcode-protocol/session-data/permanent-deletion.ts`,
+v4 `storage/sessionData/*` preview→execute with a revision guard,
+retained-artifact allowlist, busy/in-use blocking, `forgetIndexedSession`
+sweeping the sessions-index projections). The bridge needs NO change to keep
+running (a physically deleted session resume hits the existing
+`isSessionGoneError` → sessionEvicted path), but `reviveTombstonesOnActivity`
+can resurrect tombstoned rows whose bytes are gone (garbage in /resume), and
+the hub's delete endpoints can now be upgraded to REAL deletion — tracked in
+#371.
+
+**Correction (2026-11-12)**: the audit above scoped "no bridge change" to the
+PROTOCOL surface only — hours after the machine took the 3.18.0 update, the
+credential-store migration knocked every bridge session down (all turns
+`model_request_failed`; the values moved to `enc:v2:os` OS-keyring
+encryption, unreadable to the pre-v2 reader which passed the ciphertext
+through as plaintext). Fixed in 0.84.0 (#374): keyring-backed reads via
+@napi-rs/keyring, the `interaction/requestCredentialCipher` host delegation
+with the strict `{requestId, result}` reply shape, and no
+ciphertext-as-plaintext passthrough — full Gotcha in AGENTS.md. The
+tombstone follow-up above is unaffected and stays open.
+
 **3.14.0 audit (2026-09-20, app-server 0.16.9 — live-probed end to end)**: the
 dynamic-workflow family (ten model tools led by `CreateWorkflow`) is OFF by
 default headless and enabled per PROCESS via
@@ -259,7 +431,7 @@ when a concrete ACP/editor need appears. Ranked shortlist in
 | `workflows/*` family (NEW 0.16.9: `list/get/updateMeta/delete/runs/move`, `index.ts:2685-2937, 3618-3625`)                                                                                                                                                                                                                                                      | Session-less management of saved dynamic workflows (`<cwd>/.zcode/workflows/`, project+global scopes), run history with `artifacts`, cross-cwd runs query | **WIRED (2026-09-24, ADR-0029)**: proxied under `/settings/workflows*` + the local `/workflows` slash listing; availability is the remote `/client/configs` verdict (`src/config/workflow-gate.ts`), and `v4/command startSavedWorkflow`/`resumeWorkflowRun` + the `workflowRun*` queries are wired with it (see the v4 section below) |
 | `provider/testModelConnectivity` (3.12.3)                                                                                                                                                                                                                                                                                                                       | Probe a provider/model endpoint                                                                                                                           | Not used; model availability comes from the `session/create` response                                                                                                                                                                                                                                                                  |
 | `runtime/capabilities` (3.12.3; returns `{independentPlanState:true}`)                                                                                                                                                                                                                                                                                          | Trivial capability handshake                                                                                                                              | Not used; cheap preflight for a `zcode-acp doctor` command                                                                                                                                                                                                                                                                             |
-| `interaction/providerRuntimeHeadersCancelled` notification (`index.ts:336, 2396-2406`)                                                                                                                                                                                                                                                                          | Backend cancels a pending runtime-headers refresh (workspace/session/requestId scoped)                                                                    | Not handled; drop pending answerers immediately on turn cancel instead of waiting them out                                                                                                                                                                                                                                             |
+| `interaction/providerRuntimeHeadersCancelled` notification (`index.ts:336, 2396-2406`)                                                                                                                                                                                                                                                                          | Backend cancels a pending runtime-headers refresh (workspace/session/requestId scoped)                                                                    | Moot by design: the bridge answers the ask at frame ARRIVAL (`providerRuntimeHeadersResponder`), so nothing is ever pending to cancel — received, logged, acknowledged (client.ts)                                                                                                                                                     |
 | `workspace/generateText` / `workspace/cancelGenerateText` (0.16.5)                                                                                                                                                                                                                                                                                              | Workspace-scoped one-shot text generation                                                                                                                 | Not used; no ACP counterpart                                                                                                                                                                                                                                                                                                           |
 | `workspace/updateInteractionPreferences` / `workspace/updateModelIoPreferences`                                                                                                                                                                                                                                                                                 | Client preference updates                                                                                                                                 | Not used                                                                                                                                                                                                                                                                                                                               |
 | `offPeak/{create,list}`, `workspace/updateOffPeakToolPolicy` (3.12.3)                                                                                                                                                                                                                                                                                           | Off-peak (discounted-hours) task family                                                                                                                   | Not used; `session/send` carries the matching `offPeakTaskId`/`offPeakRunType` params — candidate if a client wants to schedule discounted-hours runs. Off-peak tools are fail-closed at the protocol layer with three unlock channels (per-session param OR'd, process policy method, `offPeakPort` injection)                        |
@@ -300,21 +472,21 @@ options:{reasoningLevel?}}` (`packages/shared/src/model-selection.ts`); the
 
 Notes per type (the ones with known bridge relevance):
 
-| Event                                                                    | Notes                                                                                                                                                                                                                                                                                             |
-| ------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `session.titleUpdated`                                                   | **Wired** — `SessionTitleListener` adopts `generated`/`custom` pushes                                                                                                                                                                                                                             |
-| `message.upserted` / `message.removed`                                   | Message-granular upsert/remove; the projection differ reconciles instead                                                                                                                                                                                                                          |
-| `part.started` / `part.delta` / `part.upserted` / `part.removed`         | Message-PART granular streaming (the v4 conversation model on the v3 envelope)                                                                                                                                                                                                                    |
-| `permission.requested` / `permission.resolved`                           | Interaction lifecycle OBSERVER events; the bridge serves the request methods                                                                                                                                                                                                                      |
-| `userInput.requested` / `userInput.resolved`                             | Same, for user-input interactions                                                                                                                                                                                                                                                                 |
-| `checkpoint.created` / `rewind.triggered`                                | Checkpoint + rewind lifecycle (rewinds initiated elsewhere are observable)                                                                                                                                                                                                                        |
-| `streamRecovery.updated`                                                 | Stream recovery progress — payload is an untyped `jsonObjectSchema` upstream; useful for the replay/gap-fill path                                                                                                                                                                                 |
-| `turn.started` payload extras (`index.ts:1168-1186`)                     | `executionKind:"agent"\|"controlOnly"` (controlOnly = no model turn — the bridge's own boot-resume ack could be classified by this instead of text-matching), `foregroundExecutionId` (feeds the precise v4 stop), `backgroundSource`, `intent`, `originMeta`                                     |
-| `turn.steerQueued` / `turn.steerDrained` payloads (`index.ts:1191-1229`) | Queue length, `commandKind`, `delivery`, `targetTurnId`, drained `injectedMessageIds` — enough to render a proper "queued behind running turn" ACP update. Steer is only reachable via v4 delivery semantics (see Gotchas) — a steer caused by ANOTHER client on the same backend is visible here |
-| `turn.completed` `resultType` + `cacheStats` (`index.ts:1230-1261`)      | `resultType: success\|cancelled\|error_max_turns\|error_max_budget\|error_during_execution\|error_max_tool_calls`; `cacheStats{totalMessages, cachedMessages, lastCacheHit, cacheReadTokens?}` — rich terminal lines + cache-health visibility                                                    |
-| `turn.failed` `turnPhase` (`index.ts:1262-1269`)                         | Failure phase string for better triage                                                                                                                                                                                                                                                            |
-| `model.streaming` kinds (`index.ts:987-1014`)                            | 13 kinds incl. `reasoning_*` deltas — relevant if thinking streams are ever surfaced directly                                                                                                                                                                                                     |
-| `session.updated` with `state.updated` mutation reasons                  | Compact terminal state IS observable here: `session_compacted` / `session_compact_cancelled` / `session_compact_failed` (source: `server-operations.ts:2082-2119`) — the bridge can report real compact failures instead of assuming success from the RPC ack                                     |
+| Event                                                                    | Notes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| ------------------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `session.titleUpdated`                                                   | **Wired** — `SessionTitleListener` adopts `generated`/`custom` pushes                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                         |
+| `message.upserted` / `message.removed`                                   | Message-granular upsert/remove; the projection differ reconciles instead                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
+| `part.started` / `part.delta` / `part.upserted` / `part.removed`         | Message-PART granular streaming (the v4 conversation model on the v3 envelope)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `permission.requested` / `permission.resolved`                           | Interaction lifecycle OBSERVER events; the bridge serves the request methods                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                  |
+| `userInput.requested` / `userInput.resolved`                             | Same, for user-input interactions                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `checkpoint.created` / `rewind.triggered`                                | Checkpoint + rewind lifecycle (rewinds initiated elsewhere are observable)                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `streamRecovery.updated`                                                 | Stream recovery progress — payload is an untyped `jsonObjectSchema` upstream; useful for the replay/gap-fill path                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
+| `turn.started` payload extras (`index.ts:1168-1186`)                     | `executionKind:"agent"\|"controlOnly"` (controlOnly = no model turn — the bridge's own boot-resume ack could be classified by this instead of text-matching), `foregroundExecutionId` (feeds the precise v4 stop), `backgroundSource`, `intent`, `originMeta`                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `turn.steerQueued` / `turn.steerDrained` payloads (`index.ts:1191-1229`) | Queue length, `commandKind`, `delivery`, `targetTurnId`, drained `injectedMessageIds`. Steer is REACHABLE again since `_session/steering` (#352, `v4/command` sendText). **Drain echo WIRED (2026-11-02)**: `turn.steerDrained` mirrors every drained input (a persisted USER message upstream, `persistUserPrompt` at drain) to the clients as `user_message_chunk` (`echoSteeredInputs`, io.ts) — from the turn loop while live, from BackgroundTaskListener in the no-turn-loop window (pendingTurns-gated so the two paths never double-echo), EXCLUDING steering clients (`steerEchoSuppressedRoots`: martty's Send Now cell renders the text locally — verified in martty source, `steer_ext_deferred` keeps the cell on injected/startedNewTurn — an unconditional echo would double-render there). Residual: `turn.steerQueued` still only feeds the steer-swallow guard — no live "queued behind running turn, position N" indicator |
+| `turn.completed` `resultType` + `cacheStats` (`index.ts:1230-1261`)      | `resultType: success\|cancelled\|error_max_turns\|error_max_budget\|error_during_execution\|error_max_tool_calls`; `cacheStats{totalMessages, cachedMessages, lastCacheHit, cacheReadTokens?}` — rich terminal lines + cache-health visibility                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
+| `turn.failed` `turnPhase` (`index.ts:1262-1269`)                         | Failure phase string for better triage                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                        |
+| `model.streaming` kinds (`index.ts:987-1014`)                            | 13 kinds incl. `reasoning_*` deltas — relevant if thinking streams are ever surfaced directly                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `session.updated` with `state.updated` mutation reasons                  | Compact terminal state IS observable here: `session_compacted` / `session_compact_cancelled` / `session_compact_failed` (source: `server-operations.ts:2082-2119`) — WIRED: the bridge records the reason (`onCompactOutcome`) and `compact()` reports real failure instead of assuming success from the RPC ack                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                              |
 
 **Corrected 2026-09-21 (source)**: `rewind.started` / `rewind.failed` /
 `rewind.completed`, `turn.attachments.resolved`, `usage.delta`, and
@@ -406,7 +578,8 @@ bridge reads plugin commands from disk instead).
 **Automation tool gating, corrected against source (2026-09-21)**: there is NO
 backend env gate — `ZCODE_ENABLE_AUTOMATION_TOOLS` exists only in the bridge
 (`src/backend/resolve.ts`). The backend registers `CronCreate/CronList/
-CronUpdate/CronDelete` whenever an `automationPort` is injected
+CronUpdate/CronDelete` (+ `CronPauseSelf` since 0.17.1 — see the 3.17.1
+audit entry) whenever an `automationPort` is injected
 (`core/src/runtime/helpers/runtime-tools.ts:66`), and the legacy protocol
 server injects one for every session create
 (`server-operations.ts:3370`) — so the backend ALWAYS registers them in
@@ -414,7 +587,8 @@ app-server mode. Opting out is entirely the bridge's per-session
 `toolDenylist` on create/resume (the `--disallowed-tools` argv flag is parsed
 but NOT consumed on the app-server path — #340, alignment item 10). Bonus:
 `AUTOMATION_MUTATION_TOOL_NAMES = [CronCreate, CronUpdate, CronDelete]` gets
-special turn-loop treatment (`turn-loop-state.ts:23`).
+special turn-loop treatment (`turn-loop-state.ts:23`; upstream keeps
+`CronPauseSelf` OUT of it by design).
 
 ## Alignment opportunities (2026-09-21, source-verified — ranked)
 
@@ -504,7 +678,9 @@ cache-read tokens`), non-success resultTypes surface verbatim as a
     allow-list env var) is a reasonable follow-up — same two sites,
     `session/send` rejects it. Regression tests: `tests/tool-denylist.test.ts`.
 11. **v4/command channel** as the single implementation surface for
-    rewind/edit/feedback/queue UX later. PENDING.
+    rewind/edit/feedback/queue UX later. The steer half landed (#352):
+    `_session/steering` → `sendText requestedDelivery guide|queue` (src/handlers/steering.ts).
+    PENDING: rewind/edit-turn/feedback/queue UX.
 
 ## Verification method
 

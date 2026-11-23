@@ -230,6 +230,21 @@ zcode-acp-remote-desktop` (every desktop hub call is); or such a stamped
   already holding that session live, whatever its origin — and only a
   workspace without one spawns, headless. Attach and `session/new` /
   `session/load` exactly as after a headless fallback.
+- **A reuse target must run the CURRENT code** (bridge ≥0.83.3): every bridge
+  reports a `codeFingerprint` (with its `version`) on each registration. When
+  that fingerprint differs from the dist on disk — i.e. a rebuild or release
+  landed after the bridge started — the hub treats it as stale for NEW work:
+  a create, a resume of an idle conversation, and the history listing all
+  incubate a fresh bridge instead, and `incubateServe`'s registration poll
+  refuses a stale registration so the spawn cannot be answered by the bridge
+  it was meant to replace. Node loads its modules once per process, so a
+  reused pre-build bridge otherwise served its OLD handlers and model list
+  forever (reported 2026-11-10: a released entitlement fix appeared absent
+  from every "new" session). Two invariants: a resume whose session is LIVE
+  on some bridge always lands there, staleness notwithstanding (two bridges
+  must never load one conversation), and a stale bridge is never killed — it
+  keeps its attached clients and running turns and exits on its own idle
+  window.
 - Lifetime depends on the surface: a terminal-TUI instance lives while its
   window lives (the owner closing it retires the bridge — re-create on
   demand); the headless fallback exists for remote interest only and exits
@@ -875,6 +890,14 @@ discovery (no re-advertise, so the hub tombstone above stays armed), and the
 result carries `_meta.zcode.sessionClosed: true`: retire the tab locally and
 do not retry. Omitted (or `"user"`) keeps the manual-reopen behavior — a
 human picking the session on a live bridge re-arms discovery as before.
+"Retired" is checked BOTH in the bridge's memory AND in its durable close
+record (`~/.zcode/v2/acp-closed-sessions.json`, every id spelling): a
+serve-origin bridge exits on its last close, and the hub-incubated successor
+process has no memory of the retirement — without the durable lookup the
+ladder's auto load resurrected the conversation on the fresh bridge
+(observed 2026-10-28). Genuine use (a prompt, a user-intent load) clears the
+record, so a deliberate reopen survives later respawns; entries expire after
+30 days.
 
 Cross-instance note: if the same conversation is also registered by another
 bridge of the project, the hub's dedupe re-attaches it under that instance —
@@ -902,6 +925,13 @@ conversation itself is still resumable later via
 process, not the history. If other advertised conversations (or remote-created
 empty sessions) remain on the instance, it stays up.
 
+**`POST /api/instances/{id}/shutdown`** (the older "close the instance"
+gesture) retires first too: before the kill, every conversation the instance
+advertises goes through the same close semantics with `force` (an in-flight
+turn is cancelled, not a refusal), so an auto reconnect ladder meets the same
+`409 session closed` on every id spelling and resurrects nothing. A
+user-intent resume always reopens the conversations afterwards.
+
 ## Renaming a session
 
 ```text
@@ -909,23 +939,55 @@ POST {hub}/api/instances/{id}/sessions/{sessionId}/rename
      body: { "title": "new name" }                        → 200 { "ok": true, "title": "…" }
 ```
 
-The session title is set **once**, automatically, from the first prompt of a
-freshly created session (first non-empty line, capped at 80 chars) — this
-endpoint is the only later modifier. ACP has no client→agent rename channel,
-and an editor-side rename lives in the editor's own storage forever, so the
-remote side is where a rename enters the system.
+The session title is set **once**, automatically: the first prompt seeds a
+provisional title (first non-empty line, capped at 80 chars) and the backend's
+first LLM-generated title may replace it — after that the title is frozen for
+every automatic path. Only a manual rename may change it afterwards: this
+endpoint, the `/rename <title>` slash command (editors and the CLI TUI), or a
+rename made in the ZCode desktop app.
 
-The bridge applies the rename everywhere: its in-memory title pin (no later
-automatic write can touch it), the discovery summary (live within one
-heartbeat), the ZCode App's tasks-index (`title_overridden=1`, same marker the
-App's own rename sets), and a `session_info_update` broadcast to every
-attached client — the editor tab updates live. The title is normalized like
-the auto-title: flattened to one line, trimmed, capped at 80 chars; an
-all-whitespace title is rejected with `400`.
+The bridge applies the rename everywhere (via the shared `renameSessionCore`):
+its in-memory title pin for the FULL alias group (no later automatic write can
+touch it), the backend's own store through the v4 `renameSession` command
+(`titleSource=custom`, sticky — the backend never auto-generates over it, and
+the desktop app's conversation view follows the same event), the discovery
+summary (live within one heartbeat), the ZCode App's tasks-index
+(`title_overridden=1`, same marker the App's own rename sets), and a
+`session_info_update` broadcast to every attached client — the editor tab
+updates live. The title is normalized like the auto-title: flattened to one
+line, trimmed, capped at 80 chars; an all-whitespace title is rejected with
+`400`.
 
 Errors: `400` missing/empty title or oversized body (>4 KB), `401` bad token,
 `404` unknown session (or instance), `502` bridge unreachable. Renaming during
 a running turn is allowed — titles are no longer turn-coupled.
+
+## Editing or regenerating a message (rewind)
+
+Edit-and-resend of the latest user message and regenerate of the latest turn
+ride two ACP extension methods (NOT hub routes — they go over the client's own
+ACP connection, like `session/prompt`):
+
+```json
+{ "method": "session/edit_user_message",
+  "params": { "sessionId": "…", "messageId": "<_meta.zcode.mid>", "newText": "…" } }
+{ "method": "session/retry_turn",
+  "params": { "sessionId": "…", "messageId": "<_meta.zcode.mid, optional>" } }
+```
+
+Gate on the `initialize` capability `agentCapabilities._meta.zcode.rewind ===
+true` (absent on older bridges/backends — hide the actions and degrade to
+quote-to-composer). Addressing uses the `_meta.zcode.mid` every replayed
+message update carries (see `docs/PROTOCOL.md` §Extension Methods).
+
+Client recipe on the ack (`{ok, rewoundMessageId}`): the rewound tail is
+already committed — refetch history (`session/load`); the replacement turn
+streams to every attached client as `agent_message_chunk` while the session
+reports busy via `$/zcode/turnState`. A second attached client's cached tail
+is stale until its next replay (v1: single user; the edit happens on the
+viewed client). Only the LATEST user message can be edited and the latest
+assistant reply regenerated — anything else answers `-32602` without a
+backend round trip.
 
 ## Deleting a project or session
 
@@ -972,6 +1034,64 @@ token, `404` unknown instance / deleted-on-resume, `409` session is live on
 this bridge, `502` bridge unreachable, `503` tasks index unavailable
 (session delete only — never a silent success). Project delete is idempotent:
 an unknown or already-deleted project answers `200` with `deletedTasks: 0`.
+
+### Opt-in physical purge (`{"purge": true}`)
+
+Both delete endpoints accept a `{"purge": true}` body to **physically destroy
+the conversation bytes** through the upstream 3.18+ v4 deletion face
+(`storage/sessionData/deletionPreview` → `deletionExecute`, with its own
+busy/in-use guards and revision check). This is destructive and irreversible,
+so it needs BOTH the per-request flag and a machine-level arming switch:
+
+```json
+// ~/.config/zcode-acp/config.json
+{ "delete": { "purge": true } }
+```
+
+(or env `ZCODE_ACP_DELETE_PURGE=1`). A purge request on an unarmed machine
+answers `403` and deletes nothing — a stolen token must not be able to
+destroy bytes.
+
+```text
+POST {hub}/api/instances/{id}/sessions/{sid}/delete
+     body: { "purge": true }   → 200 { "ok": true, "deleted": true, "purged": true }
+
+POST {hub}/api/projects/delete
+     body: { "workspacePath": "...", "purge": true }
+                               → 200 { "ok": true, "deletedTasks": 12,
+                                        "purged": ["sess_a", "sess_c"],
+                                        "skipped": [{ "id": "sess_b", "reason": "running" }] }
+```
+
+Semantics:
+
+- The **tombstone is written first** — any purge failure degrades to the soft
+  delete (200 with `purged: false` and a `reason`), never a half state.
+- Upstream guards map to `409` with the reason (`running`, `in-use`,
+  `changed`); a session the backend answers `not-found` for (already
+  physically deleted, or soft-deleted upstream — resume refuses both) gets its
+  tombstone **retired** (hidden for good, never revived) and answers
+  `200 { purged: false, reason: "not-found" }`.
+- A completed purge also removes the tasks-index row (its bytes are gone).
+- Project purge relays each session through the workspace's serve bridge (≤4
+  concurrent, ≤200 sessions per request — the overflow is reported in
+  `skipped` with a cap reason, never silently dropped; re-issue to continue);
+  with no serve bridge reachable the tombstones still apply and the answer
+  carries a `warning` plus per-id `skipped` entries.
+
+### Tombstone retirement (sessions whose bytes are gone)
+
+A session physically deleted from the desktop App (3.18+ v4 face), or
+soft-deleted upstream (`time_deleted` — upstream resume refuses those with
+`Session not found`), can no longer be resumed through any bridge path. Its
+tombstone therefore **retires** instead of reviving: the row keeps `deleted=1`
+and gains `archived=1`, hidden from every listing forever. Retirement happens
+lazily — the first resume attempt that fails as gone — and proactively, before
+any project-wide mass revival (`session/list`'s batch id query is the liveness
+oracle; on backends without it, per-id `session/lifecycle/getState`). A probe
+failure never retires anything: no verdict means the old blind-revival
+behavior. Bridge-tombstoned sessions (deleted through THIS API, no upstream
+`time_deleted`) keep the full self-heal contract above.
 
 ## Hub self-upgrade
 

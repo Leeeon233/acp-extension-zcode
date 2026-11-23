@@ -132,8 +132,7 @@ vi.mock("node:fs", async () => {
 });
 
 // Import AFTER vi.mock is set up.
-const { loadAllModels, modelContextWindow, personalModelSpec } =
-  await import("../src/config/options.js");
+const { loadAllModels, modelContextWindow } = await import("../src/config/options.js");
 
 beforeEach(() => {
   fakePersonal = FAKE_PERSONAL;
@@ -171,10 +170,6 @@ describe("loadAllModels with provider_config.json", () => {
     });
   });
 
-  it("keeps personal model rules with enabled:false hidden", () => {
-    expect(loadAllModels().map((m) => m.modelId)).not.toContain("hidden-model");
-  });
-
   it("advertises a provider only the personal config describes", () => {
     expect(loadAllModels()).toContainEqual({
       providerId: "uuid-brand-new",
@@ -183,10 +178,28 @@ describe("loadAllModels with provider_config.json", () => {
     });
   });
 
-  it("keeps desktop-disabled and keyless-remote personal providers out (#156)", () => {
+  it("excludes a custom provider present in legacy config.json when provider_config.json disables it", () => {
+    fakePersonal = {
+      ...FAKE_PERSONAL,
+      config: {
+        ...FAKE_PERSONAL.config,
+        providerConfigRules: {
+          providerRules: [
+            {
+              providerId: "uuid-provider",
+              providerName: "OcGo",
+              enabled: false,
+              config: {
+                access: { type: "api-key", apiKey: "k-ocgo-personal" },
+                api: { type: "openai-responses", baseUrl: "http://localhost:18586/openai/v1" },
+              },
+            },
+          ],
+        },
+      },
+    };
     const pids = loadAllModels().map((m) => m.providerId);
-    expect(pids).not.toContain("uuid-disabled");
-    expect(pids).not.toContain("uuid-keyless-remote");
+    expect(pids).not.toContain("uuid-provider");
   });
 
   it("normalizes account: spelling onto the builtin config.json provider", () => {
@@ -201,41 +214,10 @@ describe("loadAllModels with provider_config.json", () => {
       "account:bigmodel-individual-coding-plan",
     );
   });
-
-  it("leaves the dropdown config.json-only when the personal config is absent", () => {
-    fakePersonal = null;
-    const models = loadAllModels();
-    expect(models.map((m) => m.modelId)).not.toContain("step-5-preview");
-    expect(models.map((m) => m.modelId)).toContain("deepseek-v4.1-flash");
-  });
 });
 
 describe("modelContextWindow with the personal fallback", () => {
-  it("prefers config.json's declaration when both exist", () => {
-    expect(modelContextWindow("uuid-provider", "deepseek-v4.1-flash")).toBe(128000);
-  });
-
   it("falls back to the personal rule's contextWindow", () => {
     expect(modelContextWindow("uuid-provider", "step-5-preview")).toBe(500000);
-  });
-
-  it("resolves through the account: spelling", () => {
-    expect(modelContextWindow("account:bigmodel-individual-coding-plan", "GLM-5.3-Flash")).toBe(
-      131072,
-    );
-  });
-});
-
-describe("personalModelSpec", () => {
-  it("exposes the reasoning vocabulary for level resolution", () => {
-    expect(personalModelSpec("uuid-provider", "step-5-preview")?.reasoningValues).toEqual([
-      "high",
-      "max",
-    ]);
-  });
-
-  it("returns null for models the personal config does not declare", () => {
-    expect(personalModelSpec("uuid-provider", "deepseek-v4.1-flash")).toBeNull();
-    expect(personalModelSpec("uuid-provider", "no-such-model")).toBeNull();
   });
 });

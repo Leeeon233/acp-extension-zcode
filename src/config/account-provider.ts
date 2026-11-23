@@ -34,6 +34,8 @@ import type { ZcodeBackend } from "../backend/client.js";
 import { BUILTIN_PROVIDER_ENV, builtinProviderEnv } from "../backend/resolve.js";
 import { log, warn, zcodePersonalProviderPath, ZCODE_CREDS_PATH } from "../utils.js";
 import { bridgeOverlays, readCredentialConfig } from "./bridge-accounts.js";
+import { type CodingPlanFamily, hasOAuthLogin, isCodingPlanFamily } from "./project-token.js";
+import { startPlanVerdict } from "./start-plan-verdict.js";
 
 /** The bundled provider-table file the CLI boots from. */
 const PROVIDER_CONFIG_NAME = "zcode-builtin.json";
@@ -204,41 +206,58 @@ function storeIndividualCodingPlanKey(accountProviderId: string): string | null 
 }
 
 /**
+ * The decrypted `zcodejwttoken` from the encrypted credential store — the
+ * Start Plan bearer JWT the 3.15+ desktop host serves for `account:*-start-plan`
+ * over `interaction/requestProviderRuntimeHeaders` (`AccountProviderRequestAuthService.resolveCurrent`).
+ */
+const ZCODE_JWT_CREDENTIAL_KEY = "zcodejwttoken";
+
+export function storeStartPlanJwt(): string | null {
+  return readCredentialStoreSync()[ZCODE_JWT_CREDENTIAL_KEY]?.trim() || null;
+}
+
+/**
  * The plans the user actually holds, keyed by the LEGACY `builtin:<family>-<plan>`
  * id — the id every entitlement source below speaks.
  *
  * On-disk signals, ranked by authority:
  *
- *   1. `coding-plan-cache.json` — the desktop's own availability verdict
- *      (`{items: {"builtin:bigmodel-coding-plan": {status:"available" | "unavailable"}}}`).
- *      Carries the resolved available/not-entitled decision, not a raw flag.
- *      Desktop-only, so a headless-only machine falls through.
- *   2. `config.json` (legacy CLI config) — `builtin:*` entries with
+ *   1. `config.json` (legacy CLI config) — `builtin:*` entries with
  *      `enabled:true` AND an apiKey. Still written by the app.
- *   3. The encrypted credential store (#320) — a fresh desktop-only install
- *      writes NEITHER of the above; its plan api-keys live only in
- *      `~/.zcode/v2/credentials.json`. Weaker evidence than a verdict (the
+ *      (`coding-plan-cache.json`, the 3.12–3.14 desktop's availability
+ *      verdict, is deliberately NOT read: those were transitional releases,
+ *      and a leftover cache surviving a 3.15+ upgrade would suppress the
+ *      OAuth union below — #359.)
+ *   2. The encrypted credential store (#320) — a fresh desktop-only install
+ *      writes no config.json; its plan api-keys live only in
+ *      `~/.zcode/v2/credentials.json`. Weaker evidence than enablement (the
  *      store also keeps keys for plans the account does not currently hold),
  *      so it only speaks when no verdict-bearing source said anything at all,
  *      and only for individual plans (see storeIndividualCodingPlanKey).
- *   4. `setting.json` — last resort: the Settings UI's remembered pick per
- *      family. A SELECTION record, not an entitlement.
+ *   3. `setting.json` — last resort: the Settings UI's remembered pick per
+ *      family. A SELECTION record, not an entitlement. The 3.15+ spelling
+ *      (`providerFamilyConnectionSelections`, an individual coding plan
+ *      backed by an OAuth sign-in in the store) is stronger than a mere pick:
+ *      it names the connection the desktop CURRENTLY runs, and both of its
+ *      signals only exist on a 3.15+ layout — so it is also UNIONED with the
+ *      sources above UNCONDITIONALLY: no older on-disk signal can speak
+ *      against it, and a leftover config.json entry for another family must
+ *      not hide the active OAuth plan (its request auth project-token.ts
+ *      mints on demand).
  *
  * Bridge accounts (`acp-accounts.json`, written by `zcode-acp setup`) sit
  * above the whole ladder: an explicit user key entitles its family's
- * individual coding plan even over an `unavailable` verdict, because
- * deliberate user input beats a possibly stale cache. Only families the
- * credential overlay applied count (see bridgeOverlays), so a family whose
- * installed catalog is unusable gains nothing. They never count as a
- * verdict, so an account for one family leaves source 3 open for the other.
+ * individual coding plan, because deliberate user input beats any stale
+ * on-disk signal. Only families the credential overlay applied count (see
+ * bridgeOverlays), so a family whose installed catalog is unusable gains
+ * nothing. They never count as a verdict, so an account for one family
+ * leaves source 2 open for the other.
  *
  * Manual plan keys from provider_config.json (`zhipu-coding-plan-api-key`
- * rules, #344) sit at the source-2 tier — see manualCodingPlanKeys below.
+ * rules, #344) sit at the source-1 tier — see manualCodingPlanKeys below.
  *
- * Verified 2026-09 against the desktop's own pushed account snapshot: sources
- * 1+2 produced exactly its entitlement set (bigmodel individual true, every
- * zai/start/team plan false); source 3 restores the same outcome on fresh
- * desktop-only layouts (verified 2026-10 against a real store).
+ * Verified 2026-09/10 against the desktop's own pushed account snapshot and
+ * a real credential store.
  */
 /**
  * Manual coding-plan api keys from provider_config.json (#344).
@@ -250,9 +269,9 @@ function storeIndividualCodingPlanKey(accountProviderId: string): string | null 
  * every account model switch failed with "Provider Registry 中不存在 Model"
  * and the reporter had to copy the key into config.json by hand. These rules
  * are the same tier as config.json's builtin entries — an explicit user key,
- * not a verdict — so they ADD to the ladder without arming sawVerdict, and a
- * coding-plan-cache `unavailable` verdict (about the ACCOUNT plan, not manual
- * keys) does not suppress them.
+ * not an enablement signal — so they ADD to the ladder without arming
+ * sawVerdict, and a config.json disable on the same family does not suppress
+ * them.
  *
  * The family comes from the rule's api.baseUrl (the official coding-plan
  * endpoints; the rule id itself — e.g. `zai-api` — is user-chosen and carries
@@ -337,25 +356,125 @@ function entitledBuiltinProviders(): Set<string> {
   return out;
 }
 
-/** Sources 1-4 above, read from the raw desktop files only. */
+/**
+ * Coding-plan families whose 3.15+ desktop connection is an active OAuth
+ * individual coding plan (`setting.json` `providerFamilyConnectionSelections`
+ * + an `oauth:<family>:access_token` in the credential store, not switched to
+ * `apiKey` mode in `modelProviderFamilyModes`).
+ */
+function oauthSelectedCodingPlanFamilies(
+  credsDir = path.dirname(ZCODE_CREDS_PATH),
+): Set<CodingPlanFamily> {
+  const out = new Set<CodingPlanFamily>();
+  try {
+    const setting = JSON.parse(readFileSync(path.join(credsDir, "setting.json"), "utf8")) as {
+      modelProviderFamilyModes?: Record<string, unknown>;
+      providerFamilyConnectionSelections?: Record<string, { kind?: unknown } | null>;
+    };
+    for (const [family, selection] of Object.entries(
+      setting.providerFamilyConnectionSelections ?? {},
+    )) {
+      if (selection?.kind !== "individual-coding-plan") continue;
+      if (setting.modelProviderFamilyModes?.[family] === "apiKey") continue;
+      if (!isCodingPlanFamily(family) || !hasOAuthLogin(family)) continue;
+      out.add(family);
+    }
+  } catch {
+    // setting.json absent (headless-only) — nothing to infer
+  }
+  return out;
+}
+
+/**
+ * Families entitled for Start Plan.
+ *
+ * Authoritative source (issue #406): the billing/balance verdict warmed by
+ * `queryStartPlan` (quota/startplan.ts → config/start-plan-verdict.ts).
+ * `entitled` entitles every coding-plan family with an OAuth login — the
+ * 3.17+ desktop serves Start Plan as an OVERLAY whose
+ * `providerFamilyConnectionSelections` entry stays `individual-coding-plan`
+ * forever (observed: ~294M Start Plan tokens billed while the flag never
+ * flipped; flipping it by hand breaks the desktop's own credential
+ * resolution, so it is not a safe lever either way). `none` (billing
+ * queried, no active plan) suppresses even a start-plan flag — billing wins
+ * in both directions, mirroring upstream codingPlanProviderAvailability.ts
+ * (`hasActiveStartPlan`).
+ *
+ * `unknown` (never queried / query failed — offline bridge, rate limit)
+ * keeps the legacy on-disk gate: ONLY a `start-plan` connection selection
+ * entitles (observed 2026-11-10: an OAuth sign-in for the individual Coding
+ * Plan leaves `zcodejwttoken` in the store without a Start Plan holding — a
+ * login alone must not light up GLM-5.2/GLM-5-Turbo from the table's
+ * start-plan rule).
+ *
+ * In every branch the family additionally needs the store's `zcodejwttoken`,
+ * the family's OAuth login, and not `apiKey` mode.
+ * `providerFamilyDomain` / `oauth:active_provider` name the ACTIVE family,
+ * not a plan holding — deliberately not entitlement sources.
+ */
+function oauthEntitledStartPlanFamilies(
+  credsDir = path.dirname(ZCODE_CREDS_PATH),
+): Set<CodingPlanFamily> {
+  const out = new Set<CodingPlanFamily>();
+  if (!storeStartPlanJwt()) return out;
+  let modes: Record<string, unknown> | undefined;
+  const flagFamilies = new Set<CodingPlanFamily>();
+  try {
+    const setting = JSON.parse(readFileSync(path.join(credsDir, "setting.json"), "utf8")) as {
+      modelProviderFamilyModes?: Record<string, unknown>;
+      providerFamilyConnectionSelections?: Record<string, { kind?: unknown } | null>;
+    };
+    modes = setting.modelProviderFamilyModes;
+    for (const [family, selection] of Object.entries(
+      setting.providerFamilyConnectionSelections ?? {},
+    )) {
+      // Legacy gate (verdict `unknown` only): an individual-coding-plan
+      // selection is a different plan that merely shares the OAuth login
+      // and the store's JWT.
+      if (selection?.kind !== "start-plan") continue;
+      if (!isCodingPlanFamily(family)) continue;
+      flagFamilies.add(family);
+    }
+  } catch {
+    // setting.json absent (headless-only) — only the billing verdict can entitle
+  }
+  const verdict = startPlanVerdict();
+  const selected: Iterable<CodingPlanFamily> =
+    verdict.status === "entitled"
+      ? // One account-level JWT serves the single start-plan gateway; entitle
+        // every family the store actually holds an OAuth login for.
+        (["zai", "bigmodel"] as const)
+      : verdict.status === "none"
+        ? []
+        : flagFamilies;
+  for (const family of selected) {
+    if (modes?.[family] === "apiKey") continue;
+    if (!hasOAuthLogin(family)) continue;
+    out.add(family);
+  }
+  return out;
+}
+
+/**
+ * The billing grant's capability models (lowercased) when the verdict is
+ * `entitled` and carries any, else null — the filter that keeps unbilled
+ * bundled-table models (GLM-5.2 / GLM-5-Turbo under a glm-5.3-flash-only
+ * grant) out of the dropdown and the pushed snapshot (#406: "selecting those
+ * two likely fails billing"). Null (verdict unknown, or a grant with no
+ * capability list) keeps the table's full list.
+ */
+function startPlanBillingModelFilter(): Set<string> | null {
+  const verdict = startPlanVerdict();
+  if (verdict.status !== "entitled" || verdict.modelIds.length === 0) return null;
+  return new Set(verdict.modelIds.map((id) => id.toLowerCase()));
+}
+
+/** Sources 1-3 above, read from the raw desktop files only. */
 function desktopEntitledBuiltinProviders(): Set<string> {
   const out = new Set<string>();
   const credsDir = path.dirname(ZCODE_CREDS_PATH);
   let sawVerdict = false;
-  // 1) Desktop availability cache (authoritative: the resolved verdict).
-  try {
-    const cache = JSON.parse(
-      readFileSync(path.join(credsDir, "coding-plan-cache.json"), "utf8"),
-    ) as { entryStatus?: { items?: Record<string, { status?: string }> } };
-    const items = Object.entries(cache.entryStatus?.items ?? {});
-    if (items.length > 0) sawVerdict = true;
-    for (const [pid, entry] of items) {
-      if (entry?.status === "available") out.add(pid);
-    }
-  } catch {
-    // cache absent/unreadable — the other sources decide
-  }
-  // 2) Legacy config.json (still the app's own provider enablement).
+  // 1) Legacy config.json (still the app's own provider enablement).
   try {
     const cfg = JSON.parse(readFileSync(ZCODE_CREDS_PATH, "utf8")) as {
       provider?: Record<string, { enabled?: boolean; options?: { apiKey?: string } }>;
@@ -370,8 +489,21 @@ function desktopEntitledBuiltinProviders(): Set<string> {
   } catch {
     // unreadable config — the other sources decide
   }
+  // The 3.15+ OAuth selection (`providerFamilyConnectionSelections` + an
+  // OAuth login in the store) is UNIONED unconditionally: both signals only
+  // exist on a 3.15+ layout, so no older on-disk signal can speak against
+  // it — and a leftover config.json entry for another family must not hide
+  // the active OAuth family (#357). The 3.12–3.14 availability cache is
+  // deliberately not consulted (transitional releases; a leftover cache
+  // surviving a 3.15+ upgrade would suppress this union — #359).
+  for (const family of oauthSelectedCodingPlanFamilies(credsDir)) {
+    out.add(`builtin:${family}-coding-plan`);
+  }
+  for (const family of oauthEntitledStartPlanFamilies(credsDir)) {
+    out.add(`builtin:${family}-start-plan`);
+  }
   if (out.size > 0) return out;
-  // 3) Fresh desktop-only layout (#320): no verdict-bearing source spoke, but
+  // 2) Fresh desktop-only layout (#320): no verdict-bearing source spoke, but
   //    the encrypted store holds the account's individual plan key.
   if (!sawVerdict) {
     const rules =
@@ -386,7 +518,7 @@ function desktopEntitledBuiltinProviders(): Set<string> {
     }
   }
   if (out.size > 0) return out;
-  // 4) Last resort only (everything above empty — a machine that has never
+  // 3) Last resort only (everything above empty — a machine that has never
   //    written them): the Settings UI's remembered pick per family. This is a
   //    SELECTION record, not an entitlement — `zai` sitting there means the
   //    user opened that family's picker, not that the plan is held (observed
@@ -407,23 +539,62 @@ function desktopEntitledBuiltinProviders(): Set<string> {
 }
 
 /**
- * The request auth the bridge can serve for an `account:*` coding-plan model,
- * or null when it cannot answer.
- *
- * The 3.12+ backend asks its host for provider runtime headers before EVERY
- * model request on a `zhipu-account` provider (bundle-verified: the only other
- * suppliers are the desktop host and the CLI's own "standalone" credential
- * pair, whose identity half this machine never wrote). The desktop answers
- * with the plan's API key; the bridge serves the same plan's key from legacy
- * config.json when written, and otherwise from the encrypted credential store
- * — a fresh desktop-only install writes no config.json, its plan key lives
- * only there (#320). Only the individual coding plan is served: start-plan
- * needs an Aliyun captcha (stays refused, issue #123), and team keys are not
- * entitlement evidence (see storeIndividualCodingPlanKey).
+ * Dropdown entries for the entitled individual coding plans, straight from the
+ * bundled table: the models a desktop-only layout with no config.json (3.15+
+ * after an OAuth sign-in) can actually run. Without them the dropdown fell
+ * back to the fresh-install BigModel default, which an account entitled to
+ * another family cannot use ("Select a model before continuing").
  */
-export function codingPlanRequestAuthFor(
+export function entitledCodingPlanModels(): Array<{
+  providerId: string;
+  providerName: string;
+  modelId: string;
+}> {
+  const rules =
+    readBuiltinTable()?.table.config?.providerConfigRules?.providerRules?.filter(
+      (r) =>
+        r.config?.access?.type === "zhipu-account" &&
+        (r.config.access.mode === "individual-coding-plan" ||
+          r.config.access.mode === "start-plan"),
+    ) ?? [];
+  if (rules.length === 0) return [];
+  const entitled = entitledBuiltinProviders();
+  const billingModels = startPlanBillingModelFilter();
+  const out: Array<{ providerId: string; providerName: string; modelId: string }> = [];
+  for (const rule of rules) {
+    const providerId = configProviderIdFor(rule.providerId);
+    if (!entitled.has(providerId)) continue;
+    const startPlanFilter = rule.config?.access?.mode === "start-plan" ? billingModels : null;
+    for (const modelId of rule.config?.builtinModelIds ?? []) {
+      if (startPlanFilter && !startPlanFilter.has(modelId.toLowerCase())) continue;
+      out.push({ providerId, providerName: rule.providerName ?? providerId, modelId });
+    }
+  }
+  return out;
+}
+
+/**
+ * The family whose OAuth sign-in can mint request auth for `accountProviderId`
+ * (an entitled individual coding plan with no static key anywhere), or null.
+ * Checked only after `codingPlanRequestAuthFor` found no key, so a bridge
+ * account, config.json, a manual key or a stored plan key always wins.
+ */
+export function oauthProjectTokenFamilyFor(
   accountProviderId: string | undefined,
-): { apiKey: string } | null {
+): CodingPlanFamily | null {
+  const legacyId = entitledIndividualPlanLegacyId(accountProviderId);
+  const family = legacyId ? /^builtin:([a-z0-9]+)-coding-plan$/u.exec(legacyId)?.[1] : undefined;
+  if (!family || !isCodingPlanFamily(family) || !hasOAuthLogin(family)) return null;
+  return family;
+}
+
+/**
+ * The legacy `builtin:<family>-coding-plan` id of `accountProviderId` when it
+ * is an INDIVIDUAL coding plan the account ladder entitles, else null — the
+ * shared gate of every request-auth source (static keys and the OAuth
+ * project-token exchange alike).
+ */
+function entitledIndividualPlanLegacyId(accountProviderId: string | undefined): string | null {
   if (!accountProviderId?.startsWith("account:")) return null;
   const rule = readBuiltinTable()?.table.config?.providerConfigRules?.providerRules?.find(
     (r) => r.providerId === accountProviderId,
@@ -434,26 +605,123 @@ export function codingPlanRequestAuthFor(
   if (!individual) return null;
   const legacyId = configProviderIdFor(accountProviderId);
   if (legacyId === accountProviderId) return null;
-  if (!entitledBuiltinProviders().has(legacyId)) return null;
-  // A bridge account's key, then config.json (the pre-3.12 builtin: provider's
-  // own spelling), merged by readCredentialConfig. A fresh desktop-only layout
-  // has neither, so the stored plan key answers.
-  try {
-    const cfg = readCredentialConfig(ZCODE_CREDS_PATH) as {
-      provider?: Record<string, { enabled?: boolean; options?: { apiKey?: string } }>;
-    };
-    const apiKey = cfg.provider?.[legacyId]?.options?.apiKey?.trim();
-    if (apiKey) return { apiKey };
-  } catch {
-    // unreadable/absent config — the manual key or the store decides
+  return entitledBuiltinProviders().has(legacyId) ? legacyId : null;
+}
+
+/**
+ * The request auth the bridge can serve for an `account:*` coding-plan model,
+ * or null when it cannot answer.
+ *
+ * The 3.12+ backend asks its host for provider runtime headers before EVERY
+ * model request on a `zhipu-account` provider (bundle-verified: the only other
+ * suppliers are the desktop host and the CLI's own "standalone" credential
+ * pair, whose identity half this machine never wrote). The desktop answers
+ * with the plan's API key; the bridge serves the same plan's key from
+ * whichever source is CURRENT: a manual key in provider_config.json (3.12+,
+ * #344) outranks the frozen legacy config.json, and a fresh desktop-only
+ * install writes no config.json at all — its plan key lives only in the
+ * encrypted credential store (#320). Only the individual coding plan is
+ * served: start-plan needs an Aliyun captcha (stays refused, issue #123), and
+ * team keys are not entitlement evidence (see storeIndividualCodingPlanKey).
+ */
+export function codingPlanRequestAuthFor(
+  accountProviderId: string | undefined,
+): { apiKey: string } | null {
+  const legacyId = entitledIndividualPlanLegacyId(accountProviderId);
+  if (!legacyId || !accountProviderId) return null;
+  const family = /^builtin:([a-z0-9]+)-coding-plan$/u.exec(legacyId)?.[1];
+  // 1) Explicit bridge account (`zcode-acp setup`) always wins, even over a
+  //    3.15+ OAuth sign-in.
+  if (family && isCodingPlanFamily(family)) {
+    const bridgeKey = bridgeOverlays()[family]?.apiKey?.trim();
+    if (bridgeKey) return { apiKey: bridgeKey };
   }
-  // The desktop's own manual plan key (#344): 3.12+ writes it to
-  // provider_config.json, never config.json — rank it above the encrypted
-  // store (a fresh-install account key) but below the bridge's own setups.
+  // 2) The desktop's own manual plan key (#344): 3.12+ writes it to
+  //    provider_config.json, never config.json — a `zhipu-coding-plan-api-key`
+  //    rule can only exist on a 3.12+ layout, where config.json is frozen at
+  //    its pre-3.12 state. Rank it ABOVE that frozen file (and above the
+  //    3.15+ OAuth exchange: an explicit key the user typed beats the login),
+  //    but below the bridge's own setups.
   const manual = manualCodingPlanKeys().get(legacyId);
   if (manual) return { apiKey: manual };
+  // When 3.15+ `setting.json` selects this family's individual coding plan in
+  // OAuth mode (backed by an `oauth:<family>:access_token` in the store), any
+  // static key left in pre-3.12 `config.json` or pre-3.15 `credentials.json`
+  // is a stale pre-upgrade artifact (3.12+ stopped writing `config.json`, and
+  // 3.15+ switched OAuth plans to short-lived project tokens). Skip those so
+  // `answerProviderRuntimeHeaders` falls through to `resolveOAuthProjectToken`.
+  const oauthActive =
+    Boolean(family && isCodingPlanFamily(family)) &&
+    oauthSelectedCodingPlanFamilies().has(family as CodingPlanFamily);
+  if (!oauthActive) {
+    try {
+      const cfg = readCredentialConfig(ZCODE_CREDS_PATH) as {
+        provider?: Record<string, { enabled?: boolean; options?: { apiKey?: string } }>;
+      };
+      const apiKey = cfg.provider?.[legacyId]?.options?.apiKey?.trim();
+      if (apiKey) return { apiKey };
+    } catch {
+      // unreadable/absent config — the store decides
+    }
+  }
+  if (oauthActive) return null;
   const stored = storeIndividualCodingPlanKey(accountProviderId);
   return stored ? { apiKey: stored } : null;
+}
+
+/**
+ * The legacy `builtin:<family>-start-plan` id of `accountProviderId` when it is
+ * a Start Plan provider the account ladder entitles, else null.
+ */
+function entitledStartPlanLegacyId(accountProviderId: string | undefined): string | null {
+  if (!accountProviderId?.startsWith("account:")) return null;
+  const rule = readBuiltinTable()?.table.config?.providerConfigRules?.providerRules?.find(
+    (r) => r.providerId === accountProviderId,
+  );
+  const isStartPlan =
+    rule?.config?.access?.mode === "start-plan" ||
+    (!rule && accountProviderId.endsWith("-start-plan"));
+  if (!isStartPlan) return null;
+  const legacyId = configProviderIdFor(accountProviderId);
+  if (legacyId === accountProviderId) return null;
+  return entitledBuiltinProviders().has(legacyId) ? legacyId : null;
+}
+
+/**
+ * The request auth the bridge can serve for an `account:<family>-start-plan`
+ * model, or null when it cannot answer.
+ *
+ * Since 0.17.x (the request-security edition stubs `requiresRequestVerification()`
+ * to `false`, so the host answers Start Plan without interaction — the remote
+ * client-config captcha flag is never read), the desktop host
+ * (`AccountProviderRequestAuthService.resolveCurrent` +
+ * `respondAccountRequestAuthWithoutInteraction`) answers Start Plan model
+ * requests directly with `{ apiKey: zcodeJwtToken }` from `credentials.json`.
+ * When the desktop's connection selection is Start Plan (3.15+), any stale
+ * pre-3.12 `config.json` key is skipped so the fresh store JWT wins.
+ */
+export function startPlanRequestAuthFor(
+  accountProviderId: string | undefined,
+): { apiKey: string } | null {
+  const legacyId = entitledStartPlanLegacyId(accountProviderId);
+  if (!legacyId) return null;
+  const family = /^builtin:([a-z0-9]+)-start-plan$/u.exec(legacyId)?.[1];
+  const oauthActive =
+    Boolean(family && isCodingPlanFamily(family)) &&
+    oauthEntitledStartPlanFamilies().has(family as CodingPlanFamily);
+  if (!oauthActive) {
+    try {
+      const cfg = readCredentialConfig(ZCODE_CREDS_PATH) as {
+        provider?: Record<string, { enabled?: boolean; options?: { apiKey?: string } }>;
+      };
+      const apiKey = cfg.provider?.[legacyId]?.options?.apiKey?.trim();
+      if (apiKey) return { apiKey };
+    } catch {
+      // unreadable/absent config — the store decides
+    }
+  }
+  const jwt = storeStartPlanJwt();
+  return jwt ? { apiKey: jwt } : null;
 }
 
 /**
@@ -511,12 +779,21 @@ export function buildAccountProviderConfig(): AccountProviderPayload | null {
     ) ?? [];
   if (rules.length === 0) return null;
   const enabled = entitledBuiltinProviders();
+  const billingModels = startPlanBillingModelFilter();
   const providers: AccountProviderPayload["providers"] = {};
   const states: AccountProviderPayload["states"] = {};
   for (const rule of rules) {
     const entitled = enabled.has(configProviderIdFor(rule.providerId));
+    let builtinModelIds = rule.config?.builtinModelIds;
+    // Same billing filter as the dropdown (#406): a start-plan grant's
+    // capability list decides which of the table's models the backend should
+    // even register — an unfiltered push would leave dead options reachable
+    // through a manual setModel.
+    if (rule.config?.access?.mode === "start-plan" && billingModels && builtinModelIds) {
+      builtinModelIds = builtinModelIds.filter((id) => billingModels.has(id.toLowerCase()));
+    }
     providers[rule.providerId] = {
-      builtinModelIds: rule.config?.builtinModelIds,
+      builtinModelIds,
       access: { type: "zhipu-account", entitled },
     };
     states[rule.providerId] = {

@@ -120,8 +120,40 @@ log into the ZCode desktop app once so it exists. A coding-plan key added in
 the desktop's Settings → Model Provider ("Use API key") counts too (#344): it
 lands in `~/.zcode/v2/provider_config.json` as a
 `zhipu-coding-plan-api-key` rule and the bridge reads it as an entitlement +
-request-key source. Start-plan providers stay
-declined (Aliyun captcha — desktop app only, issue #123).
+request-key source. On 3.15+ / 3.17.x OAuth installs, Start Plan
+(`account:<family>-start-plan`) entitlement is BILLING-AUTHORITATIVE
+(#406): the bridge queries `billing/balance` with the store's
+`zcodejwttoken` (warmed at session create, bounded 2s) — an active plan
+entitles the family's Start Plan even though the desktop's
+`providerFamilyConnectionSelections` never flips past
+`individual-coding-plan` (3.17+ serves Start Plan as an overlay; do NOT
+hand-edit that flag — the desktop's own credential resolution reads it and
+breaks). The grant's capability list also filters the advertised models
+(e.g. only `GLM-5.3-Flash` under a glm-5.3-flash-only grant). When the
+billing query cannot run (offline, no `zcodejwttoken`, rate-limited), the
+legacy gate decides: entitled ONLY when `setting.json` records the family's
+connection as `kind: "start-plan"` (a plain OAuth login is not a holding —
+observed 2026-11-10: a Coding Plan login lit up GLM-5.2/GLM-5-Turbo for an
+account that never activated Start Plan). Keyless Start
+Plan requests stay declined (issue #123).
+
+**Desktop 3.15+ after an OAuth sign-in:** the store holds no plan key at all,
+only the sign-in (`oauth:<family>:access_token`), and `setting.json` records the
+plan as `providerFamilyConnectionSelections` (`{"zai":{"kind":"individual-coding-plan"}}`).
+The bridge then entitles that family's individual plan and, like the desktop
+host, trades the sign-in for a short-lived project access token before each
+request (`config/project-token.ts`, in memory only). A failure is reported as a
+fixed `project_token_*` code in the turn error:
+
+| Code                                                                                            | Fix                                                                                                           |
+| ----------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| `project_token_key_missing`                                                                     | Open the ZCode desktop app once; it provisions the account's `zcode-api-key` (the bridge never creates keys). |
+| `project_token_login_required`, `project_token_scope_invalidated`, `project_token_http_401/403` | Sign in again in the ZCode desktop app.                                                                       |
+| `project_token_disabled`, `project_token_project_unavailable`                                   | Check in the ZCode desktop app that the account's Coding Plan is active.                                      |
+| `project_token_timeout`, `project_token_network_error`, `project_token_http_5xx`                | Network path to the Coding Plan API (`api.z.ai` / `bigmodel.cn`); retry.                                      |
+
+`zcode-acp setup` still works as an explicit override: a saved key always wins
+over the OAuth exchange.
 
 ### Authentication / credential errors (401, provider auth failed)
 
@@ -299,12 +331,28 @@ rather than hanging.
 Transient errors are identified by the nested `error.cause.code`
 (`model_request_failed`, `provider_not_configured`, `rate_limit`, `timeout`,
 `ECONNRESET`, etc.) or by network/connection/timeout keywords in
-`error.cause.message`. Non-transient failures (e.g. `prompt is running`) still
-surface as hard errors immediately.
+`error.cause.message`.
 
-After retries are exhausted, the bridge **degrades gracefully**: it emits a
-user-visible `[请求失败：…。会话仍可用，请重新发送消息重试。]` message and returns
-`end_turn`, so the session stays usable — resend the message to try again.
+**One-shot gateway failures are retried even when marked non-retryable.**
+The upstream classifier tags provider 4xx/unknown answers
+(`invalid_model_request`, `model_request_failed`, `provider_not_configured`)
+with `retryable: false` — a verdict about the _request shape_, not the
+gateway's health. Relay gateways break that assumption: a forwarding blip
+surfaces as a one-shot 400 on a request the same session accepts moments
+later (observed 2026-10-28 with an OpenAI-compatible relay intermittently
+answering `invalid_request_error` mid-conversation). These cause codes get
+the same bounded resend ladder regardless of the `retryable` flag. Quota
+(`model_rate_limited` — the quota wait/resume machinery owns it),
+context-window (`model_context_exceeded`) and model-not-found failures stay
+terminal: a plain resend cannot fix them.
+
+Other non-transient failures (e.g. `prompt is running`) still surface as
+hard errors immediately.
+
+After retries are exhausted (transient or gateway blip), the bridge
+**degrades gracefully**: it emits a user-visible
+`[请求失败：…。会话仍可用，请重新发送消息重试。]` message and returns `end_turn`,
+so the session stays usable — resend the message to try again.
 
 **Debugging:**
 
@@ -515,16 +563,26 @@ headless bridge has neither a browser nor the captcha credential. GLM Coding
 Plan providers are unaffected — they use an `id.secret` API key and sign
 requests themselves.
 
-**Workaround:** switch the session's provider to a GLM Coding Plan one
-(model dropdown, or re-enable it in the desktop app so
-`~/.zcode/v2/config.json` marks it `enabled`). The bridge answers the captcha
-request with `headersApplied:false` and the backend surfaces a clear error;
-full Start Plan support headless would require solving the Aliyun captcha
-outside a browser, which this bridge does not do. That boundary is
-deliberate: unofficial clients or proxies that impersonate the desktop app or
-bypass the captcha check won't be shipped or supported here — if the provider
-ever offers an official headless credential path, this bridge will adopt it
-(see #123).
+**Workaround:** in the ZCode desktop app (3.15+ / 3.17.x), connect the family
+via Start Plan (Settings → Model Provider), which writes both
+`zcodejwttoken` to `~/.zcode/v2/credentials.json` and a
+`kind: "start-plan"` connection selection to `setting.json` — on 0.17.x
+backends (per-request verification disabled at the
+edition level; the interactive branch is unreachable), the bridge
+serves `zcodejwttoken` over `interaction/requestProviderRuntimeHeaders`
+(`startPlanRequestAuthFor`) and injects `ZCODE_APP_VERSION` from the desktop
+bundle (`builtinProviderEnv`), matching the desktop host's own
+`AccountProviderRequestAuthService`. Entitlement no longer requires that
+selection: the billing verdict (see above, #406) entitles the family while
+billing reports an active plan, and a plain OAuth login (Coding Plan) only
+counts when billing says so — when the billing query cannot run, the
+`kind: "start-plan"` selection is the fallback gate. If no Start Plan
+credential is
+present on
+disk (or if a future edition re-enables browser captcha), switch the session's
+provider to a GLM Coding Plan one; the bridge answers with
+`headersApplied:false` and the backend surfaces a clear error rather than
+bypassing captcha checks (see #123, #363).
 
 ### Interactive TUI / `script` / `expect` fails with `Operation not permitted` under the sandbox
 
@@ -546,7 +604,7 @@ child as a bare `EPERM`, which tools may misreport as their own bug. When the
 backend runs sandboxed, the bridge logs a one-shot warning the first time a
 tool output contains `Operation not permitted` — that warning is your signal
 to suspect the sandbox. Path grants for legitimate writes go in
-`.zcode/acp/sandbox.json`.
+`~/.config/zcode-acp/sandbox.json`.
 
 ### UNRESOLVED: CLI (martty) freezes at an old state while the mobile app keeps updating
 

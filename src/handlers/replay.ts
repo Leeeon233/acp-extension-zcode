@@ -11,8 +11,6 @@
  * that bypasses the per-message lock — it only runs inside a batch.
  */
 
-import { randomUUID } from "node:crypto";
-
 import type * as acp from "@agentclientprotocol/sdk";
 
 import type { ZcodeMessage, ZcodeMessagesResult } from "../backend/types.js";
@@ -20,6 +18,7 @@ import type { ZcodeMessage, ZcodeMessagesResult } from "../backend/types.js";
 // parameter that would shadow the plain import name.
 import { messages as i18nMessages } from "../i18n.js";
 import type { ZcodeAcpServer } from "../server.js";
+import { renderToolOutput, TOOL_STATUS_MAP } from "../translators/tool-helpers.js";
 import { log, warn } from "../utils.js";
 import { throwError, withReplayBatch } from "./io.js";
 
@@ -232,6 +231,43 @@ export function readLoadIntent(params: acp.LoadSessionRequest): "auto" | "user" 
 }
 
 /**
+ * Normalize the 3.18+ `session/messages` wire shape onto the bridge's
+ * `info.id` spelling. 3.18.0 started serving history through the legacy
+ * protocol mapper (upstream `message-mapper.ts`), whose message info spells
+ * the id `messageId` — the Core shape the bridge was built against carries
+ * `info.id`. Without this mapping every id-based consumer silently degrades
+ * to its id-less fallback (differ dedup/anchor, replay pagination cursors,
+ * edit-diff tool lookup), and the turn-completion replay re-dispatches
+ * live-streamed text under chunkMsgId — the duplicate-message bug observed
+ * live 2026-11-12. Messages that already carry `info.id` (pre-3.18 backends)
+ * pass through untouched.
+ */
+export function normalizeWireMessages(messages: ZcodeMessage[]): ZcodeMessage[] {
+  let rewired = false;
+  for (const m of messages) {
+    const info = m?.info as { id?: unknown; messageId?: unknown } | undefined;
+    if (typeof info?.id !== "string" || !info.id) {
+      if (typeof info?.messageId === "string" && info.messageId) {
+        (m.info as { id?: string }).id = info.messageId;
+        rewired = true;
+      }
+    }
+  }
+  if (rewired) warnOnceMessageIdWire();
+  return messages;
+}
+
+let messageIdWireWarned = false;
+function warnOnceMessageIdWire(): void {
+  if (messageIdWireWarned) return;
+  messageIdWireWarned = true;
+  warn(
+    "session/messages carries the 3.18+ wire shape (info.messageId, no info.id) — " +
+      "normalized onto info.id for all id-based consumers",
+  );
+}
+
+/**
  * Drop duplicate entries the backend can return for the same message id
  * (observed in live session/messages payloads: the same id appears at
  * multiple, non-adjacent positions with identical content). Replaying every
@@ -347,7 +383,7 @@ export async function fetchMessages(
     result = await read();
   }
   if (result === null) return [];
-  return dedupeMessages(result.messages ?? []);
+  return dedupeMessages(normalizeWireMessages(result.messages ?? []));
 }
 
 /**
@@ -547,13 +583,36 @@ export async function replayMessages(
   for (const [mi, m] of messages.entries()) {
     const info = m.info ?? {};
     const role = info.role;
-    const mid = info.id ?? `hist_${randomUUID().slice(0, 12)}`;
+    // Fallback ids must be derived from stable inputs (the message index),
+    // never minted randomly: mid keys client-side text folding and the
+    // histfold_/thought_ card derivatives below, so a re-replay with fresh
+    // random ids could never match — and re-attach what the client already
+    // holds, duplicating it instead of replacing.
+    const mid = info.id ?? `hist_${mi}`;
+    // Rewind addressing (session/edit_user_message · session/retry_turn):
+    // `_meta.zcode.mid` is a stable handle equal to the store row's entityId
+    // (source-verified: the v4 row projection derives entityId from the
+    // message id). Attached only when the row carries a REAL id — the
+    // `hist_<index>` fallback is positional and could never address a rewind
+    // target. Live echoes (`uprompt_`/`chunk_` ids) never carry it: only
+    // replayed store rows are rewind targets.
+    const realMid = typeof info.id === "string" && info.id ? info.id : null;
+    const markMid = (update: acp.SessionUpdate): acp.SessionUpdate => {
+      if (realMid === null) return update;
+      const meta = (update._meta ?? {}) as { zcode?: Record<string, unknown> };
+      return {
+        ...update,
+        _meta: { ...meta, zcode: { ...(meta.zcode ?? {}), mid: realMid } },
+      };
+    };
+    const decorate = (update: acp.SessionUpdate): acp.SessionUpdate =>
+      markEarlierPage(markMid(update));
     // Only a message that also emits a text chunk under `mid` should key its
     // tool cards to that id (see the tool branch below).
     const carriesText = (m.parts ?? []).some(
       (p) => p?.type === "text" && Boolean((p as { text?: string }).text),
     );
-    for (const p of m.parts ?? []) {
+    for (const [pi, p] of (m.parts ?? []).entries()) {
       if (!p || typeof p !== "object") continue;
       const ptype = (p as { type?: string }).type;
       if (ptype === "text") {
@@ -569,7 +628,7 @@ export async function replayMessages(
           if (collapse.kind === "tool-transcript" && !toolsKept(mi)) continue;
           await cx.notify("session/update", {
             sessionId: acpSid,
-            update: markEarlierPage({
+            update: decorate({
               sessionUpdate: "tool_call",
               toolCallId: `histfold_${mid}`,
               title: collapse.title,
@@ -588,7 +647,7 @@ export async function replayMessages(
         } else {
           await cx.notify("session/update", {
             sessionId: acpSid,
-            update: markEarlierPage({
+            update: decorate({
               sessionUpdate: role === "user" ? "user_message_chunk" : "agent_message_chunk",
               content: { type: "text", text },
               messageId: mid,
@@ -601,7 +660,7 @@ export async function replayMessages(
         if (text) {
           await cx.notify("session/update", {
             sessionId: acpSid,
-            update: markEarlierPage({
+            update: decorate({
               sessionUpdate: "agent_thought_chunk",
               content: { type: "text", text },
               messageId: `thought_${mid}`,
@@ -611,6 +670,8 @@ export async function replayMessages(
       } else if (ptype === "tool") {
         if (!toolsKept(mi)) continue;
         const tp = p as {
+          callID?: string;
+          callId?: string;
           id?: string;
           tool?: string;
           state?: {
@@ -618,6 +679,7 @@ export async function replayMessages(
             status?: string;
             input?: unknown;
             output?: unknown;
+            error?: unknown;
           };
         };
         const st = tp.state ?? {};
@@ -626,6 +688,9 @@ export async function replayMessages(
         // invocation input and the full (backend-truncated) result text.
         // Attach both as content blocks so expanding a replayed call shows
         // what was read/edited/ran; without content the row expands empty.
+        // Failed parts carry `error` with no `output` (the store writes no
+        // output on failure) — read both, output first, same precedence the
+        // projection differ uses.
         const content: Array<{ type: "content"; content: { type: "text"; text: string } }> = [];
         if (st.input !== undefined && st.input !== null) {
           const inputText =
@@ -634,17 +699,27 @@ export async function replayMessages(
             content.push({ type: "content", content: { type: "text", text: inputText } });
           }
         }
-        if (typeof st.output === "string" && st.output) {
-          content.push({ type: "content", content: { type: "text", text: st.output } });
+        const outputText = renderToolOutput(st.output ?? st.error);
+        if (outputText) {
+          content.push({ type: "content", content: { type: "text", text: outputText } });
         }
         await cx.notify("session/update", {
           sessionId: acpSid,
-          update: markEarlierPage({
+          update: decorate({
             sessionUpdate: "tool_call",
-            toolCallId: tp.id ?? `histtool_${randomUUID().slice(0, 8)}`,
+            // The store's call id is the ONLY identity later live
+            // tool_call_update events address a card by. A card replayed
+            // under anything else (random ids did this for a long time) can
+            // never be patched afterwards: a turn still running through a
+            // client reconnect replays its cards mid-flight, then every real
+            // update misses and the card stays frozen at replay-time state.
+            // callID/callId mirror the projection differ's dual spelling.
+            // The index-derived fallback keeps the id deterministic so
+            // repeated replays of the same history replace, not duplicate.
+            toolCallId: tp.callID ?? tp.callId ?? tp.id ?? `histtool_${mid}_${pi}`,
             title: st.title ?? histToolName ?? i18nMessages().replayToolCallFallback,
             kind: "other",
-            status: (st.status as acp.ToolCallStatus) ?? "completed",
+            status: TOOL_STATUS_MAP[st.status ?? ""] ?? "completed",
             ...(content.length > 0 ? { content } : {}),
             ...(histToolName ? { _meta: { claudeCode: { toolName: histToolName } } } : {}),
             // Key the card to its history message ONLY when that message also

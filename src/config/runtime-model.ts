@@ -27,13 +27,13 @@
  */
 
 import { accountProviderIdFor } from "./account-provider.js";
+import { parseModelRefValue, resolveModelTarget } from "./model-resolution.js";
 import { buildModelElement, type ModelEntry } from "./provider-registry.js";
 import {
   findProviderConfig,
   formatModelValue,
   isBuiltinProvider,
   loadAllModels,
-  parseModelValue,
   personalModelSpec,
 } from "./options.js";
 import type { ModelRef } from "./options.js";
@@ -115,6 +115,9 @@ export function buildResumeRuntimeModel(): unknown | null {
  *
  * `value` is the configOption value: either `"providerId\modelId"` (encoded) or
  * a legacy plain modelId (resolved to the first enabled builtin provider).
+ * Every spelling — separators (`\` / `/`), `custom:` encoding, config vs
+ * registry provider dialect, official model id case — is first normalized
+ * against the session's registry snapshot (model-resolution.ts, #403).
  *
  * 3.12+ schema (source-verified 2026-09-21 against the open-sourced 0.16.9):
  * `zcodeSessionSetModelParamsSchema` is strict and `model` must be the
@@ -145,8 +148,60 @@ export async function applyModelSwitch(
   zcodeSid: string,
   value: string,
 ): Promise<boolean> {
-  const { providerId, modelId } = parseModelValue(value);
   const backend = await server.ensureBackend();
+  const generation = server.backendGeneration;
+  // Resolve the inbound value against the session's registry snapshot (#403):
+  // dialect (`builtin:` ↔ `account:`), case, and separator spellings all
+  // normalize here, so a stale advertisement (a frozen config.json model id, a
+  // legacy-prefixed dropdown value) never reaches setModel as a raw string.
+  // A provider-qualified ref that resolves to nothing is still SENT dialect-
+  // folded — the backend is the final authority and the snapshot may lag a
+  // just-added model; a bare id keeps its uniqueness gate (a live snapshot
+  // with no match is final).
+  const snapshot = server.modelAvailability.get(zcodeSid);
+  const resolution = resolveModelTarget(value, snapshot);
+  const parsed = parseModelRefValue(value);
+  let providerId: string | undefined;
+  let modelId: string | undefined;
+  if (resolution.ok) {
+    ({ providerId, modelId } = resolution.target);
+    if (resolution.target.via !== "exact") {
+      log(
+        `model switch: resolved "${value}" → ${providerId}/${modelId} (${resolution.target.via})`,
+      );
+    }
+  } else if (!parsed.encoded && !snapshot) {
+    // Legacy bare id with no snapshot: resolve against local config — the
+    // pre-resolution behavior for cold paths (slash command before any create).
+    const models = loadAllModels();
+    const providers = new Set(
+      models
+        .filter((m) => m.modelId === value && m.providerId)
+        .map((m) => accountProviderIdFor(m.providerId!)),
+    );
+    if (providers.size !== 1) {
+      warn(`runtime-model: switch failed: ${resolution.reason}`);
+      return false;
+    }
+    providerId = [...providers][0]!;
+    modelId = value;
+  } else {
+    // Provider-qualified but unresolved: send the dialect-folded ref as-is.
+    providerId = parsed.providerId ? accountProviderIdFor(parsed.providerId) : undefined;
+    modelId = parsed.providerId ? parsed.modelId : undefined;
+    if (snapshot) {
+      log(
+        `model switch: "${value}" unresolved against the registry snapshot — sending as-is, backend validates`,
+      );
+    }
+  }
+  if (!providerId || !modelId) {
+    warn(
+      `runtime-model: switch failed: ${resolution.ok ? "unresolved model ref" : resolution.reason}`,
+    );
+    return false;
+  }
+  // Idempotent on registry-dialect ids; folds any config-dialect leftover.
   const registryProviderId = accountProviderIdFor(providerId);
   const candidates = candidateReasoningLevels(server, zcodeSid, registryProviderId, modelId);
   // [best, omit, rest]: omission second so a level-less registry def succeeds
@@ -171,7 +226,9 @@ export async function applyModelSwitch(
       { sessionId: zcodeSid, model, persistAsWorkspaceLastUsed: false },
       15000,
     );
+    if (generation !== server.backendGeneration) return false;
     if (!resp.error) {
+      server.currentModelIdentity.set(zcodeSid, { providerId: registryProviderId, modelId });
       invalidateModelCache(server, zcodeSid);
       return true;
     }
@@ -181,8 +238,28 @@ export async function applyModelSwitch(
     if (!LEVEL_REJECTED.test(lastError) && !LEVEL_REQUIRED.test(lastError)) break;
     log(`runtime-model: level attempt "${level ?? "<omitted>"}" rejected: ${lastError}`);
   }
-  warn(`runtime-model: switch failed: ${lastError}`);
+  warn(
+    `runtime-model: switch failed: ${lastError}` +
+      (snapshot
+        ? ` (registry snapshot: ${snapshot.filter((e) => e.providerId === registryProviderId).length} model(s) under ${registryProviderId}, ${snapshot.length} total)`
+        : " (no registry snapshot)"),
+  );
   return false;
+}
+
+/**
+ * The registry-dialect value a caller should REMEMBER for a session whose
+ * switch just succeeded — the identity the switch actually landed on, not the
+ * (possibly stale-dialect) inbound value. Undefined when no identity is known.
+ */
+export function lastSwitchedModelValue(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+): string | undefined {
+  const identity = server.currentModelIdentity.get(zcodeSid);
+  return identity?.providerId && identity.modelId
+    ? formatModelValue(identity.providerId, identity.modelId)
+    : undefined;
 }
 
 /** setModel rejections that mean "this LEVEL is wrong", not "this switch is wrong". */

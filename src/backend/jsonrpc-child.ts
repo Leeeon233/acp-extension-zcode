@@ -18,6 +18,7 @@
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
+import { isWindows, killTree } from "../platform/win32.js";
 import { createInterface } from "node:readline";
 import process from "node:process";
 
@@ -39,6 +40,8 @@ interface PendingRequest {
 export interface JsonRpcChildOptions {
   argv: string[];
   env: NodeJS.ProcessEnv;
+  /** Prevent preloads from running in a probe's watchdog. */
+  sanitizeWatchdog?: boolean;
   /** Backend name used in error strings (e.g. "zcode" → "zcode backend pipe broken"). */
   name: string;
   /** Human-readable label for the start log line. */
@@ -75,6 +78,7 @@ export abstract class JsonRpcChild implements BackendAdapter {
       stdio: ["pipe", "pipe", "pipe"],
       env: opts.env,
       detached: true, // own process group → kill(-pid) reaps the whole tree
+      windowsHide: process.platform === "win32", // headless GUI-bridge child: suppress the console flash
     });
     // Spawn failures (ENOENT when the CLI can't be resolved) arrive here
     // asynchronously — without a listener the bridge dies on an unhandled
@@ -108,7 +112,7 @@ export abstract class JsonRpcChild implements BackendAdapter {
       this.stderrTail = "";
     });
     this.startReader();
-    this.startWatchdog();
+    this.startWatchdog(opts.sanitizeWatchdog === true);
     log(`backend: started ${opts.logLabel} (pid=${this.proc.pid})`);
   }
 
@@ -128,7 +132,7 @@ export abstract class JsonRpcChild implements BackendAdapter {
    * kills. It self-terminates as soon as the backend process exits, so a
    * normal shutdown leaves no lingering watchdog.
    */
-  private startWatchdog(): void {
+  private startWatchdog(sanitize: boolean): void {
     const bridgePid = process.pid;
     const backendPid = this.proc.pid;
     if (!bridgePid || !backendPid) return;
@@ -140,19 +144,24 @@ export abstract class JsonRpcChild implements BackendAdapter {
         // Bridge gone? → reap the whole backend process group, then exit.
         try { process.kill(bridgePid, 0); }
         catch {
-          try { process.kill(-backendPid, 'SIGKILL'); } catch {}
-          process.exit(0);
+          if (process.platform === 'win32') { const tk = require('node:child_process').spawn('taskkill', ['/PID', String(backendPid), '/T', '/F'], { stdio: 'ignore', windowsHide: true }); tk.on('exit', () => process.exit(0)); tk.on('error', () => { try { process.kill(backendPid); } catch {} process.exit(0); }); } else { try { process.kill(-backendPid, 'SIGKILL'); } catch {} process.exit(0); }
         }
         // backend already exited? → watchdog has no job left.
-        try { process.kill(-backendPid, 0); }
+        try { process.kill(process.platform === "win32" ? backendPid : -backendPid, 0); }
         catch { process.exit(0); }
       };
       setInterval(tick, 2000);
       tick();
     `;
+    const env = sanitize ? { ...process.env } : undefined;
+    if (env) {
+      delete env.NODE_OPTIONS;
+      delete env.NODE_PATH;
+    }
     this.watchdog = spawn(process.execPath, ["-e", script], {
       stdio: "ignore",
       detached: true, // own process group, not part of the backend group
+      env,
     });
     this.watchdog.unref();
   }
@@ -404,6 +413,20 @@ export abstract class JsonRpcChild implements BackendAdapter {
     this.closing = true;
     const proc = this.proc;
     if (!proc.pid) return;
+    if (isWindows()) {
+      // Windows has no process groups: taskkill /T /F reaps the whole tree in
+      // one shot (a graceful stage has no console-app equivalent).
+      if (proc.exitCode !== null || proc.signalCode) return;
+      killTree(proc.pid);
+      await new Promise<boolean>((resolve) => {
+        const timer = setTimeout(() => resolve(false), 3000);
+        proc.once("exit", () => {
+          clearTimeout(timer);
+          resolve(true);
+        });
+      });
+      return;
+    }
     try {
       // Already exited?
       if (proc.exitCode !== null || proc.signalCode) return;

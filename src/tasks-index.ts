@@ -455,6 +455,129 @@ export async function softDeleteWorkspaceTasks(
 }
 
 /**
+ * RETIRE tombstoned rows for sessions the backend can no longer serve
+ * (physically deleted upstream via the 3.18+ v4 face, or soft-deleted —
+ * upstream resume refuses both with "Session not found", so a revival could
+ * only ever resurrect a zombie row whose every use fails with sessionEvicted).
+ *
+ * Retired = `archived=1` layered on the existing `deleted=1` (issue #376:
+ * reuse of the archive filter): every listing already hides `deleted=1 OR
+ * archived=1`, revival skips `archived=1` rows, and the hub's resume guard
+ * still sees `deleted=1`. Only tombstoned rows are touched — a live row must
+ * never gain our retirement marker. Best-effort, never throws.
+ */
+export async function retireTasks(
+  taskIds: string[],
+  dbPath: string = TASKS_INDEX_PATH,
+): Promise<number> {
+  const ids = [...new Set(taskIds)].filter((id) => typeof id === "string" && id);
+  if (!ids.length || !existsSync(dbPath)) return 0;
+  try {
+    const flipped = await withSqliteRetry(
+      (con) =>
+        Number(
+          con
+            .prepare(
+              "UPDATE tasks SET archived=1, updated_at=? " +
+                `WHERE task_id IN (${ids.map(() => "?").join(",")}) AND deleted=1`,
+            )
+            .run(Date.now(), ...ids).changes,
+        ),
+      dbPath,
+    );
+    return flipped ?? 0;
+  } catch (e) {
+    warn(`tasks-index tombstone retirement skipped: ${e instanceof Error ? e.message : String(e)}`);
+    return 0;
+  }
+}
+
+/** Probe cap for the workspace-branch pre-pass below (matches sqlite's
+ * classic 999 host-parameter ceiling with room to spare). */
+const RETIRE_PROBE_MAX_IDS = 500;
+
+/**
+ * One tasks row's recorded workspace path — the remote hard-delete flow's
+ * first-choice `workspace.workspacePath` for the upstream v4 deletion face
+ * (the store must answer with the SAME path or the preview refuses with
+ * `session-data.identity-mismatch`). Null when the row or index is absent.
+ */
+export async function taskWorkspacePath(
+  taskId: string,
+  dbPath: string = TASKS_INDEX_PATH,
+): Promise<string | null> {
+  if (!existsSync(dbPath)) return null;
+  try {
+    const row = await withSqliteRetry(
+      (con) =>
+        con.prepare("SELECT workspace_path AS p FROM tasks WHERE task_id=?").get(taskId) as
+          { p: unknown } | undefined,
+      dbPath,
+    );
+    return typeof row?.p === "string" && row.p ? row.p : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Every task id recorded for a workspace (deleted or not) — the id list the
+ * hub's project hard-delete loops through the per-session v4 deletion face.
+ * Uncapped on purpose: the CALLER bounds one purge request and must report
+ * the overflow as skipped (a silent truncation here would read as "bytes
+ * destroyed" for ids nobody purged).
+ */
+export async function workspaceTaskIds(
+  workspacePath: string,
+  dbPath: string = TASKS_INDEX_PATH,
+): Promise<string[]> {
+  if (!existsSync(dbPath)) return [];
+  try {
+    const rows = await withSqliteRetry(
+      (con) =>
+        con
+          .prepare("SELECT task_id AS id FROM tasks WHERE workspace_path=?")
+          .all(workspacePath) as Array<{ id: unknown }>,
+      dbPath,
+    );
+    const ids: string[] = [];
+    for (const r of rows ?? []) if (typeof r.id === "string" && r.id) ids.push(r.id);
+    return ids;
+  } catch {
+    return [];
+  }
+}
+
+/**
+ * Physically remove tasks rows — ONLY for sessions whose bytes the upstream
+ * v4 deletion face has already destroyed (the hard-delete success path). The
+ * row would otherwise be a zombie every future reader has to filter around.
+ * Not a general-purpose delete: tombstones (hide) go through softDelete*.
+ */
+export async function deleteTaskRows(
+  taskIds: string[],
+  dbPath: string = TASKS_INDEX_PATH,
+): Promise<number> {
+  const ids = [...new Set(taskIds)].filter((id) => typeof id === "string" && id);
+  if (!ids.length || !existsSync(dbPath)) return 0;
+  try {
+    const removed = await withSqliteRetry(
+      (con) =>
+        Number(
+          con
+            .prepare(`DELETE FROM tasks WHERE task_id IN (${ids.map(() => "?").join(",")})`)
+            .run(...ids).changes,
+        ),
+      dbPath,
+    );
+    return removed ?? 0;
+  } catch (e) {
+    warn(`tasks-index row removal skipped: ${e instanceof Error ? e.message : String(e)}`);
+    return 0;
+  }
+}
+
+/**
  * Clear delete tombstones when their sessions become USED again (ADR-0031's
  * amendment: a delete is a list-hide, and touching the project/session again
  * cancels it — "undelete = a flag flip", now automatic).
@@ -474,17 +597,61 @@ export async function softDeleteWorkspaceTasks(
  * invisibility, and this branch touches exactly one task id.
  *
  * Archived rows are never revived — `archived=1` is the desktop App's own
- * archive marker (un-deleting would not even unhide them).
+ * archive marker (un-deleting would not even unhide them), and since #376 it
+ * is also the RETIRED marker (a tombstone whose bytes are gone): flipping
+ * `deleted` alone would leave a deleted=0+archived=1 row that masquerades as
+ * a user archive.
+ *
+ * `probeGone` (optional): before the workspace-wide mass revival, the caller
+ * can ask the backend which candidate ids it can no longer resume; those
+ * RETIRE instead of reviving (see `retireTasks`). A probe that throws or
+ * reports nothing leaves the blind revival in place — a probe hiccup must
+ * never un-revive a session the store still has.
  *
  * Returns the number of rows revived (0 when there is nothing to revive, no
  * index, or the write fails — best-effort, never throws).
  */
 export async function reviveTombstonesOnActivity(
-  opts: { taskId?: string; workspacePath?: string },
+  opts: {
+    taskId?: string;
+    workspacePath?: string;
+    probeGone?: (ids: string[]) => Promise<Set<string>>;
+  },
   dbPath: string = TASKS_INDEX_PATH,
 ): Promise<number> {
   if (!existsSync(dbPath)) return 0;
   try {
+    const wsPath = opts.workspacePath;
+    if (wsPath && opts.probeGone) {
+      // Pre-pass: only when a mass revival is actually imminent (the
+      // workspace is fully invisible) do the candidates matter, so the probe
+      // never costs anything on the common visible-workspace path.
+      const candidates = await withSqliteRetry((con) => {
+        const visible = con
+          .prepare(
+            "SELECT COUNT(*) AS n FROM tasks WHERE workspace_path=? AND deleted=0 AND archived=0",
+          )
+          .get(wsPath) as { n: number } | undefined;
+        if ((visible?.n ?? 0) !== 0) return [] as string[];
+        const rows = con
+          .prepare(
+            "SELECT task_id AS id FROM tasks WHERE workspace_path=? AND deleted=1 AND archived=0",
+          )
+          .all(wsPath) as Array<{ id: unknown }>;
+        const ids: string[] = [];
+        for (const r of rows) if (typeof r.id === "string" && r.id) ids.push(r.id);
+        return ids.slice(0, RETIRE_PROBE_MAX_IDS);
+      }, dbPath);
+      if (candidates?.length) {
+        let gone = new Set<string>();
+        try {
+          gone = await opts.probeGone(candidates);
+        } catch {
+          gone = new Set(); // no verdict — revive blindly (pre-#376 behavior)
+        }
+        if (gone.size) await retireTasks([...gone], dbPath);
+      }
+    }
     const revived = await withSqliteRetry((con) => {
       let flipped = 0;
       const now = Date.now();
@@ -508,7 +675,9 @@ export async function reviveTombstonesOnActivity(
       if (opts.taskId) {
         flipped += Number(
           con
-            .prepare("UPDATE tasks SET deleted=0, updated_at=? WHERE task_id=? AND deleted=1")
+            .prepare(
+              "UPDATE tasks SET deleted=0, updated_at=? WHERE task_id=? AND deleted=1 AND archived=0",
+            )
             .run(now, opts.taskId).changes,
         );
       }
@@ -581,17 +750,63 @@ export async function isTaskDeleted(
  * from overriding the user's rename. False when the index or row is absent.
  */
 export async function isTitleOverridden(taskId: string): Promise<boolean> {
-  if (!existsSync(TASKS_INDEX_PATH)) return false;
+  return (await readTaskTitle(taskId))?.overridden === true;
+}
+
+/**
+ * One tasks row's title state, for the load/resume title adoption
+ * (`adoptStoredTitle`): `overridden: true` means the user renamed this
+ * conversation and the durable title must win over the backend's stored
+ * (possibly stale) auto title. Null when the row or index is absent.
+ */
+export async function readTaskTitle(
+  taskId: string,
+): Promise<{ title: string | null; overridden: boolean } | null> {
+  if (!existsSync(TASKS_INDEX_PATH)) return null;
   try {
     const row = await withSqliteRetry(
       (con) =>
-        con.prepare("SELECT title_overridden FROM tasks WHERE task_id=?").get(taskId) as
-          { title_overridden: number } | undefined,
+        con
+          .prepare("SELECT deleted, title, title_overridden FROM tasks WHERE task_id=?")
+          .get(taskId) as
+          { deleted: number; title: string | null; title_overridden: number } | undefined,
     );
-    return row?.title_overridden === 1;
+    if (!row || row.deleted === 1) return null;
+    return { title: row.title ?? null, overridden: row.title_overridden === 1 };
   } catch {
-    return false;
+    return null;
   }
+}
+
+/**
+ * Every durably user-renamed title (task_id → title, `title_overridden=1`,
+ * visible rows). Session listings overlay these onto the backend's rows: the
+ * backend store can lag a rename (the v4 renameSession command may still be
+ * cold-resuming the session), and the pin is the user's truth. Empty map on
+ * any failure — no overlay, backend titles as-is.
+ */
+export async function overriddenTaskTitles(
+  dbPath: string = TASKS_INDEX_PATH,
+): Promise<Map<string, string>> {
+  const out = new Map<string, string>();
+  if (!existsSync(dbPath)) return out;
+  try {
+    const rows = await withSqliteRetry(
+      (con) =>
+        con
+          .prepare(
+            "SELECT task_id AS id, title AS t FROM tasks WHERE title_overridden=1 AND deleted=0",
+          )
+          .all() as Array<{ id: unknown; t: unknown }>,
+      dbPath,
+    );
+    for (const r of rows ?? []) {
+      if (typeof r.id === "string" && typeof r.t === "string" && r.t) out.set(r.id, r.t);
+    }
+  } catch {
+    // Best-effort overlay — an unreadable index must not fail the listing.
+  }
+  return out;
 }
 
 /** One known project workspace, as recorded by the App's tasks index. */

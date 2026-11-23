@@ -60,26 +60,40 @@ import { WebSocket, WebSocketServer, type RawData } from "ws";
 import { resolveRuntime, runtimeSpawnParts } from "../runtime.js";
 import { sessionTabTitle } from "../terminal-title.js";
 import { AGENT_INFO, compareVersions, log, warn } from "../utils.js";
-import { expandHomePath, type TerminalPrefs } from "../config/user-config.js";
+import { recordClosedSessionIds } from "../closed-sessions.js";
+import { expandHomePath, hardDeleteArmed, type TerminalPrefs } from "../config/user-config.js";
 import { tuiStatsSegments } from "../config/settings.js";
 import { readCodeFingerprint } from "./code-fingerprint.js";
-import { remoteEnabledLive, remoteProjectRoots, remoteTerminalPrefs } from "./config.js";
+import {
+  remoteEnabledLive,
+  remoteExecEnabledLive,
+  remoteProjectRoots,
+  remoteTerminalPrefs,
+} from "./config.js";
+import {
+  createTerminalRelay,
+  PING_INTERVAL_MS as TERMINAL_PING_INTERVAL_MS,
+  type TerminalRelay,
+} from "./terminal-relay.js";
 import { envWithLoginShell } from "./login-shell-env.js";
 import { accountUsageStats, type UsageStatsResult } from "../handlers/account.js";
 import { BOOT_RESUME_TRIGGER } from "../handlers/session.js";
 import { createSettingsHandler } from "./settings-endpoint.js";
 import {
   composeQuotaDock,
-  formatCpDockSegment,
   formatGoDockSegment,
   formatOcDockSegment,
   formatQuotaDock,
 } from "../quota/format.js";
-import { queryCpUsage } from "../quota/cliproxy/index.js";
 import { queryQuota } from "../quota/index.js";
 import { queryOcUsage } from "../quota/ollama-cloud/index.js";
 import { queryGoUsage } from "../quota/opencode-go/index.js";
-import { isTaskDeleted, listKnownWorkspaces, softDeleteWorkspaceTasks } from "../tasks-index.js";
+import {
+  isTaskDeleted,
+  listKnownWorkspaces,
+  softDeleteWorkspaceTasks,
+  workspaceTaskIds,
+} from "../tasks-index.js";
 import { buildWorkflowOverview } from "./workflow-overview.js";
 import { collectSystemStats } from "./system-stats.js";
 
@@ -150,6 +164,19 @@ export interface HubOptions {
    * only an explicit disable retires the daemon.
    */
   stayAliveCheck?: () => boolean;
+  /**
+   * Override the Remote Terminal exec gate (app ADR-0011; tests pin it).
+   * Default: live re-read of `remote.exec.enabled` (remoteExecEnabledLive,
+   * default false). The relay re-checks per frame and per keepalive sweep,
+   * so flipping the config tears down live pairings without a hub restart.
+   */
+  execEnabled?: () => boolean;
+  /**
+   * Keepalive sweep cadence for the terminal relay legs (pong-supervised
+   * pings + the exec-gate sweep for idle pairs; tests shrink it). Default
+   * PING_INTERVAL_MS.
+   */
+  terminalPingIntervalMs?: number;
   /**
    * Override how the remote session-create / session-resume endpoints spawn
    * a bridge (tests inject a fake). Default: this node + this package's
@@ -222,6 +249,16 @@ interface InstanceEntry {
   tuiPid?: number;
   /** First failed ?probe=1 timestamp; a bridge alive enough to re-register clears it. */
   unhealthySince?: number;
+  /**
+   * The bridge's own self-reported code identity, echoed on every heartbeat
+   * (`codeFingerprint` + `version`). The reuse decision compares it against
+   * the code on disk NOW: a bridge that cannot match it is running different
+   * code than a fresh spawn would load, so new work must not be routed there
+   * (see `bridgeRunsStaleCode`). Absent on bridges older than the fingerprint
+   * protocol — those fall back to the mtime/version signals.
+   */
+  version?: string;
+  codeFingerprint?: string;
 }
 
 const HEARTBEAT_TIMEOUT_MS = 30_000;
@@ -934,11 +971,8 @@ function getQuotaDock(): Promise<{ formatted: string | null; fetchedAt: number }
     queryOcUsage()
       .then(formatOcDockSegment)
       .catch(() => null),
-    queryCpUsage()
-      .then((cp) => formatCpDockSegment(cp.result))
-      .catch(() => null),
-  ]).then(([glm, go, oc, cp]) => {
-    dockCache = { formatted: composeQuotaDock(glm, go, oc, cp), at: Date.now() };
+  ]).then(([glm, go, oc]) => {
+    dockCache = { formatted: composeQuotaDock(glm, go, oc), at: Date.now() };
     return { formatted: dockCache.formatted, fetchedAt: dockCache.at };
   });
 }
@@ -1055,6 +1089,140 @@ function fetchBridgeSessions(
       req.destroy();
       reject(new Error("bridge session list timed out"));
     });
+  });
+}
+
+/**
+ * Per-close relay bound for instance shutdown retirement. Covers the bridge's
+ * own worst-case close — the force-settle wait (~3s) plus one racedNotify cap
+ * (5s) — WITH margin: a bound that merely EQUALS the worst case races the
+ * boundary flush into the fallback (benign, but the full relay retires every
+ * spelling). Anything past this is a wedged bridge, and shutdown must not
+ * wait for it.
+ */
+const SHUTDOWN_CLOSE_TIMEOUT_MS = 10_000;
+
+/**
+ * Relay one retirement close to an instance the shutdown route is about to
+ * kill: POST {force:true} to the bridge's /sessions/{sid}/close (the loopback
+ * route the per-session close proxy uses). Resolves with EVERY id spelling
+ * the bridge reported for the conversation, or null when the bridge did not
+ * answer 200 (unreachable, refused a running turn, timed out) — the caller
+ * then falls back to stamping the advertised spelling alone. Never rejects:
+ * shutdown proceeds to the kill whatever the dying bridge says.
+ */
+function relayShutdownClose(port: number, sid: string): Promise<string[] | null> {
+  const body = Buffer.from(JSON.stringify({ force: true }));
+  return new Promise((resolve) => {
+    const req = httpRequest(
+      {
+        host: "127.0.0.1",
+        port,
+        path: `/sessions/${sid}/close`,
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(body.length),
+        },
+      },
+      (up) => {
+        const chunks: Buffer[] = [];
+        up.on("data", (chunk: Buffer) => chunks.push(chunk));
+        up.on("error", () => resolve(null));
+        up.on("end", () => {
+          if (up.statusCode !== 200) {
+            resolve(null);
+            return;
+          }
+          let spellings = [sid];
+          try {
+            const parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+              sessionIds?: unknown;
+            };
+            if (Array.isArray(parsed.sessionIds)) {
+              const extra = parsed.sessionIds.filter(
+                (s): s is string => typeof s === "string" && s.length > 0 && s !== sid,
+              );
+              if (extra.length > 0) spellings = [sid, ...extra];
+            }
+          } catch {
+            // non-JSON body — the requested sid alone (older bridges)
+          }
+          resolve(spellings);
+        });
+      },
+    );
+    req.setTimeout(SHUTDOWN_CLOSE_TIMEOUT_MS, () => req.destroy()); // 'error' resolves null
+    req.on("error", () => resolve(null));
+    req.end(body);
+  });
+}
+
+/**
+ * Per-id relay bound for the project hard-delete loop: the bridge's purge
+ * path runs deletionPreview + deletionExecute against its backend (30s each),
+ * so the relay must outlive both with margin.
+ */
+const SESSION_PURGE_TIMEOUT_MS = 90_000;
+
+/**
+ * Relay one `{"purge": true}` session delete to a serve bridge's loopback
+ * route (the same handler POST /api/instances/{id}/sessions/{sid}/delete
+ * proxies to). Resolves `{purged, reason?}` from the bridge's answer, or
+ * null when the bridge did not answer a decision (unreachable / invalid
+ * body) — the caller reports that as a skip, never a failure of the whole
+ * project delete. Never rejects.
+ */
+function relaySessionPurge(
+  port: number,
+  sid: string,
+): Promise<{ purged: boolean; reason?: string } | null> {
+  const body = Buffer.from(JSON.stringify({ purge: true }));
+  return new Promise((resolve) => {
+    const req = httpRequest(
+      {
+        host: "127.0.0.1",
+        port,
+        path: `/sessions/${sid}/delete`,
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(body.length),
+        },
+      },
+      (up) => {
+        const chunks: Buffer[] = [];
+        up.on("data", (chunk: Buffer) => chunks.push(chunk));
+        up.on("error", () => resolve(null));
+        up.on("end", () => {
+          let parsed: { purged?: unknown; reason?: unknown } | null = null;
+          try {
+            parsed = JSON.parse(Buffer.concat(chunks).toString("utf8")) as {
+              purged?: unknown;
+              reason?: unknown;
+            };
+          } catch {
+            parsed = null;
+          }
+          if (parsed && typeof parsed.purged === "boolean") {
+            resolve({
+              purged: parsed.purged,
+              ...(typeof parsed.reason === "string" ? { reason: parsed.reason } : {}),
+            });
+            return;
+          }
+          // 409s carry a text/plain reason; anything unparseable is "no decision".
+          const text = Buffer.concat(chunks).toString("utf8").slice(0, 200);
+          resolve({
+            purged: false,
+            reason: `bridge answered ${up.statusCode ?? "?"}${text ? `: ${text}` : ""}`,
+          });
+        });
+      },
+    );
+    req.setTimeout(SESSION_PURGE_TIMEOUT_MS, () => req.destroy()); // 'error' resolves null
+    req.on("error", () => resolve(null));
+    req.end(body);
   });
 }
 
@@ -1233,10 +1401,24 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     codePaths = defaultCodePaths(),
     projectsDbPath,
     stayAliveCheck = () => remoteEnabledLive(),
+    execEnabled,
+    terminalPingIntervalMs = TERMINAL_PING_INTERVAL_MS,
     spawnServe = defaultSpawnServe,
     terminalLaunches,
     staleVoteCooldownMs = STALE_VOTE_COOLDOWN_MS,
   } = options;
+
+  /**
+   * Remote Terminal relay (app ADR-0011): a dumb authenticated pipe between
+   * remote clients and the desktop workbench's control connection. Created
+   * early — the stay-alive wrapper below and the upgrade routes both need it.
+   */
+  const terminalRelay: TerminalRelay = createTerminalRelay({
+    enabled: execEnabled ?? (() => remoteExecEnabledLive()),
+    pingIntervalMs: terminalPingIntervalMs,
+  });
+  /** Idle-exit stay-alive: the user config OR a live workbench wiring. */
+  const stayAlive = (): boolean => stayAliveCheck() || terminalRelay.controlAlive();
 
   /** Frozen at hub start — the anchor the /api/upgrade signals compare to. */
   const startedAt = Date.now();
@@ -1328,7 +1510,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
    * never opens a window retroactively.
    */
   const desktopPresence = (req: IncomingMessage): DesktopPresence | null => {
-    if (desktopPairs.size > 0) return "connection";
+    if (desktopPairs.size > 0 || terminalRelay.controlAlive()) return "connection";
     if (requestIsDesktopClient(req)) return "request";
     if (desktopSeenAt > 0 && Date.now() - desktopSeenAt < desktopPresenceTtlMs) return "recent";
     return null;
@@ -1366,6 +1548,72 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
   /** The live serve instance for a workspace, if any (per-workspace dedupe). */
   const findServeInstance = (workspacePath: string): InstanceEntry | undefined =>
     findServeInstances(workspacePath)[0];
+
+  /**
+   * The code a fresh spawn would load RIGHT NOW. Read per decision instead of
+   * cached: a rebuild that landed seconds ago is exactly the thing this
+   * guards, and the read is one small JSON plus a shallow dist walk.
+   */
+  const diskCodeNow = async (): Promise<{
+    fingerprint: string | null;
+    newestMtime: number | null;
+  }> => ({
+    fingerprint: readCodeFingerprint(codePaths.distDir),
+    newestMtime: await newestJsMtime(codePaths.distDir),
+  });
+
+  /**
+   * Does this bridge run OTHER code than a fresh spawn would? Node loads a
+   * module graph once per process, so a bridge started before the current
+   * build keeps serving its old handlers and its old model list forever — a
+   * new conversation routed to it inherits all of that (reported 2026-11-10:
+   * a Start Plan fix released, rebuilt, and still absent from every "new"
+   * session because the workspace's serve bridge predated the build).
+   *
+   * Fingerprint first: it compares IDENTITY against the same disk a spawn
+   * would load, not two processes, so "differs" is meaningful here (unlike
+   * the version votes, where a hash has no ordering). Fingerprint-less
+   * builds fall back to the mtime signal. Unknown never counts as stale.
+   */
+  const bridgeRunsStaleCode = (
+    entry: InstanceEntry,
+    disk: { fingerprint: string | null; newestMtime: number | null },
+  ): boolean => {
+    if (entry.codeFingerprint && disk.fingerprint) {
+      return entry.codeFingerprint !== disk.fingerprint;
+    }
+    return disk.newestMtime !== null && disk.newestMtime > Math.floor(entry.startedAt);
+  };
+
+  /**
+   * The serve instance NEW WORK should land on (a new session, a resume of a
+   * conversation nobody holds live, a listing that needs a bridge), if any.
+   *
+   * Reuse exists to avoid a second process per workspace, not to preserve a
+   * process on purpose: a stale bridge is skipped so the caller incubates a
+   * fresh one. The stale bridge is deliberately NOT killed — it keeps serving
+   * whatever its own clients are running and idles out on its own schedule
+   * (SERVE_IDLE_MS once its last client/turn ends).
+   */
+  const pickServeForNewWork = async (workspacePath: string): Promise<InstanceEntry | undefined> => {
+    const candidates = findServeInstances(workspacePath).filter(
+      (e) => e.unhealthySince === undefined,
+    );
+    if (candidates.length === 0) return undefined;
+    const disk = await diskCodeNow();
+    const fresh = candidates.find((e) => !bridgeRunsStaleCode(e, disk));
+    if (!fresh) {
+      // warn (not log): on the detached daemon the diary is the only place
+      // this decision is observable, and it is the explanation for a
+      // duplicate process per workspace.
+      warn(
+        `hub: serve bridge ${candidates.map((e) => e.id).join(", ")} for ${workspacePath} ` +
+          `runs code older than the dist on disk — incubating a fresh bridge instead of ` +
+          `reusing (the old one keeps its sessions and idles out)`,
+      );
+    }
+    return fresh;
+  };
 
   /**
    * Spawn a bridge and poll until it registers (or fails fast on child exit /
@@ -1438,7 +1686,18 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     // exported in their shell lives only in the login shell's environment.
     const statsFilter = tuiStatsSegments(env);
     if (statsFilter !== undefined) env.DSH_TUI_STATS = statsFilter;
-    if (kind === "resume") {
+    // Desktop Presence (amendment to ADR-0016): while the desktop app is
+    // present — a proxied connection, the request's own identity header, or a
+    // stamped call within the presence TTL (see desktopPresence) —
+    // session-create AND resume incubate in the headless serve form: the
+    // desktop app is the presenting surface, so a terminal window would
+    // re-render the same stream for nobody (a resume's window was ADR-0017's
+    // mobile surface; a desktop-originated resume loads the session itself
+    // after attach). Decided HERE, before the env: the boot handshake vars
+    // below exist for the visible TUI surface, and arming them on a headless
+    // spawn breaks the bridge for every LATER connection (see the guards).
+    const desktopPresent = (kind === "tui" || kind === "resume") && desktop !== null;
+    if (kind === "resume" && !desktopPresent) {
       // ADR-0017: the requested session rides the env — terminalTuiScript
       // exports every ZCODE_ACP_* var into the terminal's fresh shell, so the
       // TUI boots into it. The detached serve fallback ignores it; the
@@ -1450,7 +1709,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       // Must ride the env verbatim — martty reads it once at process start.
       env.DSH_TUI_AUTOPROMPT = BOOT_RESUME_TRIGGER;
     }
-    if (kind === "tui") {
+    if (kind === "tui" && !desktopPresent) {
       // Remote session-create binding: pre-generate the ACP session id BOTH
       // the TUI window and the attaching phone adopt on their first
       // session/new (ZCODE_ACP_BOOT_CREATE_SESSION tells the bridge to MINT it
@@ -1459,6 +1718,17 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       // phone's conversation invisible in the window (verified by the
       // 2026-09-06 diagnosis: martty drops every update addressed to the
       // phone's session id, and its banner never yields).
+      //
+      // NEVER under Desktop Presence: that spawn is headless, so there is no
+      // window to bind to — and the bind is PER-BRIDGE and permanent
+      // (server.bootCreateBindSession), while the hub KEEPS REUSING this one
+      // serve bridge for later creates. Every later connection would claim
+      // the same stale id on its first session/new and "create" the session
+      // that is already open (observed 2026-11-04: three new-session clicks
+      // all landed on the previously opened conversation). Same reasoning for
+      // the resume env above: a headless bridge that never boot-resumed still
+      // carries ZCODE_ACP_RESUME_SESSION, and the next session/new on it
+      // would be served as a load of the old conversation.
       env.ZCODE_ACP_RESUME_SESSION = randomUUID();
       env.ZCODE_ACP_BOOT_CREATE_SESSION = "1";
       // Same banner handshake as resume: the auto-submitted trigger drops
@@ -1473,22 +1743,10 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       // never churns when the bridge takes over the script's initial printf.
       env.ZCODE_ACP_TAB_TITLE = sessionTabTitle(tabTitle, workspacePath);
     }
-    // Desktop Presence (amendment to ADR-0016): while the desktop app is
-    // present — a proxied connection, the request's own identity header, or a
-    // stamped call within the presence TTL (see desktopPresence) —
-    // session-create AND resume incubate in the headless serve form: the
-    // desktop app is the presenting surface, so a terminal window would
-    // re-render the same stream for nobody (a resume's window was ADR-0017's
-    // mobile surface; a desktop-originated resume loads the session itself
-    // after attach). Equivalent to the exhausted-terminal-list fallback: the
-    // launch list is empty, so openNextTerminal yields to the detached serve
-    // spawn at once. The verdict was taken at the endpoint, once per request.
-    // The listing was already headless; `ZCODE_ACP_HUB_TERMINAL=0` stays the
-    // static variant.
-    const desktopPresent = (kind === "tui" || kind === "resume") && desktop !== null;
+    // Desktop Presence already decided above (before the boot env, which it
+    // gates); warn here because the daemon's stderr is null in production, so
+    // the diary is the only place this state change is observable.
     if (desktopPresent) {
-      // warn (not log): the daemon's stderr is null in production, so the
-      // diary is the only place this state change is observable.
       warn(
         `hub: desktop app present (${desktop}) — incubating ${workspacePath} headless (Desktop Presence)`,
       );
@@ -1588,9 +1846,21 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     const preexisting = new Set<string>(
       kind === "serve" ? [] : findServeInstances(workspacePath).map((e) => e.id),
     );
+    // A "serve" incubation exists to ensure a bridge that can serve NEW work,
+    // so a registration running code older than the disk does NOT satisfy it:
+    // without this, the stale bridge the caller deliberately skipped answers
+    // its own replacement's poll (the "accept any live registration" rule
+    // below) and the fresh spawn is wasted — the reported "new session, old
+    // model list" bug would survive the fix. Read once: a rebuild landing
+    // mid-incubation is not this poll's business.
+    const spawnDisk = kind === "serve" ? await diskCodeNow() : null;
+    const acceptable = (e: InstanceEntry): boolean =>
+      spawnDisk === null || !bridgeRunsStaleCode(e, spawnDisk);
     for (;;) {
       await new Promise<void>((resolve) => setTimeout(resolve, SERVE_REGISTER_POLL_MS).unref?.());
-      const candidates = findServeInstances(workspacePath).filter((e) => !preexisting.has(e.id));
+      const candidates = findServeInstances(workspacePath).filter(
+        (e) => !preexisting.has(e.id) && acceptable(e),
+      );
       const entry = candidates.find((e) => e.nonce === nonce) ?? candidates.find((e) => !e.nonce);
       if (entry) return { id: entry.id, reused: false };
       // The child dying is the honest fast-fail (missing cwd perms, port
@@ -1611,7 +1881,11 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         // own and is merely closable (ADR-0014 semantics unchanged — the
         // headless serve spawn is already the documented no-GUI fallback).
         if (kind === "tui") {
-          const fallback = findServeInstance(workspacePath);
+          // Prefer a bridge on the current code — this create is about to be
+          // handed to it, and an old one would serve old handlers/model lists.
+          const fallback =
+            (await pickServeForNewWork(workspacePath)) ??
+            findServeInstances(workspacePath).find((e) => e.unhealthySince === undefined);
           if (fallback) {
             warn(
               `hub: TUI for ${workspacePath} slow to register — ` +
@@ -1803,6 +2077,28 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
 
   server.on("upgrade", (req, socket, head) => {
     const url = new URL(req.url ?? "/", "http://127.0.0.1");
+    // Remote Terminal relay (app ADR-0011): both endpoints authenticate like
+    // every WS route (Bearer header or ?token= — browser WS can only do query).
+    if (url.pathname === "/api/desktop-control" || url.pathname === "/api/terminals/ws") {
+      if (!authorized(req, url, token)) {
+        rejectUpgrade(socket, 401, "Unauthorized");
+        return;
+      }
+      if (url.pathname === "/api/desktop-control" && !requestIsDesktopClient(req)) {
+        // Browser WS cannot set custom headers, so only the native workbench
+        // client can present the desktop identity — a phone cannot park in
+        // the carrier seat (the token remains the actual gate either way).
+        rejectUpgrade(socket, 403, "Forbidden");
+        return;
+      }
+      terminalRelay.handleUpgrade(
+        req,
+        socket,
+        head,
+        url.pathname === "/api/desktop-control" ? "control" : "client",
+      );
+      return;
+    }
     if (url.pathname !== "/acp") {
       rejectUpgrade(socket, 404, "Not Found");
       return;
@@ -1961,6 +2257,11 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           startedAt: e.startedAt,
           workspace: e.workspace,
           origin: e.origin,
+          // Code identity (absent on bridges older than the fingerprint
+          // protocol): lets a client see which instances a fresh spawn would
+          // NOT match, i.e. why a new conversation landed on a new id.
+          ...(e.version !== undefined ? { version: e.version } : {}),
+          ...(e.codeFingerprint !== undefined ? { codeFingerprint: e.codeFingerprint } : {}),
           sessions: e.sessions.filter((s) => winners.get(s.sessionId)?.instance === e),
         }));
       res.writeHead(200, { "Content-Type": "application/json" });
@@ -2158,6 +2459,13 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
     // bytes; a NEW session in that project re-adds a fresh row and the
     // project reappears — a hide, not a ban. Idempotent: 0 rows flipped is
     // still ok (already deleted / never known).
+    //
+    // `{"purge": true}` (machine-armed via delete.purge config / env, #376):
+    // after tombstoning, physically destroy each session's bytes through a
+    // serve bridge's v4 deletion face — the same per-session handler the
+    // instance delete proxy uses. The tombstones apply first regardless, so
+    // a failed/unavailable purge degrades to the plain soft delete (reported
+    // per id in `skipped`, never as a failed request).
     if (url.pathname === "/api/projects/delete" && req.method === "POST") {
       if (!authorized(req, url, token)) {
         res.writeHead(401, { "Content-Type": "text/plain" });
@@ -2172,9 +2480,80 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         res.end("workspacePath required");
         return;
       }
+      const purge = (body as { purge?: unknown } | undefined)?.purge === true;
+      if (purge && !hardDeleteArmed()) {
+        res.writeHead(403, { "Content-Type": "text/plain" });
+        res.end(
+          "purge disabled — arm it via delete.purge in the user config or ZCODE_ACP_DELETE_PURGE=1",
+        );
+        return;
+      }
       const deletedTasks = await softDeleteWorkspaceTasks(workspacePath, projectsDbPath);
+      // One purge request bounds its relay fan-out; ids past the cap stay
+      // tombstoned and are REPORTED as skipped — a silent truncation would
+      // read as "bytes destroyed" for sessions nobody purged.
+      const PURGE_REQUEST_CAP = 200;
+      const allIds = purge ? await workspaceTaskIds(workspacePath, projectsDbPath) : [];
+      const ids = allIds.slice(0, PURGE_REQUEST_CAP);
+      const overflowSkipped = allIds.slice(PURGE_REQUEST_CAP).map((id) => ({
+        id,
+        reason: `purge request cap (${PURGE_REQUEST_CAP}) — re-issue to continue`,
+      }));
+      if (!purge || ids.length === 0) {
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(
+          JSON.stringify({ ok: true, deletedTasks, ...(purge ? { purged: [], skipped: [] } : {}) }),
+        );
+        return;
+      }
+      // Same serve-bridge selection order as the history listing (fresh →
+      // incubate → any healthy): the v4 deletion face runs on the bridge's
+      // backend, and the hub is only a byte proxy with no backend of its own.
+      let entry = await pickServeForNewWork(workspacePath);
+      if (!entry) {
+        try {
+          const incubated = await joinIncubation(workspacePath, "serve");
+          entry =
+            instances.get(incubated.id) ??
+            findServeInstances(workspacePath).find((x) => x.unhealthySince === undefined);
+        } catch (e) {
+          warn(`hub: purge incubation failed: ${e instanceof Error ? e.message : String(e)}`);
+          entry = findServeInstances(workspacePath).find((x) => x.unhealthySince === undefined);
+        }
+      }
+      if (!entry) {
+        // Tombstones already applied — partial success, not a failure: the
+        // client may re-issue the purge once a serve bridge exists.
+        res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
+        res.end(
+          JSON.stringify({
+            ok: true,
+            deletedTasks,
+            purged: [],
+            skipped: ids.map((id) => ({ id, reason: "no serve bridge" })),
+            warning: "tombstones applied; no serve bridge available for the purge",
+          }),
+        );
+        return;
+      }
+      const target = entry;
+      const purged: string[] = [];
+      const skipped: Array<{ id: string; reason: string }> = [...overflowSkipped];
+      let next = 0;
+      // Bounded fan-out: 4 concurrent relays is enough throughput for the
+      // per-id preview→execute round-trips without hammering one backend.
+      const workers = Array.from({ length: Math.min(4, ids.length) }, async () => {
+        while (next < ids.length) {
+          const id = ids[next++]!;
+          const out = await relaySessionPurge(target.port, id);
+          if (out === null) skipped.push({ id, reason: "bridge unreachable" });
+          else if (out.purged) purged.push(id);
+          else skipped.push({ id, reason: out.reason ?? "not purged" });
+        }
+      });
+      await Promise.all(workers);
       res.writeHead(200, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      res.end(JSON.stringify({ ok: true, deletedTasks }));
+      res.end(JSON.stringify({ ok: true, deletedTasks, purged, skipped }));
       return;
     }
     // GET /api/projects/sessions?workspacePath=… — the project's backend
@@ -2230,14 +2609,30 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         return;
       }
       try {
-        let entry = findServeInstance(workspacePath);
+        // The listing is the client's entry point: it browses history here and
+        // then attaches/resumes into the instance id it got back, so the
+        // preferred target is a bridge running the CURRENT code. A stale-only
+        // workspace therefore incubates a fresh one (that is the whole point
+        // of the reuse check) instead of pinning every later attach to the
+        // old process. Order: fresh → incubate → any healthy (spawn failed:
+        // showing history from an old bridge still beats 502ing).
+        let entry = await pickServeForNewWork(workspacePath);
         if (!entry) {
           // "serve": a background listing must not pop a terminal window
           // (ADR-0015) — only session-create does (ADR-0016). joinIncubation
           // makes concurrent listings (and a listing racing a create) share
-          // one spawn instead of doubling bridges.
-          await joinIncubation(workspacePath, "serve");
-          entry = findServeInstance(workspacePath);
+          // one spawn instead of doubling bridges. The incubation's OWN id is
+          // the target — re-looking-up with findServeInstance would name the
+          // stale bridge again (it sorts oldest-first).
+          try {
+            const incubated = await joinIncubation(workspacePath, "serve");
+            entry =
+              instances.get(incubated.id) ??
+              findServeInstances(workspacePath).find((x) => x.unhealthySince === undefined);
+          } catch (e) {
+            warn(`hub: listing incubation failed: ${e instanceof Error ? e.message : String(e)}`);
+            entry = findServeInstances(workspacePath).find((x) => x.unhealthySince === undefined);
+          }
         }
         if (!entry) {
           throw new Error("serve bridge did not register");
@@ -2367,13 +2762,16 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       // duplicate, the status quo before this reuse.
       const desktop = desktopPresence(req);
       if (desktop) {
+        // A resume must still land on the bridge that holds the conversation
+        // LIVE, stale code or not: two bridges loading one session is a
+        // double-write. Only NEW work (a create, or a resume of an idle
+        // conversation) takes the staleness check.
         const holder = resumeSid
           ? Array.from(instances.values()).find((e) =>
               e.sessions.some((s) => s.sessionId === resumeSid),
             )
           : undefined;
-        const live =
-          holder ?? findServeInstances(workspacePath).find((e) => e.unhealthySince === undefined);
+        const live = holder ?? (await pickServeForNewWork(workspacePath));
         if (live) {
           // warn (not log): the diary is the only place this decision is
           // observable on the detached daemon (the phone's create that
@@ -2600,6 +2998,36 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
         res.writeHead(403, { "Content-Type": "text/plain" });
         res.end("instance was not incubated remotely (editor bridge) — refusing shutdown");
         return;
+      }
+      // Retirement BEFORE the kill (ADR-0006 hardening, 2026-10-29): the
+      // remote shutdown gesture is "close everything this instance hosts",
+      // not just "kill the pid". Killing alone leaves no retirement memory
+      // anywhere, and an auto reconnect ladder re-incubates the workspace and
+      // resurrects what the user closed — the same hole the durable close
+      // record fixed for per-session close (2026-10-28), reached via the
+      // shutdown route old clients still use. Relay the bridge's own close
+      // route per advertised session ({force:true} — the gesture is "end
+      // it", so an in-flight turn is cancelled instead of refusing), which
+      // runs discovery retirement, the durable close record, and the
+      // session_closed fan-out (martty drops its tab cleanly), and answers
+      // EVERY id spelling of each conversation. A wedged or older bridge
+      // falls back to hub-side stamps on the advertised spelling; the
+      // tombstone still 409s the auto resume ladder, and the idempotent
+      // durable write below covers bridges that predate the record.
+      const advertisedSids = entry.sessions
+        .map((s) => s.sessionId)
+        .filter((sid) => typeof sid === "string" && sid.length > 0);
+      if (advertisedSids.length > 0) {
+        const relays = await Promise.all(
+          advertisedSids.map(async (sid) => (await relayShutdownClose(entry.port, sid)) ?? [sid]),
+        );
+        const spellings = [...new Set(relays.flat())];
+        stampClosedSession(spellings);
+        recordClosedSessionIds(spellings);
+        log(
+          `hub: instance ${entry.id} shutdown — retired ${advertisedSids.length} session(s), ` +
+            `${spellings.length} id spelling(s) stamped`,
+        );
       }
       // TUI-incubated instance: the registered bridge is only the LEAF of the
       // window's tree (cli → martty → bridge); killing it alone leaves the
@@ -2856,6 +3284,14 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
           ...(typeof body.tuiPid === "number" && Number.isInteger(body.tuiPid) && body.tuiPid > 1
             ? { tuiPid: body.tuiPid }
             : {}),
+          // Code identity for the reuse staleness check
+          // (bridgeRunsStaleCode). A
+          // re-registration refreshes it: the value is frozen in the bridge's
+          // process, so it only ever changes when the process does.
+          ...(typeof body.version === "string" ? { version: body.version } : {}),
+          ...(typeof body.codeFingerprint === "string"
+            ? { codeFingerprint: body.codeFingerprint }
+            : {}),
         });
         // A registration advertising a tombstoned session again is fresh
         // evidence the session is genuinely alive (a client resumed it and
@@ -3028,7 +3464,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       }
       if (idleSince === null) idleSince = Date.now();
       if (Date.now() - idleSince >= idleExitMs) {
-        if (stayAliveCheck()) {
+        if (stayAlive()) {
           log("hub: idle with no instances, but remote is still enabled — staying resident");
           idleSince = Date.now();
           return;
@@ -3050,6 +3486,7 @@ export function startHub(options: HubOptions & { onIdleExit?: () => void }): Pro
       bridge.terminate();
     }
     proxyPairs.clear();
+    terminalRelay.close();
     wss.close();
     server.closeAllConnections?.();
     await new Promise<void>((resolve) => server.close(() => resolve()));

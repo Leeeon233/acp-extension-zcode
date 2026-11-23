@@ -468,21 +468,43 @@ Session state update (usage, etc.).
 ### Steer lifecycle events
 
 When a user input is steered into (queued behind) a running turn, the backend
-emits a pair of lifecycle events (app-server 0.15.2+). The bridge does
-not currently translate these — they are tracked as a future enhancement (see
-[`BACKLOG.md`](./BACKLOG.md)).
+emits a pair of lifecycle events (app-server 0.15.2+). Every drained input is
+a persisted USER message upstream, so the bridge mirrors
+`turn.steerDrained`'s `drainedInputs[].text` to the clients as
+`user_message_chunk` notifications (`echoSteeredInputs`): from the turn loop
+while one is live, and from the session-scoped background listener otherwise
+(gated on `pendingTurns`, so the two paths never double-echo). Clients that
+STEERED via `_session/steering` are excluded from the echo
+(`steerEchoSuppressedRoots` — they render the injected text locally, e.g.
+martty keeps its Send Now cell, and would see it twice); backend-internal
+guides (plan-approval feedback, workflow refine) have no steering client and
+echo to everyone. `turn.steerQueued`
+feeds the steer-swallow guard (a send accepted mid-generation is queued and
+silently dropped when the turn ends — reported to the user at once) but has no
+live "queued" indicator yet (see [`BACKLOG.md`](./BACKLOG.md)).
 
 ```json
 {
   "type": "turn.steerQueued",
-  "payload": {}
+  "payload": {
+    "pendingInputId": "…",
+    "inputPreview": "…",
+    "delivery": "queue",
+    "targetTurnId": "…",
+    "queueLength": 1
+  }
 }
 ```
 
 ```json
 {
   "type": "turn.steerDrained",
-  "payload": {}
+  "payload": {
+    "pendingInputIds": ["…"],
+    "targetTurnId": "…",
+    "injectedMessageIds": ["…"],
+    "drainedInputs": [{ "pendingInputId": "…", "messageId": "…", "text": "…" }]
+  }
 }
 ```
 
@@ -725,16 +747,67 @@ Fork a new session from a checkpoint.
 }
 ```
 
-### `session/rewind` — removed in 0.16+
+### `session/edit_user_message` / `session/retry_turn` — rewind extensions
 
-`session/rewind` (and `session/rewindCascade`) existed up to app-server
-0.15.x. The 0.16 app-server removed them from its RPC dispatch (verified
-against 0.16.3: `-32601 Method not found`) — rewind moved to the v4
-conversation API (`v4/conversation/fileRewindPreview` and friends), which the
-bridge does not speak. The bridge's `session/rewind` /
-`session/rewindCascade` ACP extensions and the `/rewind` slash command were
-removed accordingly. `session/fork` (branch from checkpoint) remains the
-bridge-side alternative.
+Edit-and-resend of the latest user message, and regenerate of the latest
+turn, mapped onto the v4 conversation commands `editUserQuery` / `retryTurn`.
+The old v3 `session/rewind` (and `session/rewindCascade`) existed up to
+app-server 0.15.x; the 0.16 app-server removed them in favor of the v4
+conversation API, and these two methods are that API's ACP surface.
+
+**Capability:** `initialize` advertises `agentCapabilities._meta.zcode.rewind:
+true` when the desktop bundle is at/above the source-verified floor (3.14.3 —
+the v4 rewind command set and `v4/conversation/rowsRange` predate that tag).
+Below the floor the key is ABSENT (not `false`); the methods then answer a
+clean error. Clients should hide edit/regenerate when the flag is missing and
+degrade to quote-to-composer.
+
+**Request (`edit`):**
+
+```json
+{
+  "id": 8,
+  "method": "session/edit_user_message",
+  "params": {
+    "sessionId": "sess_abc123",
+    "messageId": "<_meta.zcode.mid of the user message>",
+    "newText": "replacement text"
+  }
+}
+```
+
+**Request (`retry`; `messageId` optional — omitted retries the latest turn):**
+
+```json
+{
+  "id": 9,
+  "method": "session/retry_turn",
+  "params": { "sessionId": "sess_abc123", "messageId": "<_meta.zcode.mid of the assistant message>" }
+}
+```
+
+**Result** (both): `{ "ok": true, "rewoundMessageId": "<the mid that was rewound>" }`
+
+Semantics:
+
+- Only the latest turn is addressable (upstream guards `latestQueryEditOnly`
+  / `latestAssistantRetryOnly`); a stale/non-matching `messageId` answers
+  `-32602` before any backend round trip. Workspace files are never touched
+  (`workspaceMode: "preserve"` always — file rewind stays a desktop-app concern).
+- The ack returns at ADMISSION: the rewound history is already committed, and
+  the replacement turn runs next. Clients should refetch history
+  (`session/load`) on the ack; the replacement turn itself streams to every
+  attached client as `agent_message_chunk` updates, and the session reports
+  busy (`$/zcode/turnState`) until it terminates.
+- Other clients' cached tails are stale until their next replay (v1: single
+  user, edit happens on the viewed client).
+
+**`_meta.zcode.mid`:** every REPLAYED update that renders as a message
+(`user_message_chunk`, `agent_message_chunk`, `agent_thought_chunk`, and
+replayed `tool_call`s) carries `_meta: { zcode: { mid: "<store message id>" } }`
+on both `session/load` and `session/load_earlier` pages — the value the
+rewind methods address (it equals the store row's v4 `entityId`). Live echo
+chunks (`uprompt_`/`chunk_` ids) deliberately do NOT carry it.
 
 ### `session/goal`
 
@@ -780,6 +853,51 @@ steering moved to the v4 command/conversation API. The bridge's
 `session/steer` ACP extension and the `/steer` slash command were removed
 accordingly. Queued inputs still surface as `turn.steerQueued` /
 `turn.steerDrained` events (see above).
+
+### `_session/steering` — cross-adapter steering extension (#352)
+
+The successor, wired onto the v4 command API (`v4/command` `sendText` with
+`requestedDelivery:"guide" | "queue"`). The method name and reply shape follow
+the cross-adapter convention introduced by `@agentclientprotocol/codex-acp`
+and `@agentclientprotocol/claude-agent-acp`; the agent advertises it via
+`InitializeResponse._meta.steering` (`{ supported: true, timings: ["now",
+"next"] }` — `timings` is this bridge's additive field).
+
+**Request:**
+
+```json
+{
+  "id": 14,
+  "method": "_session/steering",
+  "params": {
+    "sessionId": "sess_abc123",
+    "prompt": [{ "type": "text", "text": "use the other approach" }],
+    "_meta": { "steering": { "priority": "now" } }
+  }
+}
+```
+
+- `prompt` — text blocks only (multi-block joins with newlines); the v4 steer
+  channel carries no attachments.
+- `_meta.steering.priority` — `"now"` (default) injects into the live turn
+  (guide); `"next"` queues the text for the next turn boundary.
+- `_meta.steering.idleBehavior` — only `"promptRequired"` is accepted; this
+  bridge never auto-starts a turn from a steering request.
+
+**Reply** — one outcome object:
+
+- `{ "outcome": "injected" }` — the text joined the running turn.
+- `{ "outcome": "queued" }` — delivered at the next boundary (explicit `next`,
+  or the backend demoted guide to queue because the turn kind cannot take
+  live injection).
+- `{ "outcome": "promptRequired", "reason": "noRunningTurn" }` — the session
+  is idle; the client should send a normal `session/prompt` instead.
+- `{ "outcome": "startedNewTurn" }` — the turn ended between the bridge's
+  liveness check and the backend's admission, and the steer text started a
+  new turn (race window, reported honestly).
+
+Steering a turn owned by another client (the desktop app) works — the liveness
+fallback reads the session projection when no bridge turn is registered.
 
 ### `session/setMode`
 
@@ -1009,13 +1127,34 @@ The bridge's session-scoped `SessionTitleListener` (registered alongside the
 background-task listener) adopts `generated` and `custom` pushes — updating
 `sessionTitles` for every ACP alias of the conversation, the session summary,
 the tasks-index, the martty terminal tab title, and broadcasting an ACP
-`session_info_update` to attached clients per alias. A manual rename wins:
-sessions renamed through the bridge's remote rename endpoint (or adopted via
-a `custom` push) are pinned in `server.titleUserSetBy`, and the durable
-`title_overridden` flag in `tasks-index.sqlite` is consulted for renames that
-predate the bridge process — later `generated` pushes never override them.
-`default`/`first_input` pushes are ignored — the bridge already seeds the
-first-prompt form itself (see "one-shot session title" in the handlers).
+`session_info_update` to attached clients per alias.
+
+Auto naming happens **exactly once**: the first-prompt provisional seed may be
+replaced by the first `generated` push (`server.autoTitleFinalized` freezes the
+phase after it); every later `generated` push — a deferred sidecar result, the
+resume re-emission after the stored title event rotated out of the retention
+window — is ignored. Only a manual rename may change the title afterwards: the
+`/rename` slash command, the remote rename endpoint, or a `custom` push
+(another surface's rename, e.g. the desktop app). Manual renames are pinned in
+`server.titleUserSetBy` (all aliases), and the durable `title_overridden` flag
+in `tasks-index.sqlite` is consulted for renames that predate the bridge
+process — later `generated` pushes never override them. `default`/
+`first_input` pushes are ignored — the bridge already seeds the first-prompt
+form itself (see "one-shot session title" in the handlers).
+
+A manual rename also reaches the BACKEND store via the v4 `renameSession`
+command (`titleSource=custom`, sticky — the backend's own auto generation is
+skipped from then on), so `session/list` reads, resume title re-emission, and
+the desktop app's v4 projection all converge on the user's title.
+`adoptStoredTitle` (load/resume) is pin-first: a sibling alias's known title,
+then the durable `title_overridden` title, and only then the backend's stored
+title (asked `session/list {sessionIds:[id]}` — the bare listing is only the
+50 most recent sessions across all workspaces, so older conversations need the
+by-id lookup; backends that reject the key fall back to the bare listing).
+The `/resume` slash command additionally broadcasts the adopted title as a
+`session_info_update`: editors derive a thread title from the first prompt —
+which for an adopting thread is the `/resume` command itself — and only a
+pushed title replaces that provisional name.
 
 ### `session/cancelBackgroundTask`
 

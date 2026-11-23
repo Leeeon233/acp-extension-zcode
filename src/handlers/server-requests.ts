@@ -47,7 +47,15 @@ import {
   splitAskUserQuestions,
   zcodePermissionToAcp,
 } from "../interaction/adapter.js";
-import { codingPlanRequestAuthFor } from "../config/account-provider.js";
+import {
+  codingPlanRequestAuthFor,
+  oauthProjectTokenFamilyFor,
+  startPlanRequestAuthFor,
+  storeStartPlanJwt,
+} from "../config/account-provider.js";
+import { credentialCipherOp } from "../backend/credential-store.js";
+import { resolveOfficialMcpAuthHeaders } from "../config/official-mcp-auth.js";
+import { ProjectTokenError, resolveOAuthProjectToken } from "../config/project-token.js";
 import { buildConfigOptions, buildModes } from "../config/options.js";
 import { interactionTimeoutMs } from "../config/settings.js";
 import { messages } from "../i18n.js";
@@ -391,6 +399,45 @@ async function handleOne(
     return;
   }
 
+  if (isOfficialMcpAuthHeadersRequest(method)) {
+    answerOfficialMcpAuthHeaders(backend, zcodeReqId, method, params as Record<string, unknown>);
+    return;
+  }
+
+  if (method === "interaction/requestCredentialCipher") {
+    // The CLI delegates credential encrypt/decrypt to its host when the store
+    // is v2 (OS keyring, unreadable without the keyring key) — serve both ops
+    // via the same @napi-rs/keyring entry the CLI's own keyStore uses. The CLI
+    // correlates replies by requestId over a strict zod schema
+    // ({requestId, result:{ok,…}}) and treats anything else as an invalid
+    // payload, so the reply MUST echo the requestId and nest the outcome.
+    const op = (params as { requestId?: unknown; operation?: unknown; value?: unknown }) ?? {};
+    const requestId = typeof op.requestId === "string" ? op.requestId : "";
+    if (!requestId) {
+      warn("  ⚠ credential cipher: ask without requestId — declining");
+      sendZcodeError(backend, zcodeReqId, "credential cipher request missing requestId");
+      return;
+    }
+    const out = credentialCipherOp(String(op.operation ?? ""), String(op.value ?? ""));
+    if (out !== null) {
+      log("  credential cipher: served a " + String(op.operation ?? "?") + " op");
+      sendZcodeReply(backend, zcodeReqId, { requestId, result: { ok: true, value: out } });
+    } else {
+      warn("  ⚠ credential cipher: no OS-keyring key — declining");
+      sendZcodeReply(backend, zcodeReqId, {
+        requestId,
+        result: {
+          ok: false,
+          error: {
+            code: "CREDENTIAL_SECURE_STORAGE_UNAVAILABLE",
+            message: "System credential storage is unavailable on the bridge host",
+          },
+        },
+      });
+    }
+    return;
+  }
+
   if (!perm && !(isUserInputRequestUnchecked(method) && (epm || ask))) {
     warn(`  ⚠ unhandled server→client request: ${method} (id=${zcodeReqId})`);
     sendZcodeError(backend, zcodeReqId, `bridge unsupported: ${method}`);
@@ -533,6 +580,40 @@ async function settleOrphan(
     }
     if (isProviderRuntimeHeadersRequest(req.method)) {
       answerProviderRuntimeHeaders(backend, req.id, req.method, params);
+      return;
+    }
+    if (isOfficialMcpAuthHeadersRequest(req.method)) {
+      answerOfficialMcpAuthHeaders(backend, req.id, req.method, params);
+      return;
+    }
+    if (req.method === "interaction/requestCredentialCipher") {
+      // Arrival-time path (no active turn loop): the CLI asks mid-boot for its
+      // credential ops — serve the same way (requestId-correlated reply), no
+      // session needed.
+      const op = (params as { requestId?: unknown; operation?: unknown; value?: unknown }) ?? {};
+      const requestId = typeof op.requestId === "string" ? op.requestId : "";
+      if (!requestId) {
+        warn("  ⚠ credential cipher (arrival): ask without requestId — declining");
+        sendZcodeError(backend, req.id, "credential cipher request missing requestId");
+        return;
+      }
+      const out = credentialCipherOp(String(op.operation ?? ""), String(op.value ?? ""));
+      if (out !== null) {
+        log("  credential cipher (arrival): served a " + String(op.operation ?? "?") + " op");
+        sendZcodeReply(backend, req.id, { requestId, result: { ok: true, value: out } });
+      } else {
+        warn("  ⚠ credential cipher (arrival): no OS-keyring key — declining");
+        sendZcodeReply(backend, req.id, {
+          requestId,
+          result: {
+            ok: false,
+            error: {
+              code: "CREDENTIAL_SECURE_STORAGE_UNAVAILABLE",
+              message: "System credential storage is unavailable on the bridge host",
+            },
+          },
+        });
+      }
       return;
     }
     if (isPermissionRequest(req.method) && isSessionAlwaysTool(`${params["toolName"] ?? ""}`)) {
@@ -1323,6 +1404,36 @@ function isProviderRuntimeHeadersRequest(method: string): boolean {
   return method === "interaction/requestProviderRuntimeHeaders";
 }
 
+/** Whether `method` is the official plugin MCP identity-headers request. */
+function isOfficialMcpAuthHeadersRequest(method: string): boolean {
+  return method === "interaction/requestOfficialMcpAuthHeaders";
+}
+
+/**
+ * Answer an `interaction/requestOfficialMcpAuthHeaders` request.
+ * Logs carry only non-sensitive metadata (plugin name, key, status) — never
+ * any token value.
+ */
+export function answerOfficialMcpAuthHeaders(
+  backend: ZcodeBackend,
+  reqId: number | string,
+  method: string,
+  params: Record<string, unknown>,
+): boolean {
+  if (!isOfficialMcpAuthHeadersRequest(method)) return false;
+  const outcome = resolveOfficialMcpAuthHeaders(params);
+  const pluginId = typeof params.pluginId === "string" ? params.pluginId : "unknown";
+  const mcpKey = typeof params.mcpKey === "string" ? params.mcpKey : "plugin-command";
+  if (outcome.ok) {
+    const headerNames = Object.keys(outcome.headers).sort().join(", ");
+    log(`  official MCP auth headers: served [${headerNames}] for ${pluginId}:${mcpKey}`);
+  } else {
+    warn(`  ⚠ official MCP auth headers unavailable for ${pluginId}:${mcpKey} (${outcome.reason})`);
+  }
+  sendZcodeReply(backend, reqId, outcome);
+  return true;
+}
+
 /**
  * Answer an `interaction/requestProviderRuntimeHeaders` request; returns false
  * when `method` is not that request (caller keeps its own handling).
@@ -1350,23 +1461,77 @@ export function answerProviderRuntimeHeaders(
   // (observed 2026-09-17: switch stuck, every send died with "unknown").
   const sel = (params as { modelSelection?: { providerId?: string }; providerId?: string })
     .modelSelection?.providerId;
-  const requestAuth = codingPlanRequestAuthFor(
-    sel ?? (params as { providerId?: string }).providerId,
-  );
+  const providerId = sel ?? (params as { providerId?: string }).providerId;
+  const requestAuth = codingPlanRequestAuthFor(providerId);
   if (requestAuth) {
     log("  provider runtime headers: serving the coding-plan API key (config.json or store)");
     sendZcodeReply(backend, reqId, { headersApplied: true, requestAuth });
     return true;
   }
-  // Start Plan providers (zcode-plan endpoints) ask their host to solve an
-  // Aliyun captcha and inject X-Aliyun-Captcha-Verify-* headers before every
-  // model request; the desktop renderer does this from a browser environment.
-  // The headless bridge has neither a browser nor the captcha credential, so
-  // the only honest answer is headersApplied:false — the backend then fails
-  // with its -32031 error carrying our message. Without this, the request
-  // fell through to the generic unsupported-request error and the backend
-  // fell back to client signing with the provider's OAuth JWT, dying with the
-  // misleading "must contain one separator" invalid-config error (#123).
+  // 3.15+ desktop layouts store no plan key at all: the desktop host trades
+  // its OAuth sign-in for a short-lived project access token before every
+  // request. Do the same exchange (project-token.ts) and answer once it
+  // settles — the backend waits for this reply, so answering asynchronously
+  // is what the desktop does too.
+  const oauthFamily = oauthProjectTokenFamilyFor(providerId);
+  if (oauthFamily) {
+    const recovery = params as {
+      rejectedProjectTokenFingerprint?: unknown;
+      expectedAccountScope?: unknown;
+    };
+    const asString = (value: unknown) => (typeof value === "string" ? value : undefined);
+    void resolveOAuthProjectToken(oauthFamily, {
+      rejectedFingerprint: asString(recovery.rejectedProjectTokenFingerprint),
+      expectedAccountScope: asString(recovery.expectedAccountScope),
+    }).then(
+      (material) => {
+        log("  provider runtime headers: serving an OAuth-derived project token");
+        // accountScope enables the backend's one-shot "PAT rejected → refresh
+        // → retry" recovery after a model 401 (account-request-retry.ts).
+        sendZcodeReply(backend, reqId, {
+          headersApplied: true,
+          requestAuth: {
+            apiKey: material.token,
+            apiKeyId: material.apiKeyId,
+            accountScope: material.accountScope,
+          },
+        });
+      },
+      (error: unknown) => {
+        const code =
+          error instanceof ProjectTokenError ? error.code : "project_token_request_failed";
+        warn(`  ⚠ provider runtime headers: project token exchange failed (${code})`);
+        sendZcodeReply(backend, reqId, {
+          headersApplied: false,
+          errorMessage: projectTokenUnavailableMessage(code),
+        });
+      },
+    );
+    return true;
+  }
+  const startPlanAuth = startPlanRequestAuthFor(providerId);
+  if (startPlanAuth) {
+    log("  provider runtime headers: serving the Start Plan JWT (store or config.json)");
+    sendZcodeReply(backend, reqId, { headersApplied: true, requestAuth: startPlanAuth });
+    return true;
+  }
+  // CLI 0.17.1 sends this ask WITHOUT a providerId: the backend needs a
+  // credential before it can even attempt a request, but the ask carries no
+  // hint about which plan applies. When the store holds a start-plan login
+  // JWT, serve it — the gateway rejects mismatched plans with a clear
+  // business error, which is strictly better than a hang.
+  if (providerId === undefined) {
+    const jwt = storeStartPlanJwt();
+    if (jwt) {
+      log("  provider runtime headers: serving the Start Plan JWT (no providerId in ask)");
+      sendZcodeReply(backend, reqId, { headersApplied: true, requestAuth: { apiKey: jwt } });
+      return true;
+    }
+  }
+  // Start Plan providers with no local credential (or when upstream requires an
+  // Aliyun captcha session) cannot be answered headlessly — reply
+  // headersApplied:false so the backend fails with its -32031 error carrying
+  // our message instead of falling back to client signing (#123).
   warn(
     "  ⚠ provider runtime headers requested (Start Plan captcha session); " +
       "the headless bridge cannot provide it — declining",
@@ -1386,3 +1551,24 @@ const PROVIDER_RUNTIME_HEADERS_UNAVAILABLE =
   "Start Plan providers require an Aliyun captcha session that only the " +
   "ZCode desktop app can provide. Use a GLM Coding Plan provider for " +
   "headless/editor sessions (see docs/TROUBLESHOOTING.md).";
+
+/**
+ * Reason surfaced when the OAuth project-token exchange fails. `code` is a
+ * fixed `project_token_*` identifier — never a token, id or response body.
+ */
+function projectTokenUnavailableMessage(code: string): string {
+  const hint =
+    code === "project_token_key_missing"
+      ? "Open the ZCode desktop app once so it provisions the account's zcode-api-key"
+      : code === "project_token_login_required" ||
+          code === "project_token_scope_invalidated" ||
+          /^project_token_http_40[13]$/u.test(code)
+        ? "Sign in again in the ZCode desktop app"
+        : code === "project_token_disabled" || code === "project_token_project_unavailable"
+          ? "Check in the ZCode desktop app that the account's Coding Plan is active"
+          : "Retry, or check the network path to the Coding Plan API";
+  return (
+    `Could not obtain a Coding Plan request token from the ZCode sign-in (${code}). ` +
+    `${hint}, or save a key with \`zcode-acp setup\` (see docs/TROUBLESHOOTING.md).`
+  );
+}

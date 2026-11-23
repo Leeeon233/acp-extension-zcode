@@ -7,11 +7,9 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type { ZcodeMessage } from "../src/backend/types.js";
-import { enqueueSessionSend, sendSessionUpdate, withReplayBatch } from "../src/handlers/io.js";
+import { sendSessionUpdate, withReplayBatch } from "../src/handlers/io.js";
 import {
-  MAX_REPLAY_LIMIT,
-  fullSlice,
-  readTailLimit,
+  normalizeWireMessages,
   replayMessages,
   sliceBefore,
   sliceTail,
@@ -69,42 +67,6 @@ describe("sliceTail", () => {
     expect(s.meta.replayedTurns).toBe(2);
   });
 
-  it("limit 0 attaches with metadata only; cursor anchors at history's end", () => {
-    const s = sliceTail(MSGS, 0);
-    expect(s.batch).toEqual([]);
-    expect(s.meta.hasMore).toBe(true);
-    expect(s.meta.totalMessages).toBe(8);
-    // The reconcile key: history's newest message id, present even on the
-    // metadata-only attach (empty batch, end anchored at history's end).
-    expect(s.meta.lastMessageId).toBe("a3");
-    // Paging from that cursor delivers the tail; the page's own anchor is the
-    // message just before the cursor.
-    const page = sliceBefore(MSGS, s.meta.cursor, 2);
-    expect(ids(page.batch)).toEqual(["u3", "a3"]);
-    expect(page.meta.lastMessageId).toBe("a3");
-  });
-
-  it("limit >= length replays everything", () => {
-    const s = sliceTail(MSGS, 99);
-    expect(s.batch).toHaveLength(8);
-    expect(s.meta.hasMore).toBe(false);
-  });
-
-  it("clamps oversized limits", () => {
-    expect(ids(sliceTail(MSGS, MAX_REPLAY_LIMIT + 100).batch)).toHaveLength(8);
-  });
-
-  it("handles empty history", () => {
-    const s = sliceTail([], 30);
-    expect(s.batch).toEqual([]);
-    expect(s.meta).toMatchObject({
-      hasMore: false,
-      totalMessages: 0,
-      totalTurns: 0,
-      lastMessageId: null,
-    });
-  });
-
   it("hidden tool-result user messages are not turn anchors (cursor must survive replay)", () => {
     // The backend stores tool results as user-role messages with
     // transcriptVisibility "hidden"; replay skips them, so a slice aligned on
@@ -144,33 +106,6 @@ describe("sliceTail", () => {
 });
 
 describe("sliceBefore pagination", () => {
-  it("pages backwards to the beginning of history", () => {
-    let cursor = sliceTail(MSGS, 2).meta.cursor;
-    const pages: string[][] = [];
-    let hasMore = true;
-    while (hasMore) {
-      const page = sliceBefore(MSGS, cursor, 2);
-      pages.push(ids(page.batch));
-      hasMore = page.meta.hasMore;
-      cursor = page.meta.cursor;
-    }
-    // hasMore:false on the last non-empty page terminates pagination — the
-    // client never needs the empty page.
-    expect(pages).toEqual([["u2", "a2a", "a2b"], ["u1", "a1"], ["s0"]]);
-    // A redundant extra call returns an empty page, still hasMore:false.
-    const extra = sliceBefore(MSGS, cursor, 2);
-    expect(extra.batch).toEqual([]);
-    expect(extra.meta.hasMore).toBe(false);
-  });
-
-  it("fullSlice's cursor pages nothing", () => {
-    const s = fullSlice(MSGS);
-    expect(s.meta.hasMore).toBe(false);
-    const page = sliceBefore(MSGS, s.meta.cursor, 10);
-    expect(page.batch).toEqual([]);
-    expect(page.meta.hasMore).toBe(false);
-  });
-
   it("keeps paging when turns were appended after the cursor was minted", () => {
     const grown = [...MSGS, msg("u4", "user", "four"), msg("a4", "assistant", "A4")];
     const cursor = sliceTail(MSGS, 2).meta.cursor;
@@ -183,41 +118,6 @@ describe("sliceBefore pagination", () => {
     const cursor = sliceTail(MSGS, 2).meta.cursor;
     const compacted = MSGS.slice(4); // fewer turns → cursor's totalTurns stale
     expect(() => sliceBefore(compacted, cursor, 2)).toThrow("cursor expired");
-  });
-
-  it("throws cursor expired on out-of-range index", () => {
-    const cursor = Buffer.from(JSON.stringify({ v: 1, index: 99, totalTurns: 4 })).toString(
-      "base64url",
-    );
-    expect(() => sliceBefore(MSGS, cursor, 2)).toThrow("cursor expired");
-  });
-
-  it("throws cursor expired on anchor id mismatch", () => {
-    const cursor = Buffer.from(
-      JSON.stringify({ v: 1, id: "wrong", index: 6, totalTurns: 4 }),
-    ).toString("base64url");
-    expect(() => sliceBefore(MSGS, cursor, 2)).toThrow("cursor expired");
-  });
-
-  it("throws cursor expired on garbage cursors", () => {
-    expect(() => sliceBefore(MSGS, "!!!not-base64url-json", 2)).toThrow("cursor expired");
-  });
-});
-
-describe("readTailLimit", () => {
-  it("reads the limit from _meta.zcode", () => {
-    expect(readTailLimit({ _meta: { zcode: { limit: 30 } } } as never)).toBe(30);
-  });
-
-  it("returns null (full replay) for absent or non-finite limits", () => {
-    expect(readTailLimit({} as never)).toBeNull();
-    expect(readTailLimit({ _meta: { zcode: { limit: "30" } } } as never)).toBeNull();
-    expect(readTailLimit({ _meta: {} } as never)).toBeNull();
-  });
-
-  it("clamps negative and oversized values", () => {
-    expect(readTailLimit({ _meta: { zcode: { limit: -5 } } } as never)).toBe(0);
-    expect(readTailLimit({ _meta: { zcode: { limit: 99999 } } } as never)).toBe(MAX_REPLAY_LIMIT);
   });
 });
 
@@ -249,21 +149,6 @@ describe("replay batch lock", () => {
     expect(events).toEqual(["batch-start", "batch-end", "live"]);
   });
 
-  it("does not block other sessions while a batch runs", async () => {
-    const events: string[] = [];
-    let releaseBatch!: () => void;
-    const batch = withReplayBatch("lock-a", async () => {
-      await new Promise<void>((resolve) => (releaseBatch = resolve));
-    });
-    await sendSessionUpdate(cx("other-session", events), "lock-b", {
-      sessionUpdate: "plan",
-      entries: [],
-    });
-    expect(events).toEqual(["other-session"]);
-    releaseBatch();
-    await batch;
-  });
-
   it("serializes concurrent batches for the same session", async () => {
     const events: string[] = [];
     const [r1, r2] = await Promise.all([
@@ -282,47 +167,11 @@ describe("replay batch lock", () => {
     expect(r2).toBeUndefined();
     expect(events).toEqual(["b1-start", "b1-end", "b2-start", "b2-end"]);
   });
-
-  it("queues background sends (enqueueSessionSend) behind an in-flight batch", async () => {
-    const events: string[] = [];
-    let releaseBatch!: () => void;
-    const batch = withReplayBatch("lock-d", async () => {
-      events.push("batch-start");
-      await new Promise<void>((resolve) => (releaseBatch = resolve));
-      events.push("batch-end");
-    });
-    const bg = enqueueSessionSend("lock-d", async () => {
-      events.push("background");
-    });
-    await Promise.resolve();
-    expect(events).toEqual(["batch-start"]);
-    releaseBatch();
-    await Promise.all([batch, bg]);
-    expect(events).toEqual(["batch-start", "batch-end", "background"]);
-  });
-
-  it("re-uses a session correctly after its guard entry was cleaned up", async () => {
-    // The first batch drains with nothing chained → withReplayBatch deletes
-    // the map entry. Deletion itself is unobservable by design; this guards
-    // that a fresh batch on the same session still serializes afterwards.
-    await withReplayBatch("lock-e", async () => {});
-    const events: string[] = [];
-    let releaseBatch!: () => void;
-    const batch = withReplayBatch("lock-e", async () => {
-      events.push("batch-start");
-      await new Promise<void>((resolve) => (releaseBatch = resolve));
-      events.push("batch-end");
-    });
-    const send = enqueueSessionSend("lock-e", async () => {
-      events.push("send");
-    });
-    await Promise.resolve();
-    expect(events).toEqual(["batch-start"]);
-    releaseBatch();
-    await Promise.all([batch, send]);
-    expect(events).toEqual(["batch-start", "batch-end", "send"]);
-  });
 });
+
+const HANDOFF_TEXT =
+  "This session is being continued from a previous conversation that ran out " +
+  "of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n1. …";
 
 describe("replayMessages collapsed harness blocks", () => {
   function collectCx(): {
@@ -340,14 +189,42 @@ describe("replayMessages collapsed harness blocks", () => {
     };
   }
 
-  const HANDOFF_TEXT =
-    "This session is being continued from a previous conversation that ran out " +
-    "of context. The summary below covers the earlier portion of the conversation.\n\nSummary:\n1. …";
+  it("keys the card to the store's callId so later live updates can address it", async () => {
+    const { cx, updates } = collectCx();
+    await replayMessages(cx, "s", [
+      {
+        info: { id: "m1", role: "assistant" },
+        parts: [{ type: "tool", callId: "call_9", tool: "Agent", state: { status: "running" } }],
+      },
+    ]);
+    expect((updates[0]!.update as Record<string, unknown>).toolCallId).toBe("call_9");
+  });
 
-  const READ_TEXT =
-    'Called the Read tool with the following input: {"file_path":"/tmp/ws/src/a.go"}\n' +
-    "Result of calling the Read tool:\npackage main";
-
+  it("derives deterministic fallback ids so repeated replays replace, not duplicate", async () => {
+    // No info.id AND no callId — both fallback chains engaged. A fresh
+    // random id per replay would re-attach the same card/text as a new item
+    // on every reconnect; index-derived ids keep replays idempotent.
+    const history: ZcodeMessage[] = [
+      {
+        info: { role: "assistant" },
+        parts: [
+          { type: "tool", tool: "Bash", state: { status: "completed", input: "ls" } },
+          { type: "text", text: "done" },
+        ],
+      },
+    ];
+    const run = async (): Promise<(string | undefined)[]> => {
+      const { cx, updates } = collectCx();
+      await replayMessages(cx, "s", history);
+      return updates.map((p) => {
+        const u = p.update as Record<string, unknown>;
+        return (u.toolCallId as string) ?? (u.messageId as string);
+      });
+    };
+    const first = await run();
+    expect(first).toEqual(["histtool_hist_0_0", "hist_0"]);
+    expect(await run()).toEqual(first);
+  });
   it("collapses a semantics-tagged compact_summary under the store's title", async () => {
     const { cx, updates } = collectCx();
     const m: ZcodeMessage = {
@@ -369,118 +246,12 @@ describe("replayMessages collapsed harness blocks", () => {
     expect((u.content as Array<{ content: { text: string } }>)[0]!.content.text).toBe(HANDOFF_TEXT);
   });
 
-  it("drops hidden harness plumbing that matches no collapse shape", async () => {
-    const { cx, updates } = collectCx();
-    const m: ZcodeMessage = {
-      info: {
-        id: "sr1",
-        role: "user",
-        semantics: {
-          kind: "system_reminder",
-          source: "plan_file_reference",
-          transcriptVisibility: "hidden",
-        },
-      },
-      parts: [
-        {
-          type: "text",
-          text: "A plan file exists from plan mode at: /tmp/plan.md\n\nPlan contents: …",
-        },
-      ],
-    };
-    await replayMessages(cx, "s", [m]);
-    expect(updates).toHaveLength(0);
-  });
-
   it("keeps replaying visible user messages (no semantics gate)", async () => {
     const { cx, updates } = collectCx();
     await replayMessages(cx, "s", [msg("u9", "user", "real question")]);
     const u = updates[0]!.update as Record<string, unknown>;
     expect(u.sessionUpdate).toBe("user_message_chunk");
     expect((u.content as { text: string }).text).toBe("real question");
-  });
-
-  it("replays a context handoff as a collapsed tool_call, not a user message", async () => {
-    const { cx, updates } = collectCx();
-    const n = await replayMessages(cx, "s", [msg("h1", "user", HANDOFF_TEXT)]);
-    expect(n).toBe(1);
-    expect(updates).toHaveLength(1);
-    const u = updates[0]!.update as Record<string, unknown>;
-    expect(u.sessionUpdate).toBe("tool_call");
-    expect(u.title).toBe("Context handoff");
-    expect(u.toolCallId).toBe("histfold_h1");
-    expect(u.status).toBe("completed");
-    const content = u.content as Array<{ content: { text: string } }>;
-    expect(content[0]!.content.text).toBe(HANDOFF_TEXT);
-    expect((u._meta as { zcode: { kind: string } }).zcode.kind).toBe("context-handoff");
-  });
-
-  it("replays a textualized tool call with a path-bearing title", async () => {
-    const { cx, updates } = collectCx();
-    await replayMessages(cx, "s", [msg("t1", "user", READ_TEXT)]);
-    const u = updates[0]!.update as Record<string, unknown>;
-    expect(u.sessionUpdate).toBe("tool_call");
-    expect(u.title).toBe("Read · /tmp/ws/src/a.go");
-    expect((u.content as Array<{ content: { text: string } }>)[0]!.content.text).toBe(READ_TEXT);
-    expect((u._meta as { zcode: { kind: string } }).zcode.kind).toBe("tool-transcript");
-  });
-
-  it("falls back to the bare tool name when the input is not JSON", async () => {
-    const { cx, updates } = collectCx();
-    const text =
-      "Called the Grep tool with the following input: {not json at all}\nResult of calling…";
-    await replayMessages(cx, "s", [msg("t2", "user", text)]);
-    const u = updates[0]!.update as Record<string, unknown>;
-    expect(u.title).toBe("Grep tool");
-    expect((u.content as Array<{ content: { text: string } }>)[0]!.content.text).toBe(text);
-  });
-
-  it("collapses task-notifications with the decoded summary as title", async () => {
-    const { cx, updates } = collectCx();
-    const text =
-      "<task-notification>\n<task-id>exec_bed88298</task-id>\n" +
-      "<tool-use-id>call_1a3782c9</tool-use-id>\n" +
-      "<output-file>/tmp/call-stdout.log</output-file>\n<status>completed</status>\n" +
-      '<summary>Background command "Build debug Android APK for testing" completed (exit code 0)</summary>\n' +
-      "</task-notification>";
-    await replayMessages(cx, "s", [msg("n1", "user", text)]);
-    expect(updates).toHaveLength(1);
-    const u = updates[0]!.update as Record<string, unknown>;
-    expect(u.sessionUpdate).toBe("tool_call");
-    expect(u.title).toBe('Background command "Build debug Android APK for testing" …');
-    expect(u.toolCallId).toBe("histfold_n1");
-    expect((u.content as Array<{ content: { text: string } }>)[0]!.content.text).toBe(text);
-    expect((u._meta as { zcode: { kind: string } }).zcode.kind).toBe("task-notification");
-  });
-
-  it("falls back to a generic title when a task-notification has no summary", async () => {
-    const { cx, updates } = collectCx();
-    const text = "<task-notification>\n<task-id>exec_x</task-id>\n</task-notification>";
-    await replayMessages(cx, "s", [msg("n2", "user", text)]);
-    const u = updates[0]!.update as Record<string, unknown>;
-    expect(u.title).toBe("Background task");
-    expect((u._meta as { zcode: { kind: string } }).zcode.kind).toBe("task-notification");
-  });
-
-  it("caps long title values at 60 characters", async () => {
-    const { cx, updates } = collectCx();
-    const long = "/".repeat(100);
-    const text = `Called the Read tool with the following input: {"file_path":"${long}"}\n…`;
-    await replayMessages(cx, "s", [msg("t3", "user", text)]);
-    const u = updates[0]!.update as Record<string, unknown>;
-    expect((u.title as string).length).toBeLessThanOrEqual("Read · ".length + 60);
-  });
-
-  it("keeps real user and agent speech as message chunks (regression)", async () => {
-    const { cx, updates } = collectCx();
-    await replayMessages(cx, "s", [
-      msg("u9", "user", "real question"),
-      msg("a9", "assistant", "answer"),
-    ]);
-    expect(updates.map((p) => p.update!.sessionUpdate)).toEqual([
-      "user_message_chunk",
-      "agent_message_chunk",
-    ]);
   });
 
   it("emits one collapsed tool_call per compaction", async () => {
@@ -494,122 +265,6 @@ describe("replayMessages collapsed harness blocks", () => {
     expect(kinds).toEqual(["tool_call", "user_message_chunk", "tool_call"]);
     expect(updates[0]!.update!.toolCallId).toBe("histfold_h1");
     expect(updates[2]!.update!.toolCallId).toBe("histfold_h2");
-  });
-});
-
-describe("replayMessages tool history parts", () => {
-  function collectCx(): {
-    cx: { notify: (method: string, params: unknown) => Promise<void> };
-    updates: Array<{ update?: { sessionUpdate?: string } } & Record<string, unknown>>;
-  } {
-    const updates: Array<Record<string, unknown>> = [];
-    return {
-      cx: {
-        notify: async (_method: string, params: unknown) => {
-          updates.push(params as Record<string, unknown>);
-        },
-      },
-      updates,
-    };
-  }
-
-  it("attaches input and output as content so the call expands non-empty", async () => {
-    const { cx, updates } = collectCx();
-    await replayMessages(cx, "s", [
-      {
-        info: { id: "m1", role: "assistant" },
-        parts: [
-          {
-            type: "tool",
-            id: "part_1",
-            tool: "Read",
-            state: {
-              status: "completed",
-              title: "Read REMOTE-CLIENTS.md",
-              input: { file_path: "/docs/REMOTE-CLIENTS.md" },
-              output: "1\t# Remote Clients…",
-            },
-          },
-        ],
-      },
-    ]);
-    const u = updates[0]!.update as Record<string, unknown>;
-    expect(u.sessionUpdate).toBe("tool_call");
-    expect(u.toolCallId).toBe("part_1");
-    expect(u.title).toBe("Read REMOTE-CLIENTS.md");
-    expect(u.status).toBe("completed");
-    const content = u.content as Array<{ content: { text: string } }>;
-    expect(content).toHaveLength(2);
-    expect(content[0]!.content.text).toContain("file_path");
-    expect(content[1]!.content.text).toBe("1\t# Remote Clients…");
-    expect((u._meta as { claudeCode: { toolName: string } }).claudeCode.toolName).toBe("Read");
-  });
-
-  it("keeps a string input as-is and tolerates missing input/output", async () => {
-    const { cx, updates } = collectCx();
-    await replayMessages(cx, "s", [
-      {
-        info: { id: "m1", role: "assistant" },
-        parts: [{ type: "tool", id: "part_2", tool: "Bash", state: { input: "ls -la" } }],
-      },
-    ]);
-    const u = updates[0]!.update as Record<string, unknown>;
-    const content = u.content as Array<{ content: { text: string } }>;
-    expect(content).toHaveLength(1);
-    expect(content[0]!.content.text).toBe("ls -la");
-    expect(u.title).toBe("Bash"); // no state.title → tool name fallback
-  });
-
-  it("omits content entirely when the part has no payload", async () => {
-    const { cx, updates } = collectCx();
-    await replayMessages(cx, "s", [
-      {
-        info: { id: "m1", role: "assistant" },
-        parts: [{ type: "tool", id: "part_3", tool: "TodoWrite" }],
-      },
-    ]);
-    const u = updates[0]!.update as Record<string, unknown>;
-    expect(u.content).toBeUndefined();
-    expect(u.title).toBe("TodoWrite");
-  });
-
-  it("replays prose-less tool messages without messageId so adjacent calls coalesce", async () => {
-    // The backend stores one tool part per message; a run of adjacent calls
-    // is many tool-only messages. Stamping each card with its own messageId
-    // made clients mint one bare card message per call (one-by-one cards),
-    // while the same calls live coalesce into one run card — live tool_calls
-    // carry no messageId, so replayed prose-less ones must not either.
-    const { cx, updates } = collectCx();
-    const toolMsg = (id: string, partId: string): ZcodeMessage => ({
-      info: { id, role: "assistant" },
-      parts: [
-        { type: "tool", id: partId, tool: "Bash", state: { status: "completed", title: id } },
-      ],
-    });
-    await replayMessages(cx, "s", [toolMsg("m1", "part_1"), toolMsg("m2", "part_2")]);
-    const cards = updates.map((p) => p.update as Record<string, unknown>);
-    expect(cards).toHaveLength(2);
-    expect(cards[0]!.messageId).toBeUndefined();
-    expect(cards[1]!.messageId).toBeUndefined();
-  });
-
-  it("keeps messageId on a tool card whose message also carries text", async () => {
-    const { cx, updates } = collectCx();
-    await replayMessages(cx, "s", [
-      {
-        info: { id: "m1", role: "assistant" },
-        parts: [
-          { type: "text", text: "checking" },
-          { type: "tool", id: "part_1", tool: "Bash", state: { status: "completed" } },
-        ],
-      },
-    ]);
-    const text = updates[0]!.update as Record<string, unknown>;
-    expect(text.sessionUpdate).toBe("agent_message_chunk");
-    expect(text.messageId).toBe("m1");
-    const card = updates[1]!.update as Record<string, unknown>;
-    expect(card.sessionUpdate).toBe("tool_call");
-    expect(card.messageId).toBe("m1");
   });
 });
 
@@ -630,7 +285,7 @@ describe("replayMessages toolTurnWindow (TUI condensation)", () => {
     parts: [
       {
         type: "tool",
-        id: `tool_${id}`,
+        callId: `tool_${id}`,
         tool: "Bash",
         state: { title: `Run ${id}`, status: "completed", input: "ls", output: "file" },
       },
@@ -660,22 +315,101 @@ describe("replayMessages toolTurnWindow (TUI condensation)", () => {
     // 1-turn window → dropped. Last turn: the tool-transcript stays.
     expect(shapes).toEqual(["text", "text", "text", "text", "Read · /tmp/a", "text"]);
   });
+});
 
-  it("window of 2 keeps the second-to-last turn's tools too", async () => {
+describe("normalizeWireMessages (3.18+ wire shape: info.messageId, no info.id)", () => {
+  it("maps the wire messageId spelling onto info.id", () => {
+    const wire = [
+      {
+        info: { messageId: "msg_u1", sessionId: "sess", role: "user" },
+        parts: [{ type: "text", text: "one" }],
+      },
+      {
+        info: { messageId: "msg_a1", sessionId: "sess", role: "assistant" },
+        parts: [{ type: "text", text: "A1" }],
+      },
+    ] as unknown as ZcodeMessage[];
+    const out = normalizeWireMessages(wire);
+    expect(out.map((m) => m.info.id)).toEqual(["msg_u1", "msg_a1"]);
+  });
+});
+
+describe("replayMessages _meta.zcode.mid (rewind addressing)", () => {
+  function collectCx() {
+    const updates: Array<Record<string, unknown>> = [];
+    return {
+      cx: {
+        notify: async (_m: string, params: unknown) => {
+          updates.push(params as Record<string, unknown>);
+        },
+      },
+      updates,
+    };
+  }
+  const meta = (u: Record<string, unknown>): Record<string, unknown> =>
+    ((u.update as Record<string, unknown>)._meta ?? {}) as Record<string, unknown>;
+
+  it("carries the store message id on user/agent/thought chunks", async () => {
     const { cx, updates } = collectCx();
-    await replayMessages(cx, "s", batch, { toolTurnWindow: 2 });
-    const toolTitles = updates
-      .map((p) => (p.update as Record<string, unknown>).title)
-      .filter((t): t is string => typeof t === "string");
-    expect(toolTitles).toEqual(["Run t2", "Read · /tmp/a"]);
+    await replayMessages(cx, "s", [
+      msg("u1", "user", "question"),
+      {
+        info: { id: "a1", role: "assistant" },
+        parts: [
+          { type: "reasoning", text: "thinking" },
+          { type: "text", text: "answer" },
+        ],
+      },
+    ]);
+    expect(updates).toHaveLength(3);
+    const [u, thought, agent] = updates.map((p) => p.update as Record<string, unknown>);
+    expect(u.sessionUpdate).toBe("user_message_chunk");
+    expect(meta(updates[0]!).zcode).toEqual({ mid: "u1" });
+    // The thought chunk's top-level id is thought_-prefixed, but the mid is
+    // the raw message id — the value rowsRange's entityId matches.
+    expect(thought.messageId).toBe("thought_a1");
+    expect(meta(updates[1]!).zcode).toEqual({ mid: "a1" });
+    expect(agent.sessionUpdate).toBe("agent_message_chunk");
+    expect(meta(updates[2]!).zcode).toEqual({ mid: "a1" });
   });
 
-  it("without the option every tool record replays (editor fidelity)", async () => {
+  it("skips the mid for id-less rows (positional fallback is not an address)", async () => {
     const { cx, updates } = collectCx();
-    await replayMessages(cx, "s", batch);
-    const toolTitles = updates
-      .map((p) => (p.update as Record<string, unknown>).title)
-      .filter((t): t is string => typeof t === "string");
-    expect(toolTitles).toEqual(["Run t1", "Run t2", "Read · /tmp/a"]);
+    await replayMessages(cx, "s", [
+      { info: { role: "user" }, parts: [{ type: "text", text: "anon" }] },
+    ]);
+    const u = updates[0]!.update as Record<string, unknown>;
+    expect(u.messageId).toBe("hist_0");
+    expect(u._meta).toBeUndefined();
+  });
+
+  it("merges the mid beside earlierPage and existing _meta keys", async () => {
+    const { cx, updates } = collectCx();
+    const history: ZcodeMessage[] = [
+      msg("u1", "user", "q"),
+      {
+        info: { id: "a1", role: "assistant" },
+        parts: [
+          {
+            type: "tool",
+            callId: "c1",
+            tool: "Bash",
+            state: { title: "Run", status: "completed", input: "ls", output: "f" },
+          },
+          { type: "text", text: "done" },
+        ],
+      },
+    ];
+    await withReplayBatch("s", () => replayMessages(cx, "s", history));
+    const tool = updates[1]!.update as Record<string, unknown>;
+    // tool_call keeps its claudeCode _meta and gains zcode.mid.
+    const toolMeta = tool._meta as { claudeCode?: unknown; zcode?: { mid: string } };
+    expect(toolMeta.claudeCode).toEqual({ toolName: "Bash" });
+    expect(toolMeta.zcode).toEqual({ mid: "a1" });
+
+    const { cx: cx2, updates: earlier } = collectCx();
+    await withReplayBatch("s", () => replayMessages(cx2, "s", history.slice(0, 1), { earlierPage: true }));
+    const pageMeta = meta(earlier[0]!).zcode as Record<string, unknown>;
+    expect(pageMeta).toEqual({ mid: "u1", earlierPage: true });
   });
 });

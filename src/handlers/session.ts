@@ -36,12 +36,14 @@ import type {
 import {
   buildModes,
   buildConfigOptions,
+  buildInitialConfigOptions,
   DEFAULT_MODEL_ID,
   DEFAULT_PROVIDER_ID,
   formatModelValue,
   loadAllModels,
   modelContextWindow,
   parseModelValue,
+  rememberModelChoice,
 } from "../config/options.js";
 import { currentModelCached, emitInitialUsage } from "../config/model-cache.js";
 import {
@@ -49,11 +51,17 @@ import {
   scheduleQuotaDockBackstop,
   startQuotaRefresher,
 } from "../quota/live.js";
+import { warmStartPlanVerdict } from "../quota/startplan.js";
 import { noteUserActivity, pushSettled, pushSourceLabel } from "../push/push.js";
 import { buildProviderRegistry } from "../config/provider-registry.js";
 import { configProviderIdFor, pushAccountProviderConfig } from "../config/account-provider.js";
-import { initialSessionMode } from "../config/settings.js";
-import { applyModelSwitch, buildResumeRuntimeModel } from "../config/runtime-model.js";
+import { initialSessionMode, pinAdvertisedModel } from "../config/settings.js";
+import { probeInitialModelCatalog } from "../config/initial-model-catalog.js";
+import {
+  applyModelSwitch,
+  buildResumeRuntimeModel,
+  lastSwitchedModelValue,
+} from "../config/runtime-model.js";
 import {
   effectiveWorkflowGate,
   effectiveWorkflowGateNow,
@@ -64,17 +72,21 @@ import { messages } from "../i18n.js";
 import {
   lookupLazySession,
   lookupModelChoiceByZcodeSid,
+  recordAdvertisedModel,
   recordMaterializedSession,
   rememberLazySession,
 } from "../lazy-sessions.js";
 import { emitLodyRateLimitsUpdate, emitLodyUsageUpdate } from "../lody.js";
 import { refreshTerminalTabTitle } from "../terminal-title.js";
+import { isClosedSessionId } from "../closed-sessions.js";
 import {
   buildDiffContent,
   EventTranslator,
   extractLocations,
   formatTurnError,
   isBackendLostError,
+  isContentLiveDelivered,
+  isGatewayBlipTurnError,
   isTransientTurnError,
   ProjectionDiffer,
 } from "../translators/index.js";
@@ -83,7 +95,9 @@ import { clientConnectionRoot, log, warn, zcodeHomeDir } from "../utils.js";
 import type { PendingTurn, ZcodeAcpServer } from "../server.js";
 import { dispatchEvent } from "./dispatch.js";
 import {
+  echoSteeredInputs,
   emitSessionTurnState,
+  enqueueSessionSend,
   sendAvailableCommandsDeferred,
   sendSessionUpdate,
   sendTextChunk,
@@ -116,6 +130,124 @@ import { handleServerRequests } from "./server-requests.js";
 function workspaceFor(cwd?: string): { workspacePath: string; workspaceKey: string } {
   const p = cwd || process.cwd();
   return { workspacePath: p, workspaceKey: p };
+}
+
+function initialCatalog(
+  server: ZcodeAcpServer,
+  cwd: string,
+): {
+  cached: ZcodeCreateResult | null;
+  flight?: Promise<ZcodeCreateResult | null>;
+} {
+  const cached = server.initialCatalogCache.get(cwd);
+  if (cached) return { cached };
+  let flight = server.initialCatalogFlights.get(cwd);
+  if (!flight) {
+    const generation = server.backendGeneration;
+    flight = new Promise<ZcodeCreateResult | null>((resolve) => {
+      setImmediate(() => {
+        if (server.disposed || server.backendGeneration !== generation) {
+          resolve(null);
+          return;
+        }
+        void probeInitialModelCatalog(cwd).then(resolve, () => resolve(null));
+      });
+    })
+      .then((result) => {
+        const model = result?.settings?.model;
+        if (
+          server.disposed ||
+          generation !== server.backendGeneration ||
+          !model?.current?.providerId ||
+          !model.current.modelId ||
+          !Array.isArray(model.available) ||
+          model.available.some((entry) => !entry?.ref?.providerId || !entry.ref.modelId) ||
+          !model.available.some(
+            (entry) =>
+              entry.ref?.providerId === model.current?.providerId &&
+              entry.ref?.modelId === model.current?.modelId,
+          )
+        )
+          return null;
+        server.initialCatalogCache.set(cwd, result!);
+        return result;
+      })
+      .catch(() => null);
+    server.initialCatalogFlights.set(cwd, flight);
+    const ownedFlight = flight;
+    void flight.finally(() => {
+      if (server.initialCatalogFlights.get(cwd) === ownedFlight)
+        server.initialCatalogFlights.delete(cwd);
+    });
+  }
+  return { cached: null, flight };
+}
+
+/**
+ * The model configOption's advertised current value, if the menu carries one.
+ *
+ * `session/new` has no backend session yet, so the current model there is a
+ * projection (`buildConfigOptions` leader / catalog-probe snapshot), not a
+ * measurement. Whoever receives it may skip its model switch on equality —
+ * the pin at materialization below uses this exact value to keep that
+ * projection true.
+ */
+function advertisedModelFrom(options: acp.SessionConfigOption[]): string | undefined {
+  const model = options.find((option) => option.id === "model");
+  return model?.type === "select" ? model.currentValue : undefined;
+}
+
+/** Send only to the connection that adopted this still-unmodified placeholder. */
+function updateInitialCatalog(
+  server: ZcodeAcpServer,
+  cwd: string,
+  sid: string,
+  client: acp.AgentContext | undefined,
+  flight: Promise<ZcodeCreateResult | null> | undefined,
+): void {
+  if (!flight) return;
+  const pending = server.pendingSessions.get(sid);
+  if (!pending) return;
+  const generation = server.backendGeneration;
+  const root = clientConnectionRoot(client);
+  const tracked =
+    !!client && server.clients.snapshot().some((cx) => clientConnectionRoot(cx) === root);
+  const valid = () =>
+    !server.disposed &&
+    server.backendGeneration === generation &&
+    server.sessionCwds.get(sid) === cwd &&
+    server.pendingSessions.get(sid) === pending &&
+    pending.cwd === cwd &&
+    !pending.creating &&
+    !server.resolveSid(sid) &&
+    (!tracked || server.clients.snapshot().some((cx) => clientConnectionRoot(cx) === root));
+  void flight.then((result) => {
+    if (!result || !valid()) return;
+    // The request handler returns synchronously after newSession. The SDK's
+    // response enters its per-connection write queue before this callback;
+    // that queue orders the update behind the response even under backpressure.
+    setImmediate(() => {
+      void (async () => {
+        if (!valid()) return;
+        const options = await buildInitialConfigOptions(server, root, result);
+        await enqueueSessionSend(sid, async () => {
+          if (!valid()) return;
+          // The probe snapshot is the truthful current model. A client may
+          // only ever see this later menu before it prompts, so the pin at
+          // materialization must follow the LATEST advertised value.
+          const advertised = advertisedModelFrom(options);
+          if (advertised) {
+            pending.advertisedModel = advertised;
+            recordAdvertisedModel(sid, advertised);
+          }
+          await (client ?? server.clients.broadcast()).notify("session/update", {
+            sessionId: sid,
+            update: { sessionUpdate: "config_option_update", configOptions: options },
+          });
+        });
+      })().catch((err) => log(`initial model catalog update failed: ${String(err)}`));
+    });
+  });
 }
 
 /**
@@ -328,6 +460,63 @@ function workspaceFromResumeResult(result: unknown): string | null {
   return typeof ws === "string" && ws !== "" && ws !== "/" ? ws : null;
 }
 
+/** Verify workspace against the persisted backend record, not the caller's cwd.
+ * sessionIds is intentionally unscoped: a workspace filter can mask a foreign
+ * session and some backend versions echo the filter instead of the stored path.
+ *
+ * A backend whose schema predates the `sessionIds` key (strict zod
+ * "Unrecognized key" — verdict pinned per generation, mirroring
+ * probeGoneBackendSessions) cannot answer the pre-check: skip it instead of
+ * failing every serve-mode recovery. The post-resume workspace guard below
+ * remains the backstop, exactly the pre-#381 behavior on those builds.
+ */
+async function verifyServeWorkspace(server: ZcodeAcpServer, zcodeSid: string): Promise<void> {
+  if (server.sessionIdsQueryRejected === true) return;
+  const backend = await server.ensureBackend();
+  // ensureBackend may have respawned (and reset the verdict to null) while we
+  // waited — re-read without the pre-await narrowing.
+  if ((server.sessionIdsQueryRejected as boolean | null) === true) return;
+  const resp = await backend.request(
+    server.nextId(),
+    "session/list",
+    { sessionIds: [zcodeSid] },
+    15000,
+  );
+  if (resp.error) {
+    const message = resp.error.message ?? "";
+    if (/unrecognized key/i.test(message)) {
+      if (server.sessionIdsQueryRejected === null) {
+        server.sessionIdsQueryRejected = true;
+        log(
+          "session/list sessionIds unsupported on this backend build — " +
+            "skipping serve workspace pre-check (post-resume guard remains)",
+        );
+      }
+      return;
+    }
+    throw new Error(`cannot verify session workspace: ${message || "backend error"}`);
+  }
+  server.sessionIdsQueryRejected = false;
+  const sessions = (
+    resp.result as
+      | { sessions?: Array<{ sessionId?: unknown; workspace?: { workspacePath?: unknown } }> }
+      | undefined
+  )?.sessions;
+  const entry = Array.isArray(sessions)
+    ? sessions.find((s) => s?.sessionId === zcodeSid)
+    : undefined;
+  if (
+    Array.isArray(sessions) &&
+    !entry &&
+    (await probeLifecycleResidency(server, zcodeSid)) === "gone"
+  ) {
+    throw new Error(`Session not found: ${zcodeSid}`);
+  }
+  const ws = workspaceFromResumeResult({ session: entry });
+  if (!ws) throw new Error("cannot verify session workspace");
+  if (!sameProjectDir(ws, process.cwd())) throw new Error("session belongs to another workspace");
+}
+
 /**
  * Push the provider registry to the backend so third-party providers (those in
  * config.json) are recognised. The V4 backend doesn't auto-load them from
@@ -344,6 +533,13 @@ async function syncProviderRegistry(server: ZcodeAcpServer, cwd: string): Promis
     // models the user's config selects never reach `settings.model.available`
     // (verified 2026-09 — switches then fail with "Provider Registry 中不存在
     // Model"). Pushing the snapshot restores desktop parity. Best-effort.
+    //
+    // Warm the billing-authoritative Start Plan verdict first (#406): the
+    // snapshot, the dropdown and the runtime-headers answer all read it
+    // synchronously. Bounded — an offline/slow gateway leaves `unknown` and
+    // the legacy connection-selection gate decides (no credentials → no
+    // network at all).
+    await warmStartPlanVerdict();
     await pushAccountProviderConfig(await server.ensureBackend(), () => server.nextId());
     const registry = buildProviderRegistry();
     if (registry.providers.length === 0) {
@@ -434,6 +630,21 @@ function consumeBootCreateBind(): string | null {
 export const BOOT_RESUME_TRIGGER = "resume session";
 
 /**
+ * `_meta.zcode` on the session/new response (#400): the provider metadata ACP
+ * clients render a provider picker from, mirroring the `model` configOption's
+ * `_meta.zcode` payload verbatim — one source, so the response copy can never
+ * drift from the option the same response carries. The option-level `_meta`
+ * is the refresh vehicle (every config_option_update re-attaches it); this
+ * response-level copy is the boot snapshot integrators code against. Absent
+ * when the model option itself was omitted (no provider identity).
+ */
+function attachProviderMeta(resp: acp.NewSessionResponse): acp.NewSessionResponse {
+  const meta = resp.configOptions?.find((option) => option.id === "model")?._meta?.["zcode"];
+  if (meta !== undefined) resp._meta = { zcode: meta };
+  return resp;
+}
+
+/**
  * `session/new` → local placeholder id. The real zcode `session/create` is
  * deferred to first use (`ensureRealSession`) so an editor startup that never
  * sends a message leaves no empty session in the backend or the App's task
@@ -511,11 +722,17 @@ export async function newSession(
     server.lastMode.set(bindSid, modes.currentModeId);
     emitBootUsageUpdate(server, bindSid);
     scheduleQuotaDockBackstop(server);
-    return {
-      sessionId: bindSid,
-      modes,
-      configOptions: await buildConfigOptions(server, null, bindRoot),
-    };
+    const cwd = server.sessionCwds.get(bindSid) ?? process.cwd();
+    const catalog = initialCatalog(server, cwd);
+    const configOptions = await buildInitialConfigOptions(server, bindRoot, catalog.cached);
+    const boundPending = server.pendingSessions.get(bindSid);
+    const boundModel = advertisedModelFrom(configOptions);
+    if (boundPending && boundModel) {
+      boundPending.advertisedModel = boundModel;
+      recordAdvertisedModel(bindSid, boundModel);
+    }
+    updateInitialCatalog(server, cwd, bindSid, client, catalog.flight);
+    return attachProviderMeta({ sessionId: bindSid, modes, configOptions });
   }
   const bootResume = consumeBootResumeTarget();
   if (bootResume) {
@@ -569,11 +786,11 @@ export async function newSession(
       }
       emitBootUsageUpdate(server, bootResume);
       scheduleQuotaDockBackstop(server);
-      return {
+      return attachProviderMeta({
         sessionId: bootResume,
         modes: loaded.modes,
         configOptions: loaded.configOptions,
-      };
+      });
     } catch (e) {
       warn(
         `session/new: boot-resume of ${bootResume} failed (` +
@@ -614,7 +831,15 @@ export async function newSession(
   // mock factories throw on reading an export they do not define).
   try {
     const tasksIndexAtNew = await import("../tasks-index.js");
-    void tasksIndexAtNew.reviveTombstonesOnActivity({ workspacePath: cwd }).catch(() => {});
+    // probeGone (#376) is safe here even though lazy session/new spawns no
+    // backend: the probe uses an EXISTING backend only and answers empty
+    // (blind revival) when there is none.
+    void tasksIndexAtNew
+      .reviveTombstonesOnActivity({
+        workspacePath: cwd,
+        probeGone: (ids) => server.probeGoneBackendSessions(ids),
+      })
+      .catch(() => {});
   } catch {
     // tasks-index unavailable — revival is best-effort.
   }
@@ -625,11 +850,20 @@ export async function newSession(
   server.lastMode.set(acpSid, modes.currentModeId);
   emitBootUsageUpdate(server, acpSid);
   scheduleQuotaDockBackstop(server);
-  return {
-    sessionId: acpSid,
-    modes,
-    configOptions: await buildConfigOptions(server, null, clientConnectionRoot(client)),
-  };
+  const catalog = initialCatalog(server, cwd);
+  const configOptions = await buildInitialConfigOptions(
+    server,
+    clientConnectionRoot(client),
+    catalog.cached,
+  );
+  const pendingAtNew = server.pendingSessions.get(acpSid);
+  const advertisedModel = advertisedModelFrom(configOptions);
+  if (pendingAtNew && advertisedModel) {
+    pendingAtNew.advertisedModel = advertisedModel;
+    recordAdvertisedModel(acpSid, advertisedModel);
+  }
+  updateInitialCatalog(server, cwd, acpSid, client, catalog.flight);
+  return attachProviderMeta({ sessionId: acpSid, modes, configOptions });
 }
 
 /**
@@ -690,6 +924,13 @@ function emitBootUsageUpdate(server: ZcodeAcpServer, acpSid: string): void {
  * not active". Skipped while a turn is in flight (a running turn proves the
  * resident is live).
  *
+ * On backends that speak `session/lifecycle/getState` (>= 0.17.1) the stale
+ * stamp is first settled by that authoritative probe: `ready` merely refreshes
+ * the stamp (subscribers/interactions keep residents alive well past the TTL —
+ * the full resume reload used to run blindly here), and a not-found answer
+ * fails with the evicted error before any reload. Every other outcome keeps
+ * the reload path below.
+ *
  * Fail-safe on ordinary reload failures (the caller surfaces the backend's
  * own error downstream, as before) — but a session the backend no longer
  * STORES throws the actionable evicted-session error: continuing with the
@@ -702,23 +943,92 @@ async function ensureBackendResident(
   server: ZcodeAcpServer,
   acpSid: string,
   zcodeSid: string,
+  strict = false,
 ): Promise<void> {
   if (server.isBackendSessionLive(acpSid)) return;
   const turnInFlight = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
   if (turnInFlight) return;
+  const residency = await probeLifecycleResidency(server, zcodeSid);
+  if (residency === "ready") {
+    log(`ensureRealSession: ${acpSid} still resident per lifecycle getState — stamp refreshed`);
+    server.markBackendLoaded(acpSid);
+    return;
+  }
+  if (residency === "gone") {
+    warn(`ensureRealSession: ${acpSid} → backend session ${zcodeSid} no longer exists`);
+    retireGoneSessionTasks(zcodeSid);
+    throw new Error(messages().sessionEvicted(acpSid));
+  }
   try {
     log(`ensureRealSession: ${acpSid} possibly evicted from backend — reloading`);
     await reloadBackendSession(server, acpSid, zcodeSid);
   } catch (e) {
     if (isSessionGoneError(e)) {
       warn(`ensureRealSession: ${acpSid} → backend session ${zcodeSid} no longer exists`);
+      retireGoneSessionTasks(zcodeSid);
       throw new Error(messages().sessionEvicted(acpSid));
     }
+    if (strict) throw e;
     log(
       `ensureRealSession: reload failed, continuing with existing mapping ` +
         `(${e instanceof Error ? e.message : String(e)})`,
     );
   }
+}
+
+/** Timeout for the `session/lifecycle/getState` residency probe. */
+const LIFECYCLE_PROBE_TIMEOUT_MS = 5000;
+
+/**
+ * Ask the backend whether the session's resident runtime is live, via
+ * `session/lifecycle/getState` (app-server >= 0.17.1).
+ *
+ * - "ready" — provably resident; the caller refreshes the stamp and skips the
+ *   resume reload entirely.
+ * - "gone" — the backend no longer STORES the session (the controller's own
+ *   "Session not found: <sid>", which isSessionGoneError already matches); no
+ *   reload can fix that.
+ * - "unknown" — everything else: method unsupported on this build (verdict
+ *   pinned per backend generation via `server.backendLifecycleApi`, mirroring
+ *   toolDenylistRejected), a transient RPC failure, or a non-ready state
+ *   (unloaded/starting/stopping/faulted) where the safe move is the existing
+ *   reload — its session/resume carries mcpServers (#193) and toolDenylist
+ *   (#340), which the lifecycle family's ensureReady does NOT, so ensureReady
+ *   must not replace the reload.
+ */
+async function probeLifecycleResidency(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+): Promise<"ready" | "gone" | "unknown"> {
+  if (server.backendLifecycleApi === false) return "unknown";
+  let backend: ZcodeBackend;
+  try {
+    backend = await server.ensureBackend();
+  } catch {
+    return "unknown"; // spawn failure — the reload path surfaces it properly
+  }
+  // ensureBackend may have respawned (and reset the verdict to null) while we
+  // waited — the cast re-reads the field without the pre-await narrowing.
+  if ((server.backendLifecycleApi as boolean | null) === false) return "unknown";
+  const resp = await backend.request(
+    server.nextId(),
+    "session/lifecycle/getState",
+    { sessionId: zcodeSid },
+    LIFECYCLE_PROBE_TIMEOUT_MS,
+  );
+  if (resp.error) {
+    const message = resp.error.message ?? "";
+    if (resp.error.code === -32601 || /method not found/i.test(message)) {
+      server.backendLifecycleApi = false;
+      log("lifecycle getState unsupported on this backend build — keeping the TTL reload path");
+      return "unknown";
+    }
+    if (isSessionGoneError(message)) return "gone";
+    return "unknown";
+  }
+  server.backendLifecycleApi = true;
+  const state = (resp.result as { state?: unknown } | undefined)?.state;
+  return state === "ready" ? "ready" : "unknown";
 }
 
 /**
@@ -766,7 +1076,8 @@ export async function ensureRealSession(
       throw new Error(`session ${acpSid} not found`);
     }
     if (record?.zcodeSid) {
-      server.registerSession(acpSid, record.zcodeSid);
+      // Serve must validate the backend workspace before publishing an alias.
+      if (!server.serveMode) server.registerSession(acpSid, record.zcodeSid);
       // Recover the remembered model/thought choice (bridge restart): the
       // post-resume re-assert needs it to undo the backend's silent revert
       // to the workspace default (see reassertModelChoice).
@@ -794,7 +1105,27 @@ export async function ensureRealSession(
       // prompt on it would fail with "Session is not active" (observed
       // 2026-09-18: the first model switch after a bridge restart).
       if (opts.ensureResident !== false) {
-        await ensureBackendResident(server, acpSid, record.zcodeSid);
+        if (server.serveMode) {
+          // A residency probe cannot authenticate the workspace. Check the
+          // backend's stored record first, then preserve the normal eviction
+          // guard (including ready and in-flight fast paths).
+          const turnInFlight = [...server.pendingTurns.values()].some(
+            (turn) => turn.zcodeSid === record.zcodeSid,
+          );
+          const state = turnInFlight
+            ? "unknown"
+            : await probeLifecycleResidency(server, record.zcodeSid);
+          if (state === "gone") {
+            retireGoneSessionTasks(record.zcodeSid);
+            throw new Error(messages().sessionEvicted(acpSid));
+          }
+          await verifyServeWorkspace(server, record.zcodeSid);
+          if (state === "ready") server.markBackendLoaded(acpSid);
+          await ensureBackendResident(server, acpSid, record.zcodeSid, true);
+          server.registerSession(acpSid, record.zcodeSid);
+        } else {
+          await ensureBackendResident(server, acpSid, record.zcodeSid);
+        }
       }
       // Materialization (resume flight) settled the gate — refresh a menu
       // snapshot that may predate the verdict (see resendMenuAfterGateSettled).
@@ -806,7 +1137,7 @@ export async function ensureRealSession(
       // the guard above already proved the record's cwd matches).
       const cwd = server.serveMode ? process.cwd() : record.cwd;
       const mcpServers = server.sessionMcpServers.get(acpSid);
-      pending = { cwd, mcpServers };
+      pending = { cwd, mcpServers, advertisedModel: record.advertisedModel };
       server.pendingSessions.set(acpSid, pending);
       if (cwd !== "/") server.sessionCwds.set(acpSid, cwd);
     }
@@ -818,6 +1149,7 @@ export async function ensureRealSession(
   // promise is stored before any concurrent caller can observe the entry.
   const creating = (async () => {
     const backend = await server.ensureBackend();
+    const generation = server.backendGeneration;
     // Push the provider registry BEFORE session/create: the backend resolves
     // the session's default model against the registry, and without the
     // provider's reasoning/model definitions it falls back to the bare
@@ -857,6 +1189,8 @@ export async function ensureRealSession(
     // Compat retries build on the params ACTUALLY sent last, so a second
     // rejection does not resurrect a key the first retry already dropped.
     let sent = createParams;
+    if (generation !== server.backendGeneration)
+      throw new Error("backend generation changed during create");
     let resp = await backend.request(server.nextId(), "session/create", sent, 15000);
     if (resp.error && sent.mode === "guarded" && rejectsModeGuarded(resp.error.message)) {
       // 3.15.1's `guarded` on a pre-3.15 backend: the strict mode enum rejects
@@ -877,6 +1211,8 @@ export async function ensureRealSession(
     if (resp.error) {
       throw new Error(`zcode create failed: ${resp.error.message ?? ""}`);
     }
+    if (generation !== server.backendGeneration)
+      throw new Error("backend generation changed during create");
     const result = (resp.result ?? {}) as ZcodeCreateResult;
     const session = result.session ?? {};
     const sid = session.sessionId;
@@ -899,6 +1235,44 @@ export async function ensureRealSession(
       const selected = formatModelValue(pinnedProvider, pinnedModel);
       if (!(await applyModelSwitch(server, sid, selected))) {
         throw new Error(`zcode refused configured model ${selected}`);
+      }
+    }
+    // The pending menu advertised a model before any backend session existed
+    // (buildConfigOptions projects the dropdown leader, or the catalog probe's
+    // snapshot). session/create is the first moment a model really exists —
+    // and the backend's own default can disagree with that projection (e.g.
+    // the desktop's active account family from setting.json wins over the
+    // bridge's dropdown leader). ACP clients may skip a requested switch when
+    // it equals the advertised current value, so the mismatch silently ran
+    // turns on a model nobody selected (observed with T3Code: the thread
+    // stored a custom-provider model, the turn billed the desktop's coding
+    // plan instead and failed 1113). Make the advertisement true: pin the
+    // advertised model unless the env pair above or a client-recorded choice
+    // already owns the selection. ZCODE_ACP_PIN_DEFAULT_MODEL=0 opts out.
+    const advertised = pending.advertisedModel;
+    if (
+      !(pinnedProvider && pinnedModel) &&
+      advertised &&
+      pinAdvertisedModel() &&
+      !server.sessionModelChoices.get(sid)
+    ) {
+      if (await applyModelSwitch(server, sid, advertised)) {
+        // Remember it: a setModel before the session's first input applies
+        // in-memory only, and a later resume reverts to the workspace default
+        // — the re-assert path needs this to restore the same model. Record
+        // the registry-dialect identity the switch LANDED on (#403): the
+        // advertised value may be a stale-dialect ref that only resolved via
+        // model-resolution, and re-asserting it raw would re-run the whole
+        // resolution (or fail on a no-snapshot resume).
+        rememberModelChoice(server, acpSid, sid, {
+          model: lastSwitchedModelValue(server, sid) ?? advertised,
+        });
+        log(`session/new ${acpSid}: pinned the advertised model ${advertised}`);
+      } else {
+        warn(
+          `session/new ${acpSid}: could not pin the advertised model ${advertised}` +
+            " — keeping the backend default",
+        );
       }
     }
     // session/create loads the session into this backend process.
@@ -925,6 +1299,17 @@ export async function ensureRealSession(
       title: session.title ?? "",
       traceId: session.traceId,
     });
+    // A rename made while this was still a placeholder (no backend id) could
+    // only pin in memory — re-run the shared core now that the session exists
+    // so the backend (v4 renameSession, titleSource=custom) and tasks-index
+    // catch up. Idempotent (same title, equality-guarded downstream).
+    if (server.titleUserSetBy.has(acpSid)) {
+      const placeholderTitle = server.sessionTitles.get(acpSid);
+      if (placeholderTitle) {
+        const { renameSessionCore } = await import("./session-titles.js");
+        void renameSessionCore(server, acpSid, placeholderTitle).catch(() => undefined);
+      }
+    }
 
     return sid;
   })();
@@ -978,7 +1363,15 @@ export async function listSessions(
     if (listCwd && listCwd !== "/") {
       try {
         const { reviveTombstonesOnActivity } = await import("../tasks-index.js");
-        await reviveTombstonesOnActivity({ workspacePath: listCwd });
+        // probeGone (#376): before a mass revival, ids the backend can no
+        // longer serve (physically deleted upstream / soft-deleted) retire
+        // instead of resurrecting. The backend is alive in this scope (it just
+        // answered the listing); a probe failure answers empty → blind
+        // revival, the pre-#376 behavior.
+        await reviveTombstonesOnActivity({
+          workspacePath: listCwd,
+          probeGone: (ids) => server.probeGoneBackendSessions(ids),
+        });
       } catch {
         // revival unavailable — filter as-is.
       }
@@ -989,19 +1382,40 @@ export async function listSessions(
   } catch {
     // tasks-index unavailable — show everything.
   }
+  // User renames are the title truth: the backend store can lag the v4
+  // renameSession command (an idle session cold-resumes first), so overlay
+  // the durable `title_overridden` titles — a rename must be visible in
+  // every read the moment it returns, or the client's next list pull flips
+  // the fresh title back to the stale one ("改名被弹回"). Own try (a partially
+  // mocked tasks-index must only skip the overlay, never fail the listing).
+  try {
+    const { overriddenTaskTitles } = await import("../tasks-index.js");
+    const renamed = await overriddenTaskTitles();
+    if (renamed.size > 0) {
+      sessions = sessions.map((s) =>
+        renamed.has(s.sessionId) ? { ...s, title: renamed.get(s.sessionId) } : s,
+      );
+    }
+  } catch {
+    // overlay unavailable — backend titles as-is.
+  }
   log(`session/list → ${sessions.length} sessions`);
   return { sessions };
 }
 
 /**
- * Adopt the backend's stored title for a loaded/resumed session.
+ * Adopt a title for a loaded/resumed session, pin-first:
+ *   1. a sibling alias's already-known title (same conversation, another id
+ *      spelling);
+ *   2. the durable user rename from the App's tasks-index
+ *      (`title_overridden=1` — survives bridge restarts);
+ *   3. the backend's `session/list` stored title.
  *
  * The prompt loop's auto-title only fires for freshly created sessions
  * (`titleEligibleSessions`), so a session resumed across a bridge restart
  * would otherwise appear title-less in the hub's discovery API — remote
- * clients have no editor-side session storage to fall back on. The backend's
- * session/list is the only title source for sessions born in a previous
- * bridge lifetime. Best-effort: failures log and leave the session untitled.
+ * clients have no editor-side session storage to fall back on. Best-effort:
+ * failures log and leave the session untitled.
  */
 async function adoptStoredTitle(
   server: ZcodeAcpServer,
@@ -1009,9 +1423,53 @@ async function adoptStoredTitle(
   zcodeSid: string,
 ): Promise<void> {
   if (server.sessionTitles.has(acpSid)) return;
+  // Tier 1 — sibling alias: a rename or adoption under another spelling of
+  // the same conversation already knows the title. Copy it instead of asking
+  // the backend, whose store may lag a bridge-side rename (a rename through
+  // one alias used to be invisible here, so a load via a second alias reset
+  // the title).
+  const sibling = server
+    .sessionAliases(acpSid)
+    .map((sid) => server.sessionTitles.get(sid))
+    .find((t) => t !== undefined);
+  if (sibling !== undefined) {
+    server.sessionTitles.set(acpSid, sibling);
+    server.touchSessionSummary(acpSid, sibling);
+    refreshTerminalTabTitle(server, acpSid);
+    return;
+  }
+  // Tier 2 — durable user rename: `title_overridden=1` in the App's
+  // tasks-index survives bridge restarts (the in-memory pin does not). The
+  // backend store may never have been told (pre-v4 rename, command failure),
+  // so its session/list answer can be stale — the user's title wins.
+  try {
+    const { readTaskTitle } = await import("../tasks-index.js");
+    const task = await readTaskTitle(zcodeSid);
+    if (task?.overridden && task.title) {
+      server.sessionTitles.set(acpSid, task.title);
+      for (const sid of server.sessionAliases(acpSid)) server.titleUserSetBy.add(sid);
+      server.touchSessionSummary(acpSid, task.title);
+      refreshTerminalTabTitle(server, acpSid);
+      log(`adopted user-renamed title for ${acpSid.slice(0, 8)}: ${task.title}`);
+      return;
+    }
+  } catch {
+    // Best-effort consult — fall through to the backend's stored title.
+  }
+  // Tier 3 — the backend's session/list: the only title source for sessions
+  // born in a previous bridge lifetime. Asked BY ID: a bare listing is only
+  // the 50 most recent sessions across every workspace (upstream default
+  // limit), so an older conversation — exactly what /resume digs up — was
+  // never found. A backend rejecting `sessionIds` gets the bare listing.
   try {
     const backend = await server.ensureBackend();
-    const resp = await backend.request(server.nextId(), "session/list", {}, 15000);
+    let resp = await backend.request(
+      server.nextId(),
+      "session/list",
+      { sessionIds: [zcodeSid] },
+      15000,
+    );
+    if (resp.error) resp = await backend.request(server.nextId(), "session/list", {}, 15000);
     if (resp.error) return;
     const result = (resp.result ?? {}) as ZcodeListResult;
     const hit = (result.sessions ?? []).find((s) => s.sessionId === zcodeSid);
@@ -1136,6 +1594,23 @@ async function replayResumeHistory(
 }
 
 /**
+ * Fire-and-forget tombstone retirement (#376): a session the backend refuses
+ * to serve (physically deleted upstream, or soft-deleted — resume answers
+ * "Session not found" either way) must stop being revivable, or every future
+ * `reviveTombstonesOnActivity` resurrects a zombie row whose only use is a
+ * sessionEvicted error. Guarded typeof: test suites mock tasks-index
+ * partially. Best-effort, never blocks the error path.
+ */
+function retireGoneSessionTasks(zcodeSid: string): void {
+  if (!zcodeSid) return;
+  void import("../tasks-index.js")
+    .then((tasksIndex) =>
+      typeof tasksIndex.retireTasks === "function" ? tasksIndex.retireTasks([zcodeSid]) : 0,
+    )
+    .catch(() => undefined);
+}
+
+/**
  * Surface a resume failure honestly, keyed on WHY the id is known. Always
  * throws. Two not-found shapes get an actionable message:
  * - raw (id unknown to bridge AND alias store): a placeholder whose durable
@@ -1149,6 +1624,7 @@ function translateResumeFailure(
   methodLabel: "session/resume" | "session/load",
   acpSid: string,
   origin: "mapped" | "placeholder" | "raw",
+  zcodeSid: string,
   e: unknown,
 ): never {
   const raw = e instanceof Error ? e.message : String(e);
@@ -1158,6 +1634,7 @@ function translateResumeFailure(
     throw new Error(messages().loadUnknownAlias(acpSid));
   }
   warn(`${methodLabel}: ${acpSid} → backend session no longer exists (backend said: ${raw})`);
+  retireGoneSessionTasks(zcodeSid);
   throw new Error(messages().sessionEvicted(acpSid));
 }
 
@@ -1175,12 +1652,18 @@ export async function resumeSession(
   // file scope by sending its own cwd. Serve mode (ADR-0014) skips both
   // sources: the bridge exists for ONE hub-chosen project, so the root (and
   // the workspace sent to the backend's resume) stays the process cwd.
-  let cwd = server.serveMode ? process.cwd() : authoritativeSessionCwd(server, acpSid);
 
   // Lazy placeholders (session/new) resolve to their real backend session
   // here; alreadyLive targets skip the resume RPC because the session is live
   // in this backend subprocess.
   const { zcodeSid, alreadyLive, origin } = await resolveResumeTarget(server, acpSid);
+  // Resolving a durable alias may restore its recorded cwd; read it afterward.
+  let cwd = server.serveMode ? process.cwd() : authoritativeSessionCwd(server, acpSid);
+
+  // Same settle-before-read as loadSession (the TUI's deferred history replay
+  // fetches right after this returns; an active notification turn's final
+  // text only persists at its completion).
+  await waitForBackgroundTurnIdle(server, zcodeSid);
 
   if (!alreadyLive) {
     // No runtimeModel pinning here: the session keeps its own persisted
@@ -1208,7 +1691,7 @@ export async function resumeSession(
       const outcome = await resumePreservingModel(server, zcParams);
       resumeResult = outcome.result;
     } catch (e) {
-      translateResumeFailure("session/resume", acpSid, origin, e);
+      translateResumeFailure("session/resume", acpSid, origin, zcodeSid, e);
     }
     // The resume RPC succeeded — the session is now loaded in this backend.
     server.markBackendLoaded(acpSid);
@@ -1326,9 +1809,11 @@ export async function resumeIntoSession(
   // The adopted session's stored title wins over the placeholder's first-
   // prompt auto-title.
   server.titleEligibleSessions.delete(acpSid);
-  // Same for the user-rename pin: it belonged to the discarded placeholder
-  // thread, not the adopted conversation.
+  // Same for a pre-adoption /rename (pin AND title): it belonged to the
+  // discarded placeholder thread, not the adopted conversation — a leftover
+  // title would also short-circuit adoptStoredTitle below.
   server.titleUserSetBy.delete(acpSid);
+  server.sessionTitles.delete(acpSid);
 
   const cwd = server.serveMode ? process.cwd() : authoritativeSessionCwd(server, acpSid);
   // Settled history when a resume flight ran (performer OR joiner — the
@@ -1336,6 +1821,9 @@ export async function resumeIntoSession(
   // flight's snapshot instead of re-querying mid-hydration.
   let settledHistory: ZcodeMessage[] | undefined;
   try {
+    // Same settle-before-read as loadSession: the resume flight's history
+    // snapshot must not race an active background notification turn's tail.
+    await waitForBackgroundTurnIdle(server, zcodeTarget);
     await syncProviderRegistry(server, cwd);
     const outcome = await resumePreservingModel(
       server,
@@ -1355,6 +1843,23 @@ export async function resumeIntoSession(
   } catch (e) {
     warn(`/resume: adopting ${zcodeTarget} failed (${e instanceof Error ? e.message : String(e)})`);
     return { ok: false, error: messages().slashResumeFailed };
+  }
+
+  // Name the editor thread after the adopted conversation. Zed shows the first
+  // prompt's first line as a PROVISIONAL thread title until the agent pushes
+  // one — for an adopting thread that line is the `/resume` command itself,
+  // and adoptStoredTitle records the title bridge-side only, so the thread
+  // kept "/resume" as its title (observed 2026-11-10). Broadcast like every
+  // other title change; sent before the replay batch below takes the guard.
+  const adoptedTitle = server.sessionTitles.get(acpSid);
+  if (adoptedTitle) {
+    void sendSessionUpdate(server.clients.broadcast(), acpSid, {
+      sessionUpdate: "session_info_update",
+      title: adoptedTitle,
+      updatedAt: new Date().toISOString(),
+    }).catch((e) =>
+      log(`/resume: session_info_update failed: ${e instanceof Error ? e.message : String(e)}`),
+    );
   }
 
   // Fetch inside the batch (see replayResumeHistory): the guard must cover
@@ -1396,6 +1901,71 @@ export async function resumeIntoSession(
   return { ok: true, title: server.sessionTitles.get(acpSid) };
 }
 
+/** Poll cadence / cap for waitForBackgroundTurnIdle (see below). */
+const BG_TURN_SETTLE_POLL_MS = 250;
+const BG_TURN_SETTLE_TIMEOUT_MS = 45_000;
+/** Freshness bound for notifyTurnActiveSince, shared with the prompt path. */
+const BG_TURN_STALE_MS = 600_000;
+
+/**
+ * Wait out an ACTIVE background notification turn (the model turn the backend
+ * runs when a background task finishes) BEFORE a load/resume reads history.
+ *
+ * The turn's final reply persists only at COMPLETION — upstream writes the
+ * assistant message row at request start but its text parts at finish
+ * (turn-model-step.ts persistAssistantMessage/persistPart) — so a history
+ * fetch racing the turn's tail reads a row with no text. The attach then
+ * ships an empty-shell last reply, the client caches it as synced (same
+ * message count), and the notification's text stays invisible until the next
+ * prompt changes the count (observed 2026-11-15 on sess_70cd94db: the WeCom
+ * "task done" push fires the moment the notification turn STARTS, so the
+ * user's re-open reliably lands inside the generation window — every load in
+ * the window replayed the reply-less shell and each follow-up metadata
+ * attach saw matching counts, so it never re-fetched; the user had to ask a
+ * new question to see the result). Waiting for the turn's terminal event
+ * makes the subsequent read complete, and the wait runs BEFORE the client
+ * attach takes effect (registerSession), so no live text-delta forwarding
+ * interleaves with the replayed history either.
+ *
+ * Best-effort and bounded: on timeout the read proceeds as before
+ * (incomplete tail) instead of blocking the attach forever, and a marker
+ * older than BG_TURN_STALE_MS (the listener never saw the terminal event —
+ * dropped stream) is ignored outright, mirroring the prompt path's
+ * notify-turn busy budget in runPrompt.
+ *
+ * Exported for tests.
+ */
+export async function waitForBackgroundTurnIdle(
+  server: ZcodeAcpServer,
+  zcodeSid: string,
+): Promise<boolean> {
+  const activeAt = server.notifyTurnActiveSince.get(zcodeSid);
+  if (activeAt === undefined || Date.now() - activeAt >= BG_TURN_STALE_MS) return true;
+  const startedAt = Date.now();
+  log(
+    `  [bg-settle] background notification turn active; waiting up to ` +
+      `${Math.round(BG_TURN_SETTLE_TIMEOUT_MS / 1000)}s before reading history`,
+  );
+  while (Date.now() - startedAt < BG_TURN_SETTLE_TIMEOUT_MS) {
+    await new Promise((resolve) => setTimeout(resolve, BG_TURN_SETTLE_POLL_MS));
+    const since = server.notifyTurnActiveSince.get(zcodeSid);
+    if (since === undefined) {
+      log(`  [bg-settle] notification turn settled after ${Date.now() - startedAt}ms`);
+      return true;
+    }
+    // A marker that went stale mid-wait (terminal lost) stops waiting; a
+    // FRESH replacement marker (a second notification turn started) keeps
+    // the wait alive under the same overall cap.
+    if (Date.now() - since >= BG_TURN_STALE_MS) break;
+  }
+  warn(
+    `  [bg-settle] notification turn still active after ` +
+      `${Math.round((Date.now() - startedAt) / 1000)}s; reading history anyway ` +
+      `(the last reply may attach incomplete)`,
+  );
+  return false;
+}
+
 /**
  * `session/load` → zcode `session/resume` + stream conversation history back as
  * `session/update` notifications (text/reasoning/简化 tool_call).
@@ -1413,11 +1983,16 @@ export async function loadSession(
   // result correct it below — a remote client must not move a session's
   // file scope by sending its own cwd. Serve mode (ADR-0014) pins the root
   // (and the workspace sent to resume) to the process cwd throughout.
-  let cwd = server.serveMode ? process.cwd() : authoritativeSessionCwd(server, acpSid);
 
   // Same placeholder resolution as resumeSession; alreadyLive targets skip the
   // backend resume RPC (the session is live in this subprocess).
   const { zcodeSid, alreadyLive, origin } = await resolveResumeTarget(server, acpSid);
+  // BEFORE the resume flight and the history read: an active background
+  // notification turn persists its final text only at completion, so a fetch
+  // racing its tail ships an empty-shell last reply (see waitForBackgroundTurnIdle).
+  await waitForBackgroundTurnIdle(server, zcodeSid);
+  // Resolving a durable alias may restore its recorded cwd; read it afterward.
+  let cwd = server.serveMode ? process.cwd() : authoritativeSessionCwd(server, acpSid);
   // Settled history from a resume flight THIS call took part in (performer or
   // joiner — the flight settles hydration before resolving, so using its
   // snapshot is the mid-hydration-prefix guard; undefined = alreadyLive).
@@ -1451,8 +2026,15 @@ export async function loadSession(
   // on every surface and the auto-409 gate disarms with it. The response
   // discloses the suppression via `_meta.zcode.sessionClosed: true` so the
   // client can retire its tab locally. "user" (the default — old clients)
-  // keeps the manual-reopen re-arm exactly as before.
-  const retiredForAuto = readLoadIntent(params) === "auto" && server.isDiscoveryRetired(acpSid);
+  // keeps the manual-reopen re-arm exactly as before. Retirement is checked
+  // BOTH in memory AND in the durable close record: a serve-origin bridge
+  // EXITS on last close, so the hub-incubated successor process has no
+  // in-memory stamp — without the durable lookup a reconnect ladder's auto
+  // load resurrected the closed conversation on the fresh bridge (observed
+  // 2026-10-28: closed 00:48, auto-loaded back to life 01:07).
+  const retiredForAuto =
+    readLoadIntent(params) === "auto" &&
+    (server.isDiscoveryRetired(acpSid) || isClosedSessionId(acpSid) || isClosedSessionId(zcodeSid));
 
   if (!alreadyLive) {
     // Same mcpServers contract as resume: the client may re-declare them on
@@ -1476,7 +2058,7 @@ export async function loadSession(
       resumeResult = outcome.result;
       settledHistory = outcome.history;
     } catch (e) {
-      translateResumeFailure("session/load", acpSid, origin, e);
+      translateResumeFailure("session/load", acpSid, origin, zcodeSid, e);
     }
     // The resume RPC succeeded — the session is now loaded in this backend.
     server.markBackendLoaded(acpSid);
@@ -1600,8 +2182,12 @@ export async function loadSession(
   server.lastMode.set(acpSid, modes.currentModeId);
   // A turn from a prior client may still be in flight (the bridge runs it to
   // completion regardless of who prompted); flag it so re-attaching clients
-  // restore their running state. Editor-initiated turns land here too.
-  const turnActive = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
+  // restore their running state. Editor-initiated turns land here too — as do
+  // foreign turns the BACKEND started on its own (background-subagent wake,
+  // subagent_message; tracked by the background listener).
+  const turnActive =
+    [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid) ||
+    server.foreignActiveTurns.has(zcodeSid);
   const result = {
     modes,
     configOptions: await buildConfigOptions(server, zcodeSid, clientConnectionRoot(cx)),
@@ -2196,16 +2782,30 @@ export async function runOneTurn(
           suppressRetryNotice = true;
           continue;
         }
-        // Only a transient TurnFailedError is retryable; everything else (send
-        // failures, non-transient turn errors, exhausted retries, cancellation)
-        // propagates to the caller.
+        // Transient failures and one-shot gateway blips are retried; everything
+        // else (send failures, terminal turn errors, cancellation) propagates
+        // to the caller.
         if (e instanceof TurnFailedError) {
           const transient = isTransientTurnError(e.turnError);
-          if (attempt < MAX_TURN_ATTEMPTS && !turn.cancelled && transient) {
+          // A relay gateway's transient fault arrives as a request-failure
+          // cause code the upstream classifier marked non-retryable — its
+          // verdict judges the request shape, not the gateway's health
+          // (observed 2026-10-28: intermittent 400 invalid_request_error from
+          // a forwarding gateway, resend succeeded). Give those a bounded
+          // resend too; quota/context-exceeded/model-not-found stay terminal.
+          const gatewayBlip = !transient && isGatewayBlipTurnError(e.turnError);
+          if (attempt < MAX_TURN_ATTEMPTS && !turn.cancelled && (transient || gatewayBlip)) {
             lastTurnError = e.turnError;
             continue;
           }
-          if (!transient) throw turnFailureRequestError(e);
+          if (!transient && !gatewayBlip) throw turnFailureRequestError(e);
+          // Retries exhausted on a transient/gateway-blip failure: degrade
+          // gracefully below (user-visible notice + end_turn, goal-loop
+          // pauses via its structured throw) instead of a hard error that
+          // stops the session. A cancelled turn keeps the raw propagate.
+          if (turn.cancelled) throw e;
+          lastTurnError = e.turnError;
+          break;
         }
         throw e;
       }
@@ -2254,10 +2854,15 @@ export async function runOneTurn(
     // the helper throttles and skips when no client is attached.
     void emitLodyRateLimitsUpdate(server);
     // Report "running" only while no other turn for the session took over
-    // (preempt): the preempting turn's own running:true must survive. The
+    // (preempt): the preempting turn's own running:true must survive. A
+    // foreign turn (background-subagent wake / subagent_message — tracked in
+    // server.foreignActiveTurns) that started mid-loop also keeps the flag
+    // up: this END transition must not clear a turn it doesn't own. The
     // usage extras ride along only when the turn reported usage — a bare
     // end keeps the exact pre-extras payload shape.
-    const stillBusy = [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid);
+    const stillBusy =
+      [...server.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid) ||
+      server.foreignActiveTurns.has(zcodeSid);
     await emitTurnState(
       stillBusy,
       lastUsage ? { usage: lastUsage, turnMs: Date.now() - turnStartedAt } : undefined,
@@ -2287,11 +2892,12 @@ async function runPrompt(
   continuationRound = false,
   client?: acp.AgentContext,
 ): Promise<acp.PromptResponse> {
-  // Project-level sandbox flip (ADR-0011): a .zcode/acp/sandbox.json created
-  // after the backend spawned unsandboxed must arm on THIS prompt, not on the
-  // next bridge restart — kill the old process; the ensureBackend() below
-  // respawns under the profile and the subscribe-recovery path reloads the
-  // session. No-op unless the config appeared mid-run.
+  // Global sandbox flip: `sandbox.enabled` turned on in the user config (or
+  // ZCODE_ACP_SANDBOX=1 exported) after the backend spawned unsandboxed must
+  // arm on THIS prompt, not on the next bridge restart — kill the old
+  // process; the ensureBackend() below respawns under the profile and the
+  // subscribe-recovery path reloads the session. No-op unless the switch
+  // flipped mid-run.
   await server.applySandboxFlip();
   const backend = await server.ensureBackend();
 
@@ -2366,8 +2972,15 @@ async function runPrompt(
   // A failure here (evicted session, dead backend) abandons the prompt before
   // the send — staged files must go with it.
   let zcodeSid: string;
+  const wasPending = !server.resolveSid(params.sessionId);
   try {
     zcodeSid = await ensureRealSession(server, params.sessionId);
+    if (wasPending) {
+      const { emitConfigOptionUpdate } = await import("../config/options.js");
+      await emitConfigOptionUpdate(server, cx, params.sessionId, zcodeSid, "model").catch(
+        () => undefined,
+      );
+    }
     // Re-arm the session's out-of-band listeners (background tasks, backend
     // titles): a mid-session backend respawn (sandbox flip, dynamic allow
     // batches, dead-reader recovery) replaces the instance the listeners were
@@ -2625,7 +3238,11 @@ export async function setConfigOptionHandler(
     params.sessionId,
   );
   if (!result) {
-    throw new Error(`unsupported config option or switch failed: ${params.configId}`);
+    throw new Error(
+      params.configId === "model"
+        ? `model switch failed: "${params.value}" was not accepted (see the bridge log for the registry resolution)`
+        : `unsupported config option or switch failed: ${params.configId}`,
+    );
   }
   const { options } = await emitConfigOptionUpdate(
     server,
@@ -2894,6 +3511,10 @@ async function closeBackendSession(server: ZcodeAcpServer, zcodeSid: string): Pr
       `  [stop] session/close send failed (ignored): ${e instanceof Error ? e.message : String(e)}`,
     );
   }
+  // The runtime teardown kills any in-flight FOREIGN turn with no terminal
+  // event ever arriving for it — drop the tracking entry or the loop's
+  // finally would read the stale entry as stillBusy (false-running forever).
+  server.foreignActiveTurns.delete(zcodeSid);
 }
 
 /** Dependencies of drainBackendAfterCancel, injectable for tests. */
@@ -3234,7 +3855,7 @@ async function reassertModelChoice(server: ZcodeAcpServer, zcodeSid: string): Pr
  * cache, and the object form of `session/setModel` hard-fails a level-bearing
  * model without one ("Reasoning level is required").
  *
- * Best-effort: an empty or missing list leaves any previous cache intact.
+ * Empty or malformed lists invalidate the cache; the backend validates switches.
  */
 export function cacheModelAvailability(
   server: ZcodeAcpServer,
@@ -3250,16 +3871,34 @@ export function cacheModelAvailability(
         }>;
       }
     | undefined;
-  const avail = model?.available ?? [];
-  if (avail.length === 0) return;
+  const avail = model?.available;
+  if (
+    !Array.isArray(avail) ||
+    avail.length === 0 ||
+    avail.some(
+      (a) =>
+        !a ||
+        typeof a.ref?.providerId !== "string" ||
+        !a.ref.providerId ||
+        typeof a.ref?.modelId !== "string" ||
+        !a.ref.modelId,
+    )
+  ) {
+    server.modelAvailability.delete(zcodeSid);
+    // The identity and the snapshot are read as a pair by buildConfigOptions:
+    // a surviving registry-spelling identity over a deleted snapshot appends a
+    // duplicate same-named current into the local-config dropdown.
+    server.currentModelIdentity.delete(zcodeSid);
+    return;
+  }
   server.modelAvailability.set(
     zcodeSid,
     avail.map((a) => ({
       providerId: a.ref?.providerId,
       modelId: a.ref?.modelId,
       defaultLevel: a.reasoning?.defaultLevel ?? a.reasoning?.levels?.[0]?.value,
-      levels: (a.reasoning?.levels ?? [])
-        .map((l) => l.value)
+      levels: (Array.isArray(a.reasoning?.levels) ? a.reasoning.levels : [])
+        .map((l) => l?.value)
         .filter((v): v is string => typeof v === "string"),
     })),
   );
@@ -3291,22 +3930,35 @@ async function resumePreservingModel(
   opts: { skipSettle?: boolean } = {},
 ): Promise<ResumeOutcome> {
   const zcodeSid = String(zcParams["sessionId"] ?? "");
-  const inFlight = server.resumeInFlight.get(zcodeSid) as Promise<ResumeOutcome> | undefined;
-  if (inFlight) {
+  const inFlight = server.resumeInFlight.get(zcodeSid);
+  if (inFlight && inFlight.generation === server.backendGeneration) {
     // Known limitation (#193): the joiner rides the performer's params as
     // frozen at flight start, so mcpServers the joiner just remembered are
     // NOT delivered by this resume. Window: only right after a bridge
     // restart (map empty) with two clients loading the same session; the
     // next eviction reload re-sends the set. Re-issuing a second resume
     // here would break the single-flight dehydration guarantee.
-    const shared = await inFlight; // rethrows the first flight's failure
+    const shared = (await inFlight.promise) as ResumeOutcome; // rethrows the first flight's failure
     return { ...shared, performed: false };
   }
+  const entry: { generation: number; promise: Promise<unknown> } = {
+    generation: server.backendGeneration,
+    promise: Promise.resolve(),
+  };
   const flight = (async (): Promise<ResumeOutcome> => {
+    await server.ensureBackend();
+    const generation = server.backendGeneration;
+    // A cold spawn can advance the generation while this flight starts.
+    if (server.resumeInFlight.get(zcodeSid) === entry) entry.generation = generation;
+    // The backend can echo the supplied workspace in its resume snapshot.
+    // Verify the stored record before resume itself can load foreign history.
+    if (server.serveMode) await verifyServeWorkspace(server, zcodeSid);
     let result: unknown;
     try {
       result = await resumeBackendSession(server, zcParams);
     } catch (err) {
+      if (generation !== server.backendGeneration)
+        throw new Error("backend generation changed during resume");
       // A session the backend no longer stores cannot be repaired by ANY
       // overlay — rethrow the honest cause instead of retrying (3.12+
       // backends reject the runtimeModel key outright, so the retry would
@@ -3329,6 +3981,16 @@ async function resumePreservingModel(
         throw overlayErr;
       }
     }
+    if (generation !== server.backendGeneration)
+      throw new Error("backend generation changed during resume");
+    // Validate in the shared flight before reading history or marking live.
+    const backendWs = workspaceFromResumeResult(result);
+    if (server.serveMode) {
+      if (!backendWs) await verifyServeWorkspace(server, zcodeSid);
+      else if (!sameProjectDir(backendWs, process.cwd())) {
+        throw new Error("session belongs to another workspace");
+      }
+    }
     // The settle rides the flight (see the docstring): joiners awaiting this
     // promise are ordered after hydration, not merely after the RPC. EXCEPT
     // for a metadata-only attach (skipSettle): its reconcile is conservative —
@@ -3341,23 +4003,28 @@ async function resumePreservingModel(
     // session/read is hardcoded "current") — refresh the switch-time level
     // lookup for models added after create BEFORE the remembered choice
     // re-asserts (it resolves its level from this cache).
+    if (generation !== server.backendGeneration)
+      throw new Error("backend generation changed during resume");
     cacheModelAvailability(server, zcodeSid, result);
     // Re-apply the bridge-remembered model choice (best-effort — never fails
     // the resume): the resumed session may have silently reverted to the
     // workspace default when the backend's own selection entry was lost.
     await reassertModelChoice(server, zcodeSid);
+    if (generation !== server.backendGeneration)
+      throw new Error("backend generation changed during resume");
     return {
       performed: true,
       result,
       history,
     };
   })();
-  server.resumeInFlight.set(zcodeSid, flight);
+  entry.promise = flight;
+  server.resumeInFlight.set(zcodeSid, entry);
   try {
     return await flight;
   } finally {
     // Guarded delete: only the owner removes its own entry.
-    if (server.resumeInFlight.get(zcodeSid) === flight) server.resumeInFlight.delete(zcodeSid);
+    if (server.resumeInFlight.get(zcodeSid) === entry) server.resumeInFlight.delete(zcodeSid);
   }
 }
 
@@ -3872,7 +4539,7 @@ export async function runEventTurn(
     if (!emittedText) {
       const reply = await fetchLastReply(server, turn.zcodeSid, differ);
       if (reply) {
-        registerFetchedReply(translator, reply);
+        registerFetchedReply(translator, differ, reply);
         await sendTextChunk(cx, acpSid, reply.text, chunkMsgId);
       } else if (!emittedOutput) {
         // No text and no output → suspected failure.
@@ -3931,7 +4598,7 @@ export async function runEventTurn(
         } else {
           const reply = await fetchLastReply(server, turn.zcodeSid, differ);
           if (reply) {
-            registerFetchedReply(translator, reply);
+            registerFetchedReply(translator, differ, reply);
             await sendTextChunk(cx, acpSid, reply.text, chunkMsgId);
             turn.stallRecovered = true;
             log(
@@ -4090,6 +4757,16 @@ export async function runEventTurn(
       await sendTextChunk(cx, acpSid, messages().messageSwallowedByTurn, chunkMsgId);
       return turnResult(translator, "max_turn_requests");
     }
+    // Steer observability (#352 follow-up): every drained input becomes a
+    // persisted USER message in the backend transcript, but the injection
+    // never passes through session/prompt — no client anywhere rendered it
+    // (the steering requester got the `_session/steering` outcome reply, not
+    // a transcript entry). Echo it to everyone; deliberately BEFORE the
+    // attribution gate, since a drain that lands as boundary residue still
+    // injected a real user message into the session's history.
+    if (ev.type === "turn.steerDrained") {
+      echoSteeredInputs(server, acpSid, ev.payload);
+    }
     // Turn-attribution gate: before this turn's own turn.started arrives, any
     // event is leftover from a prior turn (cancelled/preempted but still
     // finalising) that landed in the queue while send was retrying on a busy
@@ -4130,6 +4807,14 @@ export async function runEventTurn(
     }
     for (const iev of internalEvents) {
       if (iev.kind === "TextDelta" || iev.kind === "ReasoningDelta") emittedText = true;
+      // Track live-delivered content per kind so the turn-completion replay
+      // can content-suppress a journal copy even when the two id systems
+      // failed to meet (see the completion loop below).
+      if (iev.kind === "TextDelta") {
+        differ.noteLiveTextDelta("text", iev.text, iev.messageId);
+      } else if (iev.kind === "ReasoningDelta") {
+        differ.noteLiveTextDelta("reasoning", iev.text, iev.messageId);
+      }
       if (iev.kind === "ToolCallNew" || iev.kind === "ToolCallUpdate") emittedOutput = true;
       // Sync usage to the differ so the turn-completion diff doesn't re-emit a
       // UsageDelta for the same value (the differ's lastUsage baseline is
@@ -4291,7 +4976,7 @@ export async function runEventTurn(
       if (!emittedText) {
         const reply = await fetchLastReply(server, turn.zcodeSid, differ);
         if (reply) {
-          registerFetchedReply(translator, reply);
+          registerFetchedReply(translator, differ, reply);
           await sendTextChunk(cx, acpSid, reply.text, chunkMsgId);
         }
       }
@@ -4335,6 +5020,29 @@ export async function runEventTurn(
               ? translator.deliveredMessageIds
               : translator.deliveredReasoningMessageIds;
           if (iev.messageId && delivered.has(iev.messageId)) continue;
+          // Belt under the id bridge: ids delivered live through paths this
+          // translator never saw (background notification forwarding,
+          // fetchLastReply), then content-level suppression — the live stream
+          // and the journal read can disagree on ids (3.18.0's wire spelled
+          // them `messageId`, older providers stream without any id), and
+          // re-dispatching already-seen text renders a verbatim duplicate
+          // bubble in every ACP client.
+          const liveContent =
+            iev.kind === "TextDelta" ? differ.liveTextDelivered : differ.liveReasoningDelivered;
+          const liveDelivered =
+            iev.kind === "TextDelta" && iev.messageId
+              ? differ.liveTextMessageIds.has(iev.messageId)
+              : false;
+          if (liveDelivered || isContentLiveDelivered(liveContent, iev.text)) {
+            warn(
+              `  ⚠ completion replay suppressed (${iev.kind} already delivered live; ` +
+                `messageId=${iev.messageId ?? "<no-id>"}, delivered ids: ` +
+                `[${[...delivered].join(", ")}] live-ids: [${[...differ.liveTextMessageIds].join(
+                  ", ",
+                )}])`,
+            );
+            continue;
+          }
         }
         await dispatchEvent(server, cx, acpSid, iev, chunkMsgId);
       }
@@ -4375,12 +5083,16 @@ export function shouldDropEventForTurnAttribution(
  * (the differ never saw this message — its live events were lost — so its
  * diff would re-emit the TextDelta). Reasoning is NOT registered: it was
  * never streamed either, so the replay dispatching it is pure gain.
+ * Registers on the differ's live-delivery tracker too (id + content) so a
+ * reply without a usable journal id is still content-suppressed.
  */
 function registerFetchedReply(
   translator: EventTranslator,
-  reply: { messageId: string | null },
+  differ: ProjectionDiffer,
+  reply: { text: string; messageId: string | null },
 ): void {
   if (reply.messageId) translator.deliveredMessageIds.add(reply.messageId);
+  differ.noteLiveTextDelta("text", reply.text, reply.messageId ?? undefined);
 }
 
 /**

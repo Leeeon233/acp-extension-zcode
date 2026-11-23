@@ -63,6 +63,10 @@ function makeFixtures(turn: PendingTurn, escalateAfterMs = 0): DrainFixtures {
     // reloadBackendSession re-sends remembered client MCP servers (#193) —
     // stub servers must mirror the real shape or the reload throws.
     sessionMcpServers: new Map(),
+    modelAvailability: new Map(),
+    // cacheModelAvailability drops this with an invalidated snapshot — stub
+    // servers must mirror the real shape or the reload throws.
+    currentModelIdentity: new Map(),
     markBackendLoaded: () => {},
     // resumePreservingModel single-flights through this map (ADR-0017 race
     // fix) — stub servers must mirror the real shape or the reload throws.
@@ -74,6 +78,9 @@ function makeFixtures(turn: PendingTurn, escalateAfterMs = 0): DrainFixtures {
     hydrationWatermark: new Map<string, number>(),
     // stopBackendTurn consults this (compaction kill guard) — same rule.
     autoCompactInFlight: new Set<string>(),
+    // closeBackendSession drops foreign-turn tracking on runtime teardown —
+    // same rule (stub servers must mirror the real shape).
+    foreignActiveTurns: new Map<string, string>(),
   } as unknown as ZcodeAcpServer;
   const pollOnce = vi.fn();
   const listener = { resubscribe: vi.fn(async () => true) };

@@ -66,3 +66,38 @@ close-then-reopen gesture and still misses ladders that fire past the
 window, and a complete guard needs clients to flag automated resumes, a
 cross-repo contract not worth its surface while the residual stays
 theoretical. Revisit with a real reproduction.
+
+Amendment (2026-10-28) — the retirement must outlive the serve bridge. The
+retirement stamp (`discoveryRetiredAt`) is in-memory, and a serve-origin
+bridge EXITS on its last close — so the hub-incubated successor process has
+no retirement memory at all. A reconnect ladder's auto `session/load`
+(quoting any spelling) then re-armed discovery on the fresh bridge, the
+heartbeat re-advertised the sid, and the hub cleared its close tombstone as
+"real use again": the conversation resurrected on every surface, sometimes
+with a live turn (observed live 2026-10-28: closed 00:48, resurrected by the
+ladder at 01:07 — the intent gate of the same day's fix never engaged
+because the fresh process's stamp map was empty). The durable half is the
+bridge-owned close record (`~/.zcode/v2/acp-closed-sessions.json`,
+`src/closed-sessions.ts`, same temp+rename store discipline as the
+lazy-alias store): the close endpoint records EVERY id spelling of the
+conversation (editor aliases + backend sess_ id), the auto-load gate in
+`loadSession` consults it alongside the in-memory stamp (either spelling
+matches), and genuine use — `markSessionActive`: a prompt, a user-intent
+load — clears the record, keeping the self-heal contract intact on both
+sides of a respawn. Entries expire after 30 days so a desktop-side reopen
+that never passed through a bridge cannot keep the App's tab retired
+forever. The earlier resume-guard rejection above stands: this amendment
+gates the auto LOAD path only, which the intent contract already
+distinguishes from a human's reopen.
+
+Amendment (2026-10-29) — instance shutdown retires too.
+`POST /api/instances/{id}/shutdown` (the older "close the instance" gesture)
+used to kill the pid and nothing else, leaving the hosted conversations with
+NO retirement memory anywhere — an auto reconnect ladder re-incubated the
+workspace and resurrected them through the same hole. The hub now relays the
+bridge's own close route per advertised session (`{force:true}` — cancel an
+in-flight turn instead of refusing) BEFORE the kill: discovery retirement,
+the durable record, the `session_closed` fan-out, and every id spelling
+tombstoned. A wedged or already-dead bridge falls back to hub-side stamps
+plus `recordClosedSessionIds` on the advertised spelling alone; a
+user-intent resume always reopens (shutdown retires, it never deletes).

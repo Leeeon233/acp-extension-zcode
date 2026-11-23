@@ -23,6 +23,16 @@
  *     of a notification turn; its `model.streaming text_delta` is forwarded
  *     as `agent_message_chunk` so the user sees the background result.
  *
+ * It is ALSO the running-state authority for turns this bridge did not drive
+ * (`server.foreignActiveTurns`): the turn loop only exists while a
+ * bridge-initiated prompt is registered, so a background-subagent wake, a
+ * `subagent_message` turn or a control-only turn would otherwise stream
+ * messages into a session every consumer reports as idle. Upstream keys its
+ * own running indicators off `turn.started` / `turn.terminal` facts
+ * regardless of origin (taskActivityTracker), so the listener mirrors that:
+ * foreign `turn.started` → `$/zcode/turnState running:true` broadcast +
+ * `/status` running + `replayMeta.turnActive`; the terminal clears it.
+ *
  * Everything else is ignored — the turn loop handles normal turns and normal
  * tool calls. Per the design decision, background agents' INTERNAL tool calls
  * are NOT expanded here (only the task-level card + the final result message).
@@ -41,6 +51,7 @@ import { log, warn } from "../utils.js";
 import type { ZcodeAcpServer } from "../server.js";
 import { armWorkflowRunPoller, stopWorkflowRunPoller } from "../workflow/poller.js";
 import { pushSettled, pushSourceLabel } from "../push/push.js";
+import { echoSteeredInputs, emitSessionTurnState } from "./io.js";
 
 /** Shape of a `session.updated` payload that reports a background task state. */
 interface TaskStatusPayload {
@@ -128,6 +139,16 @@ function cardTitle(description: string | undefined): string {
   return messages().backgroundTaskTitle((description ?? "").trim());
 }
 
+/**
+ * How long a rewind claim stays claimable. The replacement turn follows its
+ * admission within seconds (upstream command FIFO); anything starting later
+ * is an unrelated foreign turn and must not be misclaimed.
+ */
+const REWIND_CLAIM_TTL_MS = 90_000;
+
+/** Ownership-token sequence for the single rewind-claim slot (per process). */
+let rewindClaimTokenSeq = 0;
+
 export class BackgroundTaskListener implements EventListener {
   private readonly server: ZcodeAcpServer;
   readonly zcodeSid: string;
@@ -139,10 +160,78 @@ export class BackgroundTaskListener implements EventListener {
    * to the client as `agent_message_chunk`.
    */
   private activeNotifyTurnId: string | null = null;
+  /**
+   * Rewind claim (rewind.ts): a bridge-sent v4 editUserQuery/retryTurn admits
+   * its replacement turn through the command channel — no turn loop ever owns
+   * it, so without a claim its text would be silently dropped. Non-null while
+   * a rewind command is in flight or admitted-but-not-yet-started; the first
+   * non-background `turn.started` after it claims the notification-turn
+   * forwarding path. Timestamp (not boolean) so the TTL backstop can expire a
+   * claim whose turn never started (queue-admission edge).
+   */
+  private rewindClaimAt: number | null = null;
+  private rewindClaimToken: number | null = null;
+  private rewindClaimTimer: ReturnType<typeof setTimeout> | null = null;
 
   constructor(server: ZcodeAcpServer, zcodeSid: string) {
     this.server = server;
     this.zcodeSid = zcodeSid;
+  }
+
+  /**
+   * Pre-claim the replacement turn of a rewind command (called by rewind.ts
+   * BEFORE the v4 command is sent, so a turn starting while the ack is still
+   * settling is caught too). The claim arms the notification-turn forwarding
+   * path — the busy window is held by `notifyTurnActiveSince` + foreign-turn
+   * tracking, and settles at the turn's terminal. Returns an ownership
+   * token: the claim is single-slot, and a concurrent rewind's claim
+   * supersedes an earlier one — `releaseRewindClaim(token)` is a no-op when
+   * the slot belongs to a newer claim, so a FAILED concurrent call cannot
+   * drop the claim of the one still in flight.
+   */
+  claimRewindTurn(): number {
+    const token = ++rewindClaimTokenSeq;
+    this.rewindClaimAt = Date.now();
+    this.rewindClaimToken = token;
+    if (this.rewindClaimTimer) clearTimeout(this.rewindClaimTimer);
+    // Backstop: an accepted rewind whose replacement turn never starts (queue
+    // admission edge) would otherwise leave the busy window open forever —
+    // the handler deliberately does not settle the accepted path.
+    this.rewindClaimTimer = setTimeout(() => {
+      this.rewindClaimTimer = null;
+      if (this.rewindClaimAt === null) return;
+      this.rewindClaimAt = null;
+      this.rewindClaimToken = null;
+      warn(`  [bg] rewind claim expired without a turn — settling busy state`);
+      // Settle only when nothing else holds the session busy: a later
+      // legitimate turn (prompted while our claim sat unarmed) must not be
+      // unlocked by OUR expired claim.
+      if (this.sessionBusyElsewhere()) return;
+      const acpSid = this.server.acpSidByZcodeSid.get(this.zcodeSid);
+      if (acpSid) void emitSessionTurnState(this.server, acpSid, false);
+    }, REWIND_CLAIM_TTL_MS).unref();
+    return token;
+  }
+
+  /** True while a turn OTHER than our (expired) claim holds the session. */
+  private sessionBusyElsewhere(): boolean {
+    return (
+      [...this.server.pendingTurns.values()].some((t) => t.zcodeSid === this.zcodeSid) ||
+      this.server.foreignActiveTurns.has(this.zcodeSid) ||
+      this.server.notifyTurnActiveSince.has(this.zcodeSid)
+    );
+  }
+
+  /** Drop a claim that never armed (command rejected / errored). No-op when
+   * the slot was re-claimed by a newer rewind call. */
+  releaseRewindClaim(token: number): void {
+    if (this.rewindClaimToken !== token) return;
+    this.rewindClaimAt = null;
+    this.rewindClaimToken = null;
+    if (this.rewindClaimTimer) {
+      clearTimeout(this.rewindClaimTimer);
+      this.rewindClaimTimer = null;
+    }
   }
 
   handleEvent(event: ZcodeEvent): void {
@@ -177,7 +266,13 @@ export class BackgroundTaskListener implements EventListener {
           (event.payload?.["turnId"] as string | undefined) ??
           "";
         if (inputSource === "background_task") {
-          this.activeNotifyTurnId = turnId || null;
+          if (this.activeNotifyTurnId !== (turnId || null)) {
+            // A replacement notification started without the previous one's
+            // terminal ever arriving: drop the unfinished turn's generated
+            // message id so the new turn's text does not append to it.
+            this.firstMessageId = null;
+            this.activeNotifyTurnId = turnId || null;
+          }
           // Publish the window: the prompt path extends its send busy-retry
           // budget while a notification turn (a real model turn) holds the
           // prompt lock (server.notifyTurnActiveSince, see session.ts).
@@ -185,20 +280,94 @@ export class BackgroundTaskListener implements EventListener {
             this.server.notifyTurnActiveSince.set(this.zcodeSid, Date.now());
             log(`  [bg] background notification turn started (${turnId.slice(-8)})`);
           }
+        } else if (this.rewindClaimAt !== null && !this.activeNotifyTurnId) {
+          // The replacement turn of a bridge-sent v4 editUserQuery/retryTurn:
+          // admitted through the command channel, so no turn loop owns it and
+          // its inputSource is not "background_task". Claim it into the
+          // notification-turn forwarding path so its text streams to clients;
+          // the busy window and running transitions ride the foreign-turn
+          // tracking below (this branch only owns the text forwarding).
+          //
+          // A registered-but-not-started pendingTurn does NOT block the
+          // claim: upstream serializes turns FIFO, so the replacement always
+          // runs BEFORE a prompt queued behind it — and that prompt's turn
+          // loop drops foreign-turn events anyway (skippingForeignTurn), so
+          // forwarding here can never double-render. Skipping instead would
+          // LOSE the replacement text and strand the claim until the TTL
+          // backstop misfires its busy settle.
+          this.activeNotifyTurnId = turnId || null;
+          this.firstMessageId = null;
+          this.server.notifyTurnActiveSince.set(this.zcodeSid, Date.now());
+          this.releaseRewindClaim(this.rewindClaimToken!);
+          log(`  [bg] rewind replacement turn claimed (${(turnId || "?").slice(-8)})`);
+        } else if (this.activeNotifyTurnId) {
+          // A non-background turn starting while a notification is marked
+          // active means the notification's terminal event was never observed
+          // (dropped stream / superseded — v3 sends cannot start mid-turn on
+          // 0.16.9+). Clear the stale state: the prompt translator owns normal
+          // turns, and a stale marker would forward THEIR text as duplicated
+          // background output and hold the busy window open (#351).
+          log(`  [bg] stale notification state cleared by normal turn (${turnId.slice(-8)})`);
+          this.activeNotifyTurnId = null;
+          this.firstMessageId = null;
+          this.server.notifyTurnActiveSince.delete(this.zcodeSid);
+        }
+        // Foreign-turn running state (upstream taskActivityTracker parity):
+        // a turn.started from ANY source — background_task wake, subagent_message,
+        // control-only — marks the session running for every consumer that has
+        // no turn loop of its own to derive it from.
+        this.trackForeignTurn(turnId, true);
+        return;
+      }
+      if (event.type === "turn.steerDrained") {
+        // Mirror drained steer inputs in the no-turn-loop window (the zombie
+        // after a bridge-side cancel: the backend turn keeps generating, a
+        // steer drained then has no runEventTurn to echo it — without this
+        // the injected user text stays invisible until the next replay).
+        // While a turn loop is live it owns the echo; both listeners receive
+        // every event, so the pendingTurns gate is what keeps the two paths
+        // from double-echoing.
+        const turnLive = [...this.server.pendingTurns.values()].some(
+          (t) => t.zcodeSid === this.zcodeSid,
+        );
+        if (!turnLive) {
+          const acpSid = this.server.acpSidByZcodeSid.get(this.zcodeSid);
+          if (acpSid) echoSteeredInputs(this.server, acpSid, event.payload);
         }
         return;
       }
-      // Inside an active background notification turn → forward text deltas.
+      // Inside an active background notification turn → forward its text.
       if (this.activeNotifyTurnId) {
+        // Envelope-first turn attribution: an event naming a DIFFERENT turnId
+        // belongs to another turn (the user's foreground reply above all) —
+        // never forward it as background output and never let it close the
+        // busy window (#351). Events without any turnId (legacy backends)
+        // keep the window-open forwarding behavior.
+        const eventTurnId =
+          (event.turnId as string | undefined) ??
+          (event.payload?.["turnId"] as string | undefined) ??
+          "";
+        const foreignTurn = !!eventTurnId && eventTurnId !== this.activeNotifyTurnId;
         if (event.type === "model.streaming") {
+          if (foreignTurn) return;
           const kind = event.payload?.["kind"];
           if (kind === "text_delta") {
             const delta = (event.payload?.["delta"] as string | undefined) ?? "";
-            if (delta) void this.forwardText(delta);
+            if (delta) {
+              // Prefer the backend's assistantMessageId — replay/history
+              // surfaces key on it; the generated id covers legacy events.
+              const backendMessageId = event.payload?.["assistantMessageId"];
+              const messageId =
+                typeof backendMessageId === "string" && backendMessageId
+                  ? backendMessageId
+                  : undefined;
+              void this.forwardText(delta, messageId);
+            }
           }
           return;
         }
         if (event.type === "turn.completed" || event.type === "turn.failed") {
+          if (foreignTurn) return;
           log(`  [bg] background notification turn ended (${event.type})`);
           this.activeNotifyTurnId = null;
           this.server.notifyTurnActiveSince.delete(this.zcodeSid);
@@ -206,8 +375,19 @@ export class BackgroundTaskListener implements EventListener {
           // session gets its own — otherwise the editor would merge/overwrite
           // distinct tasks' outputs under one shared messageId.
           this.firstMessageId = null;
+          this.trackForeignTurn(eventTurnId, false);
           return;
         }
+      }
+      // Terminal outside any active notification turn: a pure foreign turn
+      // (subagent_message wake, control-only) ending — close its running
+      // state the same way.
+      if (event.type === "turn.completed" || event.type === "turn.failed") {
+        const eventTurnId =
+          (event.turnId as string | undefined) ??
+          (event.payload?.["turnId"] as string | undefined) ??
+          "";
+        this.trackForeignTurn(eventTurnId, false);
       }
     } catch (e) {
       warn(
@@ -216,6 +396,47 @@ export class BackgroundTaskListener implements EventListener {
         }`,
       );
     }
+  }
+
+  /**
+   * Maintain `server.foreignActiveTurns` for a turn this bridge did not drive
+   * (no `pendingTurns` entry exists for it) and broadcast the matching
+   * `turnState` transition when no bridge turn loop owns the session.
+   *
+   * OWNERSHIP IS DECIDED AT START: a turn.started arriving while a
+   * bridge-driven turn is registered belongs to the turn loop — it is neither
+   * tracked here nor emitted. Tracking it would poison the loop's finally
+   * (its stillBusy re-check reads this map): after an ESC cancel whose
+   * terminal never arrives, the map would hold the cancelled turn's own id
+   * and the session would report running forever (observed in review with a
+   * [true, true] broadcast sequence). The pendingTurns entry is registered
+   * before the send, so every bridge-driven turn's own turn.started lands
+   * behind it. A genuinely foreign start (background wake, subagent_message)
+   * can only begin when no bridge turn is registered — turns are serialized
+   * upstream-side.
+   *
+   * Terminal deletion is per turnId: interleaved turns' terminals must not
+   * clear a newer active entry; legacy envelopes without a turnId clear
+   * unconditionally. Emission stays gated on the pendingTurns emptiness —
+   * while a turn loop owns the session, its own start/finally emissions are
+   * the only transitions clients see.
+   */
+  private trackForeignTurn(turnId: string, started: boolean): void {
+    const turnLoopLive = [...this.server.pendingTurns.values()].some(
+      (t) => t.zcodeSid === this.zcodeSid,
+    );
+    if (started) {
+      if (turnLoopLive) return;
+      this.server.foreignActiveTurns.set(this.zcodeSid, turnId);
+    } else {
+      const current = this.server.foreignActiveTurns.get(this.zcodeSid);
+      if (turnId && current && current !== turnId) return;
+      this.server.foreignActiveTurns.delete(this.zcodeSid);
+    }
+    if (turnLoopLive) return;
+    const acpSid = this.server.acpSidByZcodeSid.get(this.zcodeSid);
+    if (!acpSid) return;
+    void emitSessionTurnState(this.server, acpSid, started);
   }
 
   /** Handle a `session.updated` carrying a background task status. */
@@ -524,10 +745,18 @@ export class BackgroundTaskListener implements EventListener {
     }
   }
 
-  /** Forward a text delta from the active background notification turn. */
-  private async forwardText(delta: string): Promise<void> {
+  /**
+   * Forward a text delta from the active background notification turn.
+   * `backendMessageId` (the payload's assistantMessageId) wins when present;
+   * otherwise the lazily-allocated generated id keeps one id per turn.
+   */
+  private async forwardText(delta: string, backendMessageId?: string): Promise<void> {
+    // Register on the session differ's live-delivery tracker so the in-flight
+    // user turn's completion diff (the notification turn's journal rows land
+    // after its anchor) doesn't replay this text over the forwarded copy.
+    this.server.differs?.get(this.zcodeSid)?.noteLiveTextDelta("text", delta, backendMessageId);
     // Allocate the messageId lazily so an empty-result turn emits nothing.
-    let msgId = this.activeMessageId();
+    let msgId = backendMessageId ?? this.activeMessageId();
     if (!msgId) {
       msgId = `bg_msg_${randomUUID().slice(0, 12)}`;
       this.firstMessageId = msgId;

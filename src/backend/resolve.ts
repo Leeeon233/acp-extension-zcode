@@ -7,16 +7,44 @@
  * "app-server", "--stdio"]` with an explicit, sqlite-capable Node binary.
  */
 
-import { existsSync, readdirSync, realpathSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { closeSync, existsSync, openSync, readdirSync, readFileSync, readSync, realpathSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { execFileSync } from "node:child_process";
 
 import { log, warn, zcodePersonalProviderPath } from "../utils.js";
 
+/**
+ * `which bin` — resolve a binary on PATH without external deps.
+ *
+ * Windows has no `which` (and GUI-launched processes have a stripped PATH):
+ * scan the PATH entries ourselves, honoring PATHEXT so `zcode` finds
+ * `zcode.cmd` / `zcode.exe`.
+ */
+export function windowsPathWhich(bin: string): string | null {
+  const dirs = (process.env.PATH ?? "").split(";").filter(Boolean);
+  const exts = (process.env.PATHEXT ?? ".COM;.EXE;.BAT;.CMD")
+    .split(";")
+    .map((e) => e.toLowerCase())
+    .filter(Boolean);
+  const names = [bin.toLowerCase(), ...exts.map((e) => bin.toLowerCase() + e)];
+  for (const dir of dirs) {
+    for (const name of names) {
+      try {
+        const full = path.join(dir, name);
+        if (existsSync(full)) return full;
+      } catch {
+        // unreadable PATH entry — skip
+      }
+    }
+  }
+  return null;
+}
+
 /** `which bin` — resolve a binary on PATH without external deps. */
 function whichSync(bin: string): string | null {
+  if (process.platform === "win32") return windowsPathWhich(bin);
   try {
     const out = execFileSync("which", [bin], {
       encoding: "utf8",
@@ -48,12 +76,25 @@ function zedBundledNodes(): string[] {
 /**
  * Candidate Node binaries in priority order. Deduped, order-preserving.
  * Falls back to the Zed-bundled Node glob as a last resort.
+ *
+ * Windows: `which node` is unavailable and the POSIX hardcodes don't exist,
+ * so the bridge's own executable (this bridge ships with engines >=22, and a
+ * GUI-launched bridge is exactly the no-PATH case the candidates exist for;
+ * skipped under Electron where execPath is the Electron binary) and the
+ * standard Program Files install are prepended.
  */
-function candidateNodeBinaries(): string[] {
+export function candidateNodeBinaries(): string[] {
   const cands: string[] = [];
   const envNode = process.env.ZCODE_NODE;
   if (envNode) cands.push(envNode);
-  cands.push("/opt/homebrew/bin/node", "/usr/local/bin/node");
+  if (process.platform === "win32") {
+    const isElectron = Boolean((process.versions as { electron?: string }).electron);
+    if (!isElectron) cands.push(process.execPath);
+    const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+    cands.push(path.join(programFiles, "nodejs", "node.exe"));
+  } else {
+    cands.push("/opt/homebrew/bin/node", "/usr/local/bin/node");
+  }
   const whichNode = whichSync("node");
   if (whichNode) cands.push(whichNode);
   cands.push(...zedBundledNodes());
@@ -68,19 +109,82 @@ function candidateNodeBinaries(): string[] {
 /**
  * Verify a Node binary can load `node:sqlite` (ZCode depends on it; Node < 22
  * lacks the module and would crash). Uses `new DatabaseSync(...)` because a
- * bare reference would mis-detect support.
+ * bare reference would mis-detect support. Memoized per binary: a binary's
+ * sqlite support cannot change within one bridge process, and the catalog
+ * probe re-resolves its command on every session/new flight.
  */
-function nodeSupportsSqlite(nodeBin: string): boolean {
+const sqliteSupportMemo = new Map<string, boolean>();
+let probeResolutionMemo: { key: string; argv: string[] } | null = null;
+
+/** Test hook — clear the per-process resolve memos between cases. */
+export function resetResolveMemosForTests(): void {
+  sqliteSupportMemo.clear();
+  probeResolutionMemo = null;
+}
+
+function nodeSupportsSqlite(nodeBin: string, env?: NodeJS.ProcessEnv): boolean {
   if (!nodeBin || !existsSync(nodeBin)) return false;
+  const memoKey = `${nodeBin}\0${env ? "sanitized" : "inherit"}`;
+  const memo = sqliteSupportMemo.get(memoKey);
+  if (memo !== undefined) return memo;
   try {
     execFileSync(nodeBin, ["-e", "new (require('node:sqlite').DatabaseSync)(':memory:')"], {
       stdio: ["ignore", "ignore", "ignore"],
       timeout: 5000,
+      env,
     });
+    sqliteSupportMemo.set(memoKey, true);
     return true;
   } catch {
+    sqliteSupportMemo.set(memoKey, false);
     return false;
   }
+}
+
+/**
+ * Parse `reg query` output for ZCode uninstallation entries to find InstallLocation.
+ * Exported for testing.
+ */
+export function parseRegUninstallLocations(output: string): string[] {
+  const locations: string[] = [];
+  const sections = output.split(/\r?\n(?=HKEY_)/);
+  for (const sec of sections) {
+    if (!/DisplayName\s+REG_SZ\s+.*ZCode/i.test(sec)) continue;
+    const match = sec.match(/InstallLocation\s+REG_SZ\s+(.*)/i);
+    if (match && match[1]) {
+      const loc = match[1].trim();
+      if (loc) locations.push(loc);
+    }
+  }
+  return locations;
+}
+
+/**
+ * Query the Windows Registry for ZCode installation locations.
+ * Checks both HKCU and HKLM Uninstall keys (including 32-bit Wow6432Node).
+ */
+export function windowsRegistryZcodeLocations(): string[] {
+  if (process.platform !== "win32") return [];
+  const roots = [
+    "HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    "HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+    "HKLM\\Software\\Wow6432Node\\Microsoft\\Windows\\CurrentVersion\\Uninstall",
+  ];
+  const locations: string[] = [];
+  for (const root of roots) {
+    try {
+      const out = execFileSync("reg", ["query", root, "/s", "/f", "ZCode", "/d"], {
+        encoding: "utf8",
+        stdio: ["ignore", "pipe", "ignore"],
+        timeout: 3000,
+        windowsHide: true,
+      });
+      locations.push(...parseRegUninstallLocations(out));
+    } catch {
+      // Key absent, query failed, or timed out — ignore silently.
+    }
+  }
+  return locations;
 }
 
 /**
@@ -88,11 +192,25 @@ function nodeSupportsSqlite(nodeBin: string): boolean {
  * (mirrors the per-platform table in README). The app never adds the CLI to
  * PATH, so a bare terminal launch of the REPL/editor bridge finds it here.
  */
-function bundledZcodeCandidates(): string[] {
+export function bundledZcodeCandidates(): string[] {
   const home = os.homedir();
   if (process.platform === "win32") {
     const localAppData = process.env.LOCALAPPDATA ?? path.join(home, "AppData", "Local");
-    return [path.join(localAppData, "Programs", "ZCode", "resources", "glm", "zcode.cjs")];
+    const programFiles = process.env.ProgramFiles ?? "C:\\Program Files";
+    const candidates = [
+      path.join(localAppData, "Programs", "ZCode", "resources", "glm", "zcode.cjs"),
+      path.join(programFiles, "ZCode", "resources", "glm", "zcode.cjs"),
+    ];
+    for (const installLoc of windowsRegistryZcodeLocations()) {
+      candidates.push(path.join(installLoc, "resources", "glm", "zcode.cjs"));
+    }
+    const seen = new Set<string>();
+    return candidates.filter((c) => {
+      const norm = path.normalize(c).toLowerCase();
+      if (seen.has(norm)) return false;
+      seen.add(norm);
+      return true;
+    });
   }
   return [
     "/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs",
@@ -134,6 +252,85 @@ function discoverZcodeBin(): string | null {
 const PROVIDER_CONFIG_NAME = "zcode-builtin.json";
 export const BUILTIN_PROVIDER_ENV = "ZCODE_BUILTIN_PROVIDER_CONFIG_FILE";
 export const PERSONAL_PROVIDER_ENV = "ZCODE_PERSONAL_PROVIDER_CONFIG_FILE";
+export const APP_VERSION_ENV = "ZCODE_APP_VERSION";
+
+/**
+ * Read `package.json#version` from an Electron `app.asar` archive header
+ * without unpacking it (cross-platform fallback for Linux/Windows bundles that
+ * carry no macOS `Info.plist`).
+ */
+function readAsarPackageVersion(asarPath: string): string | null {
+  let fd: number | undefined;
+  try {
+    fd = openSync(asarPath, "r");
+    const pre = Buffer.alloc(16);
+    if (readSync(fd, pre, 0, 16, 0) < 16) return null;
+    const headerPickleSize = pre.readUInt32LE(4);
+    const headerStringSize = pre.readUInt32LE(12);
+    if (headerStringSize === 0 || headerStringSize > 16 * 1024 * 1024) return null;
+    const headerBuf = Buffer.alloc(headerStringSize);
+    if (readSync(fd, headerBuf, 0, headerStringSize, 16) < headerStringSize) return null;
+    const header = JSON.parse(headerBuf.toString("utf8")) as {
+      files?: Record<string, { size?: unknown; offset?: unknown }>;
+    };
+    const pkgMeta = header.files?.["package.json"];
+    const size = typeof pkgMeta?.size === "number" ? pkgMeta.size : 0;
+    const offset = Number(pkgMeta?.offset);
+    if (!(size > 0 && size <= 1024 * 1024) || !Number.isFinite(offset) || offset < 0) {
+      return null;
+    }
+    const pkgBuf = Buffer.alloc(size);
+    const dataStart = 8 + headerPickleSize;
+    if (readSync(fd, pkgBuf, 0, size, dataStart + offset) < size) return null;
+    const pkg = JSON.parse(pkgBuf.toString("utf8")) as { version?: unknown };
+    return typeof pkg.version === "string" && pkg.version.trim() ? pkg.version.trim() : null;
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) {
+      try {
+        closeSync(fd);
+      } catch {
+        // ignore close error
+      }
+    }
+  }
+}
+
+/**
+ * Resolve the desktop app version adjacent to the bundled CLI directory (`glm/`).
+ *
+ * The desktop host injects `ZCODE_APP_VERSION` into its spawned app-server env
+ * (`buildHostProcessEnv`), and the CLI's `buildCliZCodeSourceHeaders` reads it
+ * to populate `User-Agent: ZCode/<version>` and `X-ZCode-App-Version: <version>`.
+ * Without it, headless launches send `User-Agent: ZCode/unknown` and omit
+ * `X-ZCode-App-Version`, which the Start Plan gateway (`zcode-plan/anthropic`)
+ * rejects even when `requestAuth` carries a valid `zcodejwttoken`.
+ */
+function readDesktopAppVersion(dir: string): string | null {
+  for (const plist of [
+    path.join(dir, "..", "..", "Info.plist"),
+    path.join(dir, "..", "Info.plist"),
+  ]) {
+    if (!existsSync(plist)) continue;
+    try {
+      const text = readFileSync(plist, "utf8");
+      const match = /<key>CFBundleShortVersionString<\/key>\s*<string>([^<]+)<\/string>/u.exec(
+        text,
+      );
+      const ver = match?.[1]?.trim();
+      if (ver) return ver;
+    } catch {
+      // try next candidate
+    }
+  }
+  for (const asar of [path.join(dir, "..", "app.asar"), path.join(dir, "..", "..", "app.asar")]) {
+    if (!existsSync(asar)) continue;
+    const ver = readAsarPackageVersion(asar);
+    if (ver) return ver;
+  }
+  return null;
+}
 
 /**
  * Env vars pointing the CLI at its provider tables, mirroring the desktop
@@ -182,7 +379,15 @@ export function builtinProviderEnv(entryArg?: string): NodeJS.ProcessEnv {
   const personal = zcodePersonalProviderPath();
   // A missing personal table is valid: the backend reads it as an empty layer.
   // Both paths must still be explicit to keep the builtin revision path stable.
-  return { [BUILTIN_PROVIDER_ENV]: found, [PERSONAL_PROVIDER_ENV]: personal };
+  const env: NodeJS.ProcessEnv = {
+    [BUILTIN_PROVIDER_ENV]: found,
+    [PERSONAL_PROVIDER_ENV]: personal,
+  };
+  if (!process.env[APP_VERSION_ENV]?.trim()) {
+    const appVersion = readDesktopAppVersion(dir);
+    if (appVersion) env[APP_VERSION_ENV] = appVersion;
+  }
+  return env;
 }
 
 /**
@@ -255,9 +460,18 @@ function happyEyeballsArgs(): string[] {
  * which the bridge does not serve (host capability, see docs/BACKLOG.md).
  * Advertised-but-unservable tools trap the model, so they are disallowed by
  * default. `ZCODE_ENABLE_AUTOMATION_TOOLS=1` opts back in for a host that
- * does implement the port (#192).
+ * does implement the port (#192). CronPauseSelf joined the always-registered
+ * set in 0.17.1 (automation run self-pause; upstream hides it from ordinary
+ * turns and puts it in remote workspaces' denylist — the bridge's headless
+ * backend never carries a run's automationId, so it can never be used).
  */
-const AUTOMATION_TOOL_DEFAULTS = ["CronCreate", "CronList", "CronUpdate", "CronDelete"];
+const AUTOMATION_TOOL_DEFAULTS = [
+  "CronCreate",
+  "CronList",
+  "CronUpdate",
+  "CronDelete",
+  "CronPauseSelf",
+];
 
 function disallowedToolsValue(): string | undefined {
   const fromEnv = process.env.ZCODE_DISALLOWED_TOOLS?.trim();
@@ -295,22 +509,47 @@ export function backendArgs(): string[] {
   return ["app-server", "--stdio", ...(disallowed ? ["--disallowed-tools", disallowed] : [])];
 }
 
-/** Resolve the full argv to launch `zcode app-server --stdio`. */
-export function resolveZcodeCommand(): string[] {
+/** Resolve the full argv to launch `zcode app-server --stdio`. The catalog
+ * probe path re-runs per session/new flight, so its resolution is memoized
+ * per process (ZCODE_BIN and the candidate set cannot change mid-process). */
+export function resolveZcodeCommand(opts: { catalogProbe?: boolean } = {}): string[] {
+  const probeEnv = opts.catalogProbe ? { ...process.env } : undefined;
+  if (probeEnv) {
+    delete probeEnv.NODE_OPTIONS;
+    delete probeEnv.NODE_PATH;
+  }
+  const memoKey = opts.catalogProbe ? (process.env.ZCODE_BIN ?? "") : null;
+  if (memoKey !== null && probeResolutionMemo?.key === memoKey) {
+    return [...probeResolutionMemo.argv];
+  }
+  const argv = resolveZcodeCommandOnce(probeEnv, opts.catalogProbe === true);
+  if (memoKey !== null) probeResolutionMemo = { key: memoKey, argv };
+  return [...argv];
+}
+
+function resolveZcodeCommandOnce(
+  probeEnv: NodeJS.ProcessEnv | undefined,
+  catalogProbe: boolean,
+): string[] {
   const zcodeBin = process.env.ZCODE_BIN ?? discoverZcodeBin() ?? "zcode";
   // Non-JS bin (e.g. a `zcode` command or wrapper) → use as-is, rely on its own shebang.
   if (!/\.(cjs|mjs|js)$/.test(zcodeBin)) {
     return [zcodeBin, ...backendArgs()];
   }
   // JS file → launch with an explicit sqlite-capable Node to bypass the shebang.
-  for (const nodeBin of candidateNodeBinaries()) {
-    if (nodeSupportsSqlite(nodeBin)) {
+  const candidates =
+    catalogProbe && process.release.name === "node" && !process.versions.electron
+      ? [process.execPath, ...candidateNodeBinaries()]
+      : candidateNodeBinaries();
+  for (const nodeBin of candidates) {
+    if (nodeSupportsSqlite(nodeBin, probeEnv)) {
       let ver = "?";
       try {
         // argv form (no shell, space-safe); capture stderr so it doesn't leak.
         ver = execFileSync(nodeBin, ["--version"], {
           encoding: "utf8",
           stdio: ["ignore", "pipe", "pipe"],
+          env: probeEnv,
         }).trim();
       } catch {
         // keep "?"

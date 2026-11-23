@@ -37,6 +37,9 @@
  * developer with it exported (Linux desktops, dotfile shells) would point the
  * suite's file-config reads at their real config — e.g. a real
  * `sandbox.enabled: true` would flip "sandbox stays off by default" tests.
+ * ZCODE_ACP_SANDBOX is DELETED for the same reason: a vitest run started
+ * from inside a sandboxed bridge session inherits the arm env, and the
+ * global-config settle/arming would run against the hermetic HOME.
  *
  * ZCODE_DYNAMIC_WORKFLOW_MODE is DELETED for the same reason: it is the
  * workflow-gate local override, and a developer exporting it (the headless
@@ -49,6 +52,15 @@
  * explicit env override the config — assertions on the merged child env then
  * see the developer's pin instead of the fixture value (observed: the PR #215
  * regression tests failing only inside bridge-run sessions).
+ *
+ * The martty boot handshake vars are DELETED for the same reason (observed
+ * 2026-11-05, four Desktop Presence tests failing only inside a boot-resumed
+ * TUI window): the terminal script exports DSH_TUI_AUTOPROMPT (the trigger
+ * martty auto-submits) and the boot-create/resume session vars into the
+ * window's shell, so a vitest run started there inherits them — and
+ * envWithLoginShell's union carries them straight into every hub-incubation
+ * env the tests assert on (a headless spawn must carry NONE of the
+ * handshake).
  */
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -60,6 +72,7 @@ const home = mkdtempSync(path.join(tmpdir(), "zacp-test-home-"));
 process.env.HOME = home;
 delete process.env.ZCODE_HOME;
 delete process.env.XDG_CONFIG_HOME;
+delete process.env.ZCODE_ACP_SANDBOX;
 delete process.env.ZCODE_DYNAMIC_WORKFLOW_MODE;
 delete process.env.ZCODE_MODEL;
 delete process.env.ANTHROPIC_API_KEY;
@@ -72,6 +85,8 @@ delete process.env.ZCODE_ACP_REMOTE_TOKEN;
 delete process.env.ZCODE_ACP_HUB_HOST;
 delete process.env.ZCODE_ACP_HUB_PORT;
 delete process.env.ZCODE_ACP_SANDBOX_ACTIVE;
+delete process.env.ZCODE_ACP_BOOT_CREATE_SESSION;
+delete process.env.DSH_TUI_AUTOPROMPT;
 
 afterAll(() => {
   // The dir is only used synchronously by store/config reads; by afterAll the

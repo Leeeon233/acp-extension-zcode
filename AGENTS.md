@@ -20,13 +20,26 @@ methods and streams events back as ACP `session/update` notifications.
 
 ZCode went open source (Apache-2.0): a local checkout lives at
 `~/Develop/NoBackup/ZCode` (remote `github.com/zai-org/ZCode`; checkout synced
-to source root 3.16.2 = app-server/`apps/zcode-cli` 0.17.0, commit `3c5b2276`,
-audited 2026-10-20 with no bridge impact — see docs/BACKLOG.md). The bridge
-runs desktop 3.16.3, whose bundled `zcode.cjs` self-reports CLI 0.17.0 — the
-SAME CLI the checkout carries, so the source is authoritative for the running
-backend (the 3.16.2→3.16.3 desktop delta is not in the public tree;
-`origin/main` IS `3c5b2276`). The Gotchas below were written against 0.16.9
-and re-verified file-by-file at the 0.17.0 audits (2026-10-19/20); the bundle
+to source root 3.18.2 via the 3.18.1 sync — the CLI still self-reports 0.17.1
+across desktop versions — commits `c5904686`/`fec97590`, audited 2026-11-14 —
+see docs/BACKLOG.md). The bridge runs desktop **3.18.2** (auto-updated from
+3.18.0, observed 2026-11-14; same CLI string; `zcode.cjs` sha256 `08726b5e…`,
+matching the catalog-probe pin in `src/config/deferred-probe-capability.ts`).
+Its audit found the protocol surface purely additive EXCEPT that ADR-0031's
+"no physical delete path" premise is gone: upstream added a v4-only
+permanent-deletion face
+(`storage/sessionData/*`, `bootstrap/src/zcode-protocol/session-data/
+permanent-deletion.ts`; follow-up in #371), AND its credential store
+migrated to `enc:v2:os` OS-keyring encryption (the 2026-11-12 outage — see
+the credential-store Gotcha below; fixed in 0.84.0, #374). The Gotchas below were written
+against 0.16.9 and re-verified file-by-file at the 0.17.0 audits
+(2026-10-19/20), the 3.17.1 audit (2026-11-02 — all invariants held; one
+bridge fix: `CronPauseSelf` joined the default tool denylist), the
+3.17.2/3.18.0 audit (2026-11-11 — all invariants held), the live
+3.18.0 credential-migration incident (2026-11-12), and the 3.18.1/3.18.2
+audit (2026-11-14 — protocol schema byte-identical both hops; 3.18.1 is
+telemetry-only, 3.18.2 adds host-only credential features and a Start-Plan
+identity split, neither touches the bridge's wires); the bundle
 recipe in docs/BACKLOG.md "Verification method" remains the way to re-prove a
 note against the binary. The agent runtime is under `apps/zcode-cli/packages/core/`;
 `packages/zcode-server-cli` is only a thin CLI shell. **Read the source BEFORE
@@ -208,16 +221,21 @@ ZCode protocol types into ACP notifications directly — always translate.
   never did; `builtinProviderEnv` now injects both vars). 3.12 also renamed
   the config-file model spelling to `custom:<urlencoded providerId>:<modelId>`
   (see `~/.zcode/agents/*.md`); `parseModelValue` accepts it. Entitlement
-  comes from `coding-plan-cache.json`
-  (desktop's resolved availability verdict) → legacy `config.json`
+  comes from legacy `config.json`
   (`builtin:*` enabled + apiKey) → manual plan keys in `provider_config.json`
   (access.type `zhipu-coding-plan-api-key`, family by official baseUrl —
-  `manualCodingPlanKeys`, the source-2 tier, #344); `setting.json`'s
+  `manualCodingPlanKeys`, the source-1 tier, #344); a 3.15+ OAuth selection
+  (`providerFamilyConnectionSelections` + `oauth:<family>:access_token`)
+  unions in UNCONDITIONALLY — both signals only exist on 3.15+ layouts, so
+  nothing older can speak against it; `setting.json`'s
   `modelProviderFamilySelectedKeys` is a _selection_ record, not an
-  entitlement — only as a last resort when both are empty. A bridge account
+  entitlement — only as a last resort when both are empty.
+  `coding-plan-cache.json` (the 3.12–3.14 verdict) is deliberately NOT read —
+  transitional releases, and a leftover cache surviving a 3.15+ upgrade would
+  suppress the OAuth union (#359). A bridge account
   (`acp-accounts.json`, `zcode-acp setup`) entitles its own family's
-  individual coding plan on top of that ladder, even over an `unavailable`
-  verdict, and never counts as a verdict. It entitles only when the overlay
+  individual coding plan on top of that ladder and never counts as a verdict.
+  It entitles only when the overlay
   applied (`bridgeOverlays`), so a family the installed catalog lacks gains
   nothing. The #320 store fallback must still
   see only the raw desktop files (`desktopEntitledBuiltinProviders`) — the
@@ -258,7 +276,22 @@ required for`); any other error aborts. Display side, `buildConfigOptions`
     say the disk is newer (`restartSoon` → `respawnSelf`); verified live
     2026-10-01 — the 0.60.0 rebuild auto-updated the running hub with no
     manual restart. A newly started bridge on the newer build votes a stale
-    hub out the same way via the register reply. `workspace/updateProviderRegistry` is
+    hub out the same way via the register reply. **A stale bridge is never
+    REUSED for new work (2026-11-10)**: the hub's `pickServeForNewWork` skips
+    any serve bridge whose self-reported `codeFingerprint` differs from the
+    dist on disk (mtime fallback for fingerprint-less builds), so a create or
+    a resume of an idle conversation incubates a bridge on the CURRENT code —
+    and `incubateServe`'s poll likewise refuses a stale registration, or the
+    skipped bridge would answer its own replacement's poll and the spawn would
+    be wasted. Those skips were the whole "Start Plan models still listed after
+    the release" report: one serve bridge per workspace, reused forever, so new
+    conversations kept the pre-build model list (the editor list is computed
+    per-process by `loadAllModels`, never by the hub — the hub is a byte proxy
+    and knows nothing of `configOptions`). Two invariants: a resume that has a
+    LIVE holder (any origin) always wins over the staleness check (two bridges
+    must never load one conversation), and the stale bridge is NOT killed — it
+    keeps serving attached clients/turns and idles out on its own
+    `SERVE_IDLE_MS`. `workspace/updateProviderRegistry` is
     GONE in 3.12+ (method-not-found) — the bridge logs it as a no-op, not a
     failure. Also note `session.model_selection.persist_failed` ("FOREIGN KEY
     constraint failed") — ROOT CAUSE found in source (2026-09-21): the
@@ -293,8 +326,37 @@ required for`); any other error aborts. Display side, `buildConfigOptions`
     bridge answers `headersApplied:true, requestAuth:{apiKey}` with the plan's
     config.json key for individual coding plans
     (`answerProviderRuntimeHeaders`, server-requests.ts) — the same key the
-    pre-3.12 `builtin:` provider used; start-plan stays declined (Aliyun
-    captcha, #123). **The answer is wired at frame ARRIVAL**
+    pre-3.12 `builtin:` provider used. On 0.17.x backends the desktop host also
+    answers `account:<family>-start-plan` directly with
+    `{apiKey: zcodejwttoken}` from `~/.zcode/v2/credentials.json` — the 0.17.1
+    request-security edition stubs `requiresRequestVerification()` to `false`
+    and `requestVerificationInteractionAvailable` to `false`
+    (verification-policy.ts; zcodeAgentService.ts:1754-1763), so
+    `respondAccountRequestAuthWithoutInteraction` ALWAYS runs and the remote
+    client-config captcha flag is never read (if a future edition re-enables
+    verification, expect gateway 403s — revisit then). The bridge mirrors the
+    host (`startPlanRequestAuthFor`) and injects `ZCODE_APP_VERSION` into the
+    backend env (`builtinProviderEnv`); Start Plan asks with no local
+    credential stay declined (#123). Start Plan ENTITLEMENT is
+    BILLING-AUTHORITATIVE (#406, 2026-11-19): `queryStartPlan`
+    (quota/startplan.ts) writes a process-wide verdict
+    (config/start-plan-verdict.ts) on every completed `billing/balance`
+    query — `entitled` (entitles any coding-plan family with an OAuth login,
+    WITHOUT the connection-selection flag, and its grant `modelIds` filter
+    the advertised/pushed start-plan models), `none` (authoritative negative,
+    suppresses even a start-plan flag), mirroring upstream
+    codingPlanProviderAvailability.ts (`hasActiveStartPlan`). The verdict is
+    warmed (bounded 2s) in `syncProviderRegistry` before the account push;
+    failures leave it `unknown`, where the LEGACY gate holds — ONLY a
+    `providerFamilyConnectionSelections` kind `start-plan` selection +
+    `zcodejwttoken` entitles, NOT the login alone (observed 2026-11-10: an
+    OAuth sign-in for the Coding Plan leaves the JWT in the store but holds
+    no Start Plan, and the login-based union once listed GLM-5.2/GLM-5-Turbo
+    for accounts that never activated it; observed 2026-11-18 #406: 3.17+
+    serves Start Plan as an OVERLAY whose selection stays
+    `individual-coding-plan` forever — the flag is neither necessary nor a
+    safe lever, flipping it by hand breaks the desktop's own credential
+    resolution). **The answer is wired at frame ARRIVAL**
     (`ZcodeBackend.providerRuntimeHeadersResponder`, set in ensureBackend), not
     just the turn-loop queue: a headers ask that lands while no turn loop is
     polling — compact's internal turn above all — used to sit unanswered until
@@ -345,6 +407,26 @@ required for`); any other error aborts. Display side, `buildConfigOptions`
   cancel — that made ESC feel dead for the whole remaining generation.
 - **`session/prompt` ordering**: subscribe to events BEFORE calling `session/send`
   — short turns can complete before a late subscribe catches them.
+- **One-shot gateway failures are resent even when the backend marks them
+  `retryable: false`** (2026-10-28): the upstream classifier tags provider
+  4xx/unknown request failures (`invalid_model_request`,
+  `model_request_failed`, `provider_not_configured`) as non-retryable — a
+  verdict about the REQUEST shape, not the gateway's health. Relay gateways
+  break that assumption (observed live: a local OpenAI-compatible relay
+  intermittently answered 400 `invalid_request_error` mid-conversation; the
+  resend succeeded — same session, minutes apart, and `attempt:1/11` meant
+  the backend's own 10-retry budget never engaged). `isGatewayBlipTurnError`
+  (src/translators/tool-helpers.ts) feeds those codes into the SAME bounded
+  resend ladder as transient failures (6 attempts, 1s/2s/4s/4s/4s); quota
+  (`model_rate_limited`), context-exceeded and model-not-found stay
+  terminal — quota has its own wait machinery and a resend cannot fix the
+  others. Exhausting the ladder now falls through to the graceful degrade
+  (`requestFailed` notice + end_turn) instead of throwing the raw
+  TurnFailedError: the pre-fix final attempt bypassed the degrade block and
+  hard-stopped the session, and the goal-loop path also lost the structured
+  RequestError its quota classifier reads. Do not "tighten" the classifier
+  back to retryable-only, and do not widen it by message keywords — the
+  code-only match is what keeps quota wording out.
 - **Auto-compact runs DETACHED from the turn that armed it — do not re-couple
   them**: `runOneTurn` arms it on end_turn; the `finally` starts it only AFTER
   `pendingTurns` cleanup + `running:false` (`runAutoCompactDetached`). The old
@@ -363,8 +445,11 @@ required for`); any other error aborts. Display side, `buildConfigOptions`
   broadcast with mutation reason `session_compacted` /
   `session_compact_cancelled` / `session_compact_failed`,
   `server-operations.ts:2082-2119` — real compact failure is now OBSERVABLE
-  on the v3 stream; wiring it into the bridge's success reporting is a
-  pending alignment item, see docs/BACKLOG.md.) Invariants that must stay: single-flight per sid
+  on the v3 stream and WIRED into the bridge's success reporting:
+  `ZcodeBackend.onCompactOutcome` records the reason per session and
+  `compact()` reads it after the lock wait — a `session_compact_failed` /
+  `session_compact_cancelled` outcome warns "context NOT compressed" instead
+  of assuming success from the RPC ack.) Invariants that must stay: single-flight per sid
   (`server.autoCompactInFlight` — keyed by the BACKEND sid and covering manual
   /compact too, not just auto) and the drain gate exempt while it runs. The
   compaction window is reported as BUSY by `compact()` itself (extensions.ts:
@@ -504,7 +589,43 @@ required for`); any other error aborts. Display side, `buildConfigOptions`
   ("Unrecognized key") — the resume overlay fallback is legacy-build-only, a
   not-found resume never retries the overlay, and a schema-rejected overlay
   rethrows the ORIGINAL failure (the old code masked "Session not found"
-  behind "Unrecognized key: runtimeModel").
+  behind "Unrecognized key: runtimeModel"). **On >= 0.17.1 backends the stale
+  stamp is settled by an authoritative probe first** (2026-11-02): the
+  backend's `SessionLifecycleController` exposes `session/lifecycle/getState`
+  (strict `{sessionId}`, side-effect-free, snapshot `{sessionId, state,
+generation, revision, lastError}` with states unloaded/starting/ready/
+  stopping/faulted; a session it no longer STORES answers "Session not found:
+  <sid>" — `isSessionGoneError` matches it as-is). `ensureBackendResident`
+  probes before reloading: `ready` merely refreshes the stamp (subscribers /
+  interactions / queued commands keep residents alive well past the bridge's
+  5-min TTL — the blind full-resume reload ran pointlessly on every stale
+  stamp), `gone` throws the evicted error before any reload, everything else
+  keeps the reload. The availability verdict is pinned per backend generation
+  (`server.backendLifecycleApi`, reset on respawn, mirrors
+  `toolDenylistRejected`) — pre-0.17.1 builds answer -32601 and pay the probe
+  exactly once. The standalone `session/lifecycle/changed` NOTIFICATION (full
+  snapshot payload, NOT a session/event) feeds `applyLifecycleSnapshot`
+  (wired via `ZcodeBackend.onLifecycleChanged`) as INVALIDATION only: every
+  non-`ready` transition (starting/stopping/unloaded/faulted) voids the
+  stamps of ALL ACP aliases mapping to that backend session — a
+  resident-pool eviction surfaces immediately instead of at the next
+  BACKEND_RESIDENT_TTL_MS boundary. `ready` deliberately does NOT re-stamp:
+  instance-ready and projection-applied are two separate completion
+  conditions upstream (session-runtime-lifecycle.md), and a foreign
+  activation (the v4 gateway's cold-resume behind renameSession, an
+  automation wake) rebuilds the runtime WITHOUT the bridge's per-load
+  mcpServers/toolDenylist — blessing it would let session/load skip its
+  resume flight + settle and replay from a possibly mid-hydration projection
+  (the replay-race hole). The getState probe is the ONLY ready-verifier, and
+  it fires on non-replay paths alone. Related wire fact: `session/resume` on
+  an already-resident session is a no-op for config — upstream
+  `activateSessionRuntime` early-returns the existing record without
+  re-applying resume params — so the pre-0.17.1 blind reload never re-sent
+  mcpServers to a still-resident session either. Do NOT replace the reload's
+  `session/resume` with `session/lifecycle/ensureReady`: the resume carries
+  mcpServers (#193) and toolDenylist (#340), which ensureReady has no field
+  for. `stop`/`restart` stay unused (bridge-side close/reload semantics are
+  already correct).
 - **AGENTS.md is workspace-scoped**: the global `~/.zcode/AGENTS.md` also exists;
   this file takes precedence for this repo.
 - **WS proxy frame type**: the SDK's WS server drops non-text frames, and
@@ -561,8 +682,65 @@ required for`); any other error aborts. Display side, `buildConfigOptions`
   Residual, accepted: a read landing ABOVE the watermark while a
   false-stable hydration still grows ships a prefix — the client-side
   last-message-id reconciliation is that defense.
+- **A background NOTIFICATION turn's reply is invisible after re-attach unless
+  the load WAITS the turn out (2026-11-15, sess_70cd94db)**: upstream writes
+  the notification turn's assistant message ROW at request start but its TEXT
+  PARTS only at turn completion (`turn-model-step.ts` persistAssistantMessage /
+  persistPart) — so a history fetch racing the turn's tail reads a row with no
+  text. The attach ships an empty-shell last reply, the client caches it as
+  synced (same message COUNT — the row exists), and every follow-up metadata
+  attach sees matching counts, never re-fetching: the task result is invisible
+  until the user's next prompt changes the count ("每次都要重新问才能继续",
+  reported as desktop-only because the desktop client IS
+  `zcode-acp-remote-desktop` — bridge-attached, not the ZCode app). The race
+  is near-deterministic: the WeCom "background task done" push fires the
+  moment the notification turn STARTS (`pushTaskTerminal` on the task's
+  terminal status), so the user's re-open reliably lands inside the
+  generation window (observed: push 10:10:23.388, attach fetch 10:10:51.069,
+  turn terminal 10:10:51.208 — 140ms short). The store itself is fine (rows +
+  semantics `assistant_response`/visible persist correctly; v3 read, v4
+  hydration, and `replayMessages` all surface the full text afterwards), and
+  a completion-diff supplement is NOT the fix — `forwardText` registers
+  `noteLiveTextDelta` even when ZERO clients received the delta, so the
+  differ's content suppression would eat the supplement. `waitForBackgroundTurnIdle`
+  (session.ts) gates `loadSession` / `resumeSession` / `resumeIntoSession`
+  BEFORE their resume flight and BEFORE `registerSession` (250ms poll on
+  `notifyTurnActiveSince`, cap 45s, marker staleness 10min mirroring the
+  prompt path's busy budget; timeout degrades to the old read, never blocks
+  forever). Before-registerSession matters: waiting after the attach takes
+  effect would interleave the turn's live `forwardText` deltas with the
+  replayed full history. Residual window: a notification turn STARTING between
+  the wait check and the fetch (sub-second); a shell cached by a pre-fix
+  attach stays invisible until the next prompt (App-side reconcile should
+  eventually also verify the last assistant message's `finish`, not just the
+  count — zcode-acp-app follow-up, not owed here).
 - **Remote failures never touch stdio**: any remote-side failure (port, hub,
   token) must warn and disable remote only — the editor link stays up.
+- **A remote close's retirement must OUTLIVE the serve bridge (ADR-0006
+  2026-10-28 amendment)**: `retireDiscovery`'s stamp is in-memory and a
+  serve-origin bridge EXITS on its last close, so the hub-incubated
+  successor has no retirement memory — a reconnect ladder's auto
+  `session/load` re-armed discovery on the fresh process, the heartbeat
+  re-advertised, the hub cleared its tombstone as "real use", and the closed
+  conversation resurrected on every surface (observed 2026-10-28: closed
+  00:48, resurrected 01:07 with a live turn; the intent gate never engaged
+  because the fresh process's stamp map was empty). The durable half is
+  `src/closed-sessions.ts` (`~/.zcode/v2/acp-closed-sessions.json`,
+  temp+rename like the lazy-alias store): the close endpoint records EVERY
+  id spelling (aliases + backend sess_ id), `loadSession`'s auto-intent gate
+  reads it alongside the in-memory stamp, and `markSessionActive` (a
+  prompt, a user-intent load) CLEARS it — the self-heal contract holds on
+  both sides of a respawn. Entries expire after 30 days (a desktop-side
+  reopen that never passed through a bridge must not keep the App's tab
+  retired forever). Do not "simplify" the gate back to the in-memory stamp
+  only, and keep new close/retire paths recording through
+  `recordClosedSessionIds`. Instance SHUTDOWN follows the same retirement
+  (2026-10-29): `/api/instances/{id}/shutdown` relays the bridge's close
+  route per advertised session (`{force:true}`) BEFORE the kill — killing
+  alone left no retirement memory anywhere, and old clients' "close
+  instance" gesture resurrected through the same hole; a wedged or
+  unreachable bridge falls back to hub-side stamps + the durable record on
+  the advertised spelling.
 - **User-level TUI env does NOT reach hub-incubated windows by itself — two
   gates, both must pass** (observed 2026-09-21: `DSH_TUI_STATS=tokens,context`
   exported in the user's shell never filtered the composer dock in a
@@ -641,7 +819,16 @@ required for`); any other error aborts. Display side, `buildConfigOptions`
   only when the updates arrive AFTER the response on a load/resume path it
   initiated (complete user_message/agent_message updates never fold — verified
   0.2.35; this holds for the boot `session/new` interception too — chunks
-  post-response DO fold). Martty's welcome banner, however, paints INSTEAD of
+  post-response DO fold). Martty STEERS through `_session/steering` (its
+  `steer_route` picks SessionSteering whenever the bridge's initialize
+  advertises `_meta.steering.supported`; Send Now / Ctrl+X) and keeps its own
+  pending cell as the rendering of an injected steer (`steer_ext_deferred`:
+  injected/startedNewTurn → the agent owns it, the cell stays; anything else
+  → hide + client-side requeue). The bridge's steer-drain echo
+  (`echoSteeredInputs`) therefore EXCLUDES the steering client's connection
+  root (`steerEchoSuppressedRoots`, recorded by the steering handler on an
+  accepted ack) — an unconditional echo would double-render in martty.
+  Martty's welcome banner, however, paints INSTEAD of
   the transcript (`ui.rs draw_chat`) and only dives on submitted text, so a
   boot-resumed TUI showed its replayed history only after the user's first
   message. Fix (bridge-side, no upstream dependency): the hub incubates resume
@@ -759,7 +946,13 @@ required for`); any other error aborts. Display side, `buildConfigOptions`
   (3) `session/fork` has no tool-face field and its `inherit` copies
   memory/toolSearch/shell but not the lists — a fork runs without the policy
   until its next resume (upstream gap; don't "fix" it with a close+resume
-  cycle on the fork response).
+  cycle on the fork response). 0.17.1 added `CronPauseSelf` (automation
+  run self-pause) to the always-registered set; the bridge's
+  `AUTOMATION_TOOL_DEFAULTS` covers it too (source 2026-11-02: upstream
+  hides it from ordinary turns and keeps it OUT of
+  `AUTOMATION_MUTATION_TOOL_NAMES` — adding it to a TURN list would corrupt
+  nothing, but the session-level default keeps it out of the ToolSearch
+  directory; upstream itself denylists it on remote workspaces).
 - **`turnId` lives on the event ENVELOPE, never the payload** (source
   2026-09-21: `zcodeEventEnvelopeSchema` carries `turnId?`,
   `packages/shared/src/zcode-protocol/index.ts:1029-1041`, while
@@ -788,13 +981,32 @@ payload}` for years and the translator read `payload["turnId"]`, which on
   deny-priority** — an `allow` emitted after a `deny` re-permits the write
   (verified via scripts/verify-sandbox.sh; the deny-island test failed until
   the denies were moved to the end). `buildSandboxProfile` therefore emits
-  base deny-all → all allows → island/strictGit denies LAST. Also:
+  base deny-all → all allows → config-dir/strictGit denies LAST. Also:
   subpath filters match REAL paths — every path (roots, allows, $TMPDIR)
   must go through `resolveReal`, or a symlinked prefix (/tmp →
   /private/tmp, $TMPDIR under /var/folders) silently fails to match. The
-  sandbox design lives in ADR-0011 (`.zcode/docs/adr/`): writes-only model,
-  per-project config in `.zcode/acp/sandbox.json` (deny island — only the
-  bridge may write it), dynamic allow = ask → persist → BATCHED backend
+  sandbox design lives in ADR-0011 (`.zcode/docs/adr/`; see its 2026-11-17
+  amendment): writes-only model, ONE machine-global config at
+  `~/.config/zcode-acp/sandbox.json` (XDG aware; auto-created on first
+  backend spawn with a pre-granted toolchain template — `~/go`,
+  `~/.gradle`, `~/.m2`, `~/.cargo`, `~/.rustup`, `~/.cocoapods`,
+  `~/.pub-cache`, `~/.nuget`, `~/.pnpm-store`, `~/.bun`, `~/.android`,
+  `~/Library/Android/sdk`; deleting the file = empty grants, NOT
+  re-created), `{allow, deny, strictGit}` — the per-project
+  `.zcode/acp/sandbox.json` and its deny island were REMOVED, and its last
+  state is migrated ONCE (live roots' allow/deny/strictGit unioned into the
+  global file; a legacy `enabled:true` carries onto the GLOBAL switch —
+  config.json `sandbox.enabled` via `writeJsonAtomic`, an explicit `false`
+  wins — so an upgrade never silently disarms; migration runs even unarmed
+  from `ensureGlobalSandboxConfig` at every ensureBackend, once per
+  process, `wx`-create so a sibling bridge's file wins the race). The
+  global config DIR is denied in every profile, after every allow — the
+  agent cannot edit its own allowlist or the config.json/hub credentials
+  beside it, and the deny holds even when a workspace root covers the dir
+  (workspace rooted at $HOME). Popup persistence goes through
+  `persistGlobalSandboxConfig` (sync temp+rename merge-at-write; REFUSES to
+  overwrite unparseable bytes — the caller downgrades to a once-allow).
+  Dynamic allow = ask → persist → BATCHED backend
   restart (3s window: grants collect, then one cancel-wave + continuation
   - close — a per-approval restart killed sibling popups still pending on
     other denied paths; the flush sets a continuation ONLY for sessions with
@@ -808,7 +1020,7 @@ payload}` for years and the translator read `payload["turnId"]`, which on
     phone: popup "expired" unanswered, model free-ran on, the WeCom notice
     pointed at a dead ask). (1) FREEZE: a real ask first sends the stop pair
     — the EPERM result already reached the model and it works past the
-    denial otherwise; structural early-returns (island/over-broad/
+    denial otherwise; structural early-returns (config-dir/over-broad/
     deny-listed/generic/debounce) never freeze. Every settled outcome then
     ends the round `cancelled` + continuation: allow → the batched restart
     as before; rejection/timeout/an ask that died UNDELIVERED (all attempts
@@ -841,10 +1053,10 @@ payload}` for years and the translator read `payload["turnId"]`, which on
     /var/tmp, /private/var/folders) are DEFAULT-ALLOWED — tools hardcode /tmp
     and $TMPDIR names only the per-user /var/folders leaf; don't "tighten"
     them back into popup storms (verify-sandbox.sh fixtures moved to HOME for
-    the same reason). Arming is dual-switch: `ZCODE_ACP_SANDBOX=1` globally
-    or `enabled: true` in that config per project (auto-created template ships
-    `false`; a malformed or non-object config reads as enabled — fail closed,
-    never rewrite the user's bytes). `server.backendSandboxed` is the process
+    the same reason). Arming is the GLOBAL switch only
+    (`ZCODE_ACP_SANDBOX=1` or `sandbox.enabled` in the user config;
+  `sandboxActive()` takes no roots anymore — the project opt-in is gone
+    with the file). `server.backendSandboxed` is the process
     fact the EPERM flow gates on — not `sandboxActive()`, which is the config
     wish re-checked per call (a mid-run flip to `true` is applied by
     `applySandboxFlip()` at prompt entry; flipping back only drops the wrap on
@@ -856,11 +1068,7 @@ payload}` for years and the translator read `payload["turnId"]`, which on
     prior sandboxed generations too, so a $TMPDIR profile is raceable across
     generations; each arm sweeps dead-pid dirs and legacy `~/.zcode-acp-sbx-*`
     HOME siblings, which the per-bridge chain-cleanup used to leak one per
-    restart), and
-    the config must pass the integrity check before the bridge persists
-    through it (symlink/hardlink pierces the deny island; a config read as
-    armed then EACCES/ENOTDIR/vanished also reads as armed — falling back to
-    the template would silently disarm). `/dev/null` must stay write-allowed
+    restart). `/dev/null` must stay write-allowed
     or every `git commit` breaks. `openpty` (`/dev/ptmx` + the granted
     `/dev/ttysNNN`, both `O_RDWR`) needs its two explicit write allows or
     `script`/`expect`/TUI binaries die with a bare `openpty: Operation not
@@ -917,15 +1125,94 @@ permitted` (#127); the slave allow is extension-gated (`require-all` +
   display shows the underlying mode until the first transition event/setMode;
   do NOT "fix" the fold away, and do not read the mode from settings expecting
   "plan".
-- **Start Plan providers are desktop-only — do NOT "fix" this with an
-  unofficial provider client**: `zcode-plan` requests need an Aliyun captcha
-  session only the desktop renderer can provide; the bridge answers
-  `interaction/requestProviderRuntimeHeaders` with `headersApplied:false` +
-  an actionable error (PR #128). Impersonating the desktop client, bypassing
-  the captcha/signing anti-abuse measures, or copying from the unlicensed
-  third-party proxies that do this are legal no-gos for a distributed tool
-  (ADR-0019) — decline the feature request and point users at GLM Coding
-  Plan or the desktop app.
+- **Start Plan providers use only the official host credential path — never an
+  unofficial provider client**: on 0.17.x backends (the request-security
+  edition disables per-request verification outright — `requiresRequestVerification()`
+  stubbed `false`, interactive branch unreachable, remote captcha config never
+  read), the desktop host serves `zcodejwttoken` from `~/.zcode/v2/credentials.json`
+  over `interaction/requestProviderRuntimeHeaders` (`startPlanRequestAuthFor`)
+  with `ZCODE_APP_VERSION` injected from the desktop bundle
+  (`builtinProviderEnv`). When no Start Plan credential exists (or if a future
+  edition re-enables per-request verification), the bridge answers
+  `headersApplied:false` + an actionable error (PR #128). Impersonating the
+  desktop client, bypassing captcha/signing anti-abuse measures, or copying
+  from unlicensed third-party proxies remain legal no-gos (ADR-0019).
+- **Desktop 3.18.0 migrated the credential store to `enc:v2:os` OS-keyring
+  encryption — the bridge MUST read it via @napi-rs/keyring, and ciphertext
+  must never pass through as plaintext** (observed live 2026-11-12: the
+  desktop update rewrote EVERY `~/.zcode/v2/credentials.json` value to
+  `enc:v2:os:<fp24>:<iv>.<tag>.<data>`; the pre-v2 reader returned
+  unparseable values unchanged, `answerProviderRuntimeHeaders` then handed
+  ciphertext to the gateway and EVERY bridge turn failed with
+  `model_request_failed` — desktop-owned sessions kept working, masking the
+  scope). Source of truth: `packages/shared/src/credential-security/
+systemCredentialCipher.ts` in the open-source tree. Wire facts that bite:
+  the key is a random 32-byte base64url secret in the platform vault under
+  service `"ZCode Credential Encryption"`, account = hex(sha256(RESOLVED
+  credentials.json path)) — resolve the path the same way or you read a
+  different entry; on Linux the Entry MUST pin `{linux:{store:
+"secret-service"}}` (upstream's AsyncEntry does — the default store differs
+  and reads a vault the desktop never wrote); `<fp24>` =
+  hex(sha256(key)).slice(0,24) is a KEY CHECKSUM, not a free-form source tag.
+  The backend also DELEGATES its own cipher ops to its host over
+  `interaction/requestCredentialCipher` (bootstrap's
+  `createProtocolCredentialCipher` — "只委托已连接 Host") — the reply is the
+  RPC RESULT validated by strict zod `credentialCipherReplySchema`:
+  `{requestId, result:{ok:true,value} | {ok:false,error:{code,message}}}` —
+  anything else is an invalid payload and every op fails as "host
+  unavailable". Declines ride the SAME `ok:false` result shape (never a bare
+  RPC error): upstream's OAuth recovery deletes stored logins only on
+  `ZCODE_CREDENTIAL_DECRYPT_FAILED`, so an uncorrelated error would
+  needlessly destroy working logins — map everything the bridge cannot serve
+  to `CREDENTIAL_SECURE_STORAGE_UNAVAILABLE`. Fixed in 0.84.0 (#374, with
+  parity tests against upstream's seal/open). **3.18.2 amendment (audited
+  2026-11-14)**: the `enc:v2:os` path is byte-identical in
+  `systemCredentialCipher.ts` (the fingerprint/service/account-keying were only
+  extracted into helpers). Upstream added two HOST-only features:
+  `shareKeyWithCopiedCredentials` (desktop data-root copy repair) and
+  `enablePrivateFileKeyFallback` — Linux Desktop Main only, default off; when
+  Secret Service is unavailable AND the directory is unbound, the host publishes
+  a 0600 `credential-secret` sibling file and future values carry source `env`
+  (`enc:v2:env:…`, key = digest of that file per `resolveManagedSecret`,
+  systemCredentialCipher.ts:141-150). The bridge's reader deliberately declines
+  `enc:v2:env` and does not read the sibling file — on that population
+  (Linux desktop without a keyring) Start-Plan credential reads degrade
+  gracefully; pre-3.18.2 those machines could not save logins at all, so this
+  is a new population, not a regression. Mirroring the sibling-file read is an
+  optional follow-up, not owed today.
+- **3.18.0 changed the `session/messages` wire shape from Core rows
+  (`info.id`) to the legacy-protocol mapper (`info.messageId`) — the bridge
+  normalizes in `fetchMessages`, and the completion replay additionally
+  content-suppresses already-delivered text** (observed live 2026-11-12, the
+  "整条 assistant 消息重复" duplicate-message bug): 3.18.0's `readMessages`
+  began serving history through upstream `message-mapper.ts` (message info
+  `messageId`/`sessionId`, parts `callId`/`messageId`/`partId`) instead of raw
+  Core rows, while `model.streaming` still carries `assistantMessageId`. The
+  bridge read `info.id` everywhere, so every id-based consumer silently
+  degraded to its id-less fallback — the turn-completion diff replayed EVERY
+  live-streamed turn's full text under `chunkMsgId` (clients render "two ids,
+  same content" as two bubbles; re-attach showed one copy because the journal
+  holds one row), and `dedupeMessages`/`historyAnchor`/replay cursors were
+  equally dead. `normalizeWireMessages` (src/handlers/replay.ts, applied
+  inside `fetchMessages` — the single history seam) maps `info.messageId` →
+  `info.id` and warns ONCE per process on first detection — that warn is the
+  wire-drift signal, not noise. Belt under the id bridge:
+  `ProjectionDiffer.noteLiveTextDelta` accumulates live-delivered
+  text/reasoning per turn window (fed by the turn loop's dispatch,
+  `fetchLastReply` via `registerFetchedReply`, and background-notification
+  `forwardText`, which also registers its backend ids into
+  `liveTextMessageIds` so a notification landing mid-user-turn is never
+  replayed over its forwarded copy); the completion loop suppresses a
+  replayed TextDelta/ReasoningDelta whose id was live-delivered through
+  another path or whose content is covered by the live stream
+  (`isContentLiveDelivered` — containment plus trimmed equality; an empty
+  accumulator never suppresses, so "replay a turn that ran while no listener
+  was attached" stays intact). The suppression emits a `⚠ completion replay
+suppressed` warn — treat that line as "the id bridge failed again". Do not
+  "simplify" either layer away: the normalization is the fix, the content
+  belt is what keeps the NEXT silent id drift from double-rendering every
+  reply. Reproduction/discrimination tooling: `.zcode/scratch/probe-duplicate/`
+  (a stdio-ACP probe that records every agent_message_chunk's messageId).
 - **ACP wire method names are snake_case** (`session/request_permission`,
   not `session/requestPermission`) — the camelCase spelling is silently
   method-not-found (-32601) on real clients, and an `as never` param cast
@@ -970,11 +1257,47 @@ permitted` (#127); the slave allow is extension-gated (`require-all` +
   (`{acpSessionId, runId, toolCallId}`) and closes it only when the bridge
   itself created it and the ack was not accepted.
 - **Project/session delete is a tasks-index TOMBSTONE — there is no physical
-  delete path, and none may be added** (ADR-0031, 2026-09-29): upstream's own
+  delete path, and none may be added** (ADR-0031, 2026-09-29; revised for
+  3.18.0 — see below): upstream's own
   `deleteTask` sets the App tasks-index row `deleted=1` and keeps the CLI
   store intact ("标记为列表不可见；CLI session 内容继续保留"), and the v3
   protocol has no delete RPC at all (`session/close` only releases the
-  runtime). The bridge mirrors exactly that: `POST /api/projects/delete` and
+  runtime). **3.18.0 revision (audited 2026-11-11, #371)**: upstream added a
+  REAL two-phase physical-deletion face — but V4-ONLY
+  (`storage/sessionData/*` preview→execute,
+  `session-data/permanent-deletion.ts`; no v3 delete RPC exists), so the
+  "none may be added" invariant narrows to "the bridge never mints deletes;
+  physical delete goes through the upstream v4 face only" — every rule below
+  still binds unchanged. The tombstone-vs-physical-delete follow-up is
+  DELIVERED (2026-11-13, #376; ADR-0031's 2026-11-13 amendment): (a)
+  **RETIREMENT** — a tombstone whose session the backend can no longer resume
+  (physically deleted via the v4 face, or upstream-soft-deleted:
+  `time_deleted`, which upstream `resumeFromStore` refuses with the same
+  "Session not found") gets `archived=1` on top of `deleted=1`
+  (`retireTasks`) and is never revived again; triggered proactively by the
+  revival pre-pass (`reviveTombstonesOnActivity`'s `probeGone` callback, fed
+  by `probeGoneBackendSessions` — `session/list {sessionIds}` batch oracle,
+  64/request schema cap, per-generation verdict `server.sessionIdsQueryRejected`
+  like toolDenylistRejected, per-id `session/lifecycle/getState` fallback,
+  EXISTING backend only — never spawns; ANY probe failure = empty set = blind
+  revival, the pre-#376 behavior) and lazily by the eviction paths
+  (`ensureBackendResident` gone branches + `translateResumeFailure`
+  fire-and-forget `retireTasks`). The task-scope revival flip now excludes
+  `archived=1` — flipping it would leave a deleted=0+archived=1 row that
+  masquerades as a user archive in the App's Archives view. Bridge-tombstoned
+  sessions (no `time_deleted`) keep the self-heal contract unchanged.
+  (b) **OPT-IN PURGE** — both delete endpoints accept `{"purge": true}` AND a
+  machine arming switch (`delete.purge` config / `ZCODE_ACP_DELETE_PURGE=1`,
+  live-read; 403 when unarmed, before any tombstone) to destroy bytes through
+  the upstream v4 face (`v4/storage/sessionData/deletionPreview|Execute`,
+  params `{sessionId, workspace:{workspacePath}, revision, operationId}` —
+  the workspace must match the store's record or the preview answers
+  identity-mismatch; tombstone FIRST so failures degrade to the soft delete;
+  running/in-use/changed → 409; not-found → retire; deleted → the tasks row
+  is REMOVED, `deleteTaskRows`). Project purge (hub) loops task ids through a
+  serve bridge (≤4 concurrent, ≤200 ids; no serve bridge → tombstones stand +
+  per-id `skipped` + `warning`). The bridge mirrors
+  exactly that: `POST /api/projects/delete` and
   `POST /api/instances/{id}/sessions/{sid}/delete` write tombstones
   (`src/tasks-index.ts` softDelete* — a session with no tasks row gets a
   born-tombstoned INSERT), `listSessions` filters `deleted=1 OR archived=1`
@@ -1003,13 +1326,51 @@ permitted` (#127); the slave allow is extension-gated (`require-all` +
   in the remote history list) because the session listing hides archived rows
   while the workspace list kept the group — the sessions count now counts
   only visible rows too.
+- **Session titles auto-name exactly ONCE, and a manual rename must fan out
+  through `renameSessionCore` — never a partial write** (2026-10-30): the
+  bridge seeds the title from the first prompt, the backend's FIRST
+  `generated` push may replace the seed (`server.autoTitleFinalized` freezes
+  the phase; every later `generated` — a deferred sidecar result, the resume
+  re-emission after the stored event rotated out of the retention window — is
+  ignored), and after that only manual renames (`/rename`, the remote rename
+  endpoint, a `custom` push from the desktop App) may change it. A rename that
+  skips the v4 `renameSession` command leaves the backend store stale and
+  every backend-derived read resurrects the old title ("改名被重置":
+  `adoptStoredTitle` read the stale `session/list` title after a restart, and
+  the resume title re-emission re-pushed it). The command sets
+  `titleSource=custom` (sticky — the backend's own generation is skipped
+  forever), and the v4 gateway COLD-RESUMES non-resident sessions for it, so
+  idle sessions are renamable too. Invariants: the rename covers the FULL
+  `sessionAliases` group (one spelling is not enough — another alias's load
+  adopted the stale title and reset it); `adoptStoredTitle` is pin-first
+  (sibling alias title → durable `title_overridden` title via `readTaskTitle`
+  → backend `session/list`); a placeholder renamed before first use replays
+  the rename at materialization (`ensureRealSession`). `/resume` into an
+  editor thread broadcasts the adopted title as a `session_info_update` right
+  after the adoption flight: Zed derives a PROVISIONAL thread title from the
+  first prompt's first line (conversation_view/thread_view.rs) and only a
+  pushed title replaces it — for an adopting thread that line is the
+  `/resume` command itself, so without the push the conversation stayed
+  titled "/resume" (observed 2026-11-10). The push rides BEFORE the replay
+  batch takes the session's send guard. `adoptStoredTitle`'s backend tier
+  asks `session/list {sessionIds:[id]}` first — the BARE listing is the 50
+  most recent sessions across ALL workspaces (upstream default limit), so an
+  old conversation was never found; a backend rejecting the key (strict zod)
+  falls back to the bare listing.
 - **Releases are fully automated** (release-please + npm OIDC trusted
   publishing, zero npm secrets): land conventional commits on `main`, merge
   the `chore(main): release X.Y.Z` PR, and tag + GitHub Release + npm publish
-  happen by themselves. Never hand-bump `package.json` version. A publish
-  failure with 404 on PUT is an npm-side trusted-publisher mismatch, not the
-  workflow. Public doc: `docs/RELEASING.md`; setup + troubleshooting runbook:
-  `.zcode/docs/releasing-runbook.md` (gitignored).
+  happen by themselves. Never hand-bump `package.json` version. **After the
+  release PR merges: local sync FIRST, publish check LAST** — `git pull` +
+  `pnpm build` (the hub auto-upgrades) right away; the release commit is on
+  `main` the moment the merge lands, so the local sync needs nothing from the
+  publish job, while `npm view` lags the CDN by minutes — watching the job or
+  waiting on npm first only stalls the local update (a recurring miss, last
+  at v0.83.0). A publish failure with 404 on PUT is an npm-side
+  trusted-publisher mismatch, not the workflow. Public doc:
+  `docs/RELEASING.md`; routine flow (gh write prefix, post-merge order) +
+  setup + troubleshooting: `.zcode/docs/releasing-runbook.md` (gitignored) —
+  read it BEFORE releasing.
 
 ## Docs to read before sensitive changes
 

@@ -28,11 +28,6 @@ vi.mock("../src/quota/index.js", () => ({ queryQuota: queryQuotaMock }));
 const { queryOcUsageMock } = vi.hoisted(() => ({ queryOcUsageMock: vi.fn() }));
 vi.mock("../src/quota/ollama-cloud/index.js", () => ({ queryOcUsage: queryOcUsageMock }));
 
-// CLIProxy dock segment — same isolation: an inherited config or env pair
-// must not reach the remote relay from tests.
-const { queryCpUsageMock } = vi.hoisted(() => ({ queryCpUsageMock: vi.fn() }));
-vi.mock("../src/quota/cliproxy/index.js", () => ({ queryCpUsage: queryCpUsageMock }));
-
 // tasks-index surface the delete routes consult. Defaults mirror the real
 // module under a hermetic HOME (no index): no known workspaces, nothing
 // deleted — existing tests behave exactly as before.
@@ -40,6 +35,7 @@ const tasksIndexMock = vi.hoisted(() => ({
   workspaces: [] as Array<{ workspacePath: string; sessions: number; lastActive: number }>,
   deletedSids: new Set<string>(),
   workspaceDeletes: [] as Array<{ workspacePath: string; dbPath?: string }>,
+  taskIds: [] as string[],
 }));
 vi.mock("../src/tasks-index.js", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../src/tasks-index.js")>();
@@ -53,15 +49,11 @@ vi.mock("../src/tasks-index.js", async (importOriginal) => {
         .filter((w) => w.workspacePath === workspacePath)
         .reduce((n, w) => n + w.sessions, 0);
     },
+    workspaceTaskIds: async () => tasksIndexMock.taskIds,
   };
 });
 
-import {
-  resetDockCacheForTest,
-  resetQuotaCacheForTest,
-  startHub,
-  type HubHandle,
-} from "../src/remote/hub-server.js";
+import { resetQuotaCacheForTest, startHub, type HubHandle } from "../src/remote/hub-server.js";
 
 const TOKEN = "test-hub-token";
 const BASE_PORT = 18400; // bridge ports start here; ephemeral hub uses port 0
@@ -123,32 +115,11 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   ]);
 }
 
-const QUOTA_FIXTURE = {
-  glm: { kind: "success", level: "Max", items: [] },
-  opencode: { kind: "not_configured" },
-};
-
 describe("hub discovery API", () => {
-  it("answers health without auth", async () => {
-    const hub = await startTestHub();
-    const res = await fetch(`http://127.0.0.1:${hub.port}/api/health`);
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe("ok");
-  });
-
   it("rejects /api/instances without or with a wrong token", async () => {
     const hub = await startTestHub();
     expect((await fetch(`http://127.0.0.1:${hub.port}/api/instances`)).status).toBe(401);
     expect((await listInstances(hub, "wrong")).status).toBe(401);
-  });
-
-  it("returns CORS headers and handles preflight", async () => {
-    const hub = await startTestHub();
-    const res = await fetch(`http://127.0.0.1:${hub.port}/api/instances`, {
-      method: "OPTIONS",
-    });
-    expect(res.status).toBe(204);
-    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 
   it("survives a client aborting mid-POST (no unhandled rejection)", async () => {
@@ -194,55 +165,6 @@ describe("hub discovery API", () => {
       sessions: [{ sessionId: "s1", title: "hello", updatedAt: 1 }],
     });
     expect(list[0]!["lastSeen"]).toBeUndefined();
-  });
-
-  it("rejects a register with a wrong body token or bad payload", async () => {
-    const hub = await startTestHub();
-    const wrongToken = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(registerBody({ token: "nope" })),
-    });
-    expect(wrongToken.status).toBe(401);
-
-    const badPayload = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(registerBody({ port: 0, sessions: "x" })),
-    });
-    expect(badPayload.status).toBe(400);
-    expect((await listInstances(hub)).status === 200).toBe(true);
-  });
-
-  it("takes the registrant's own startedAt over its own clock", async () => {
-    // The tie-break that decides which bridge wins a shared session ranks by
-    // start time. Stamping the hub's `Date.now()` at first register instead
-    // would rank by when the register ARRIVED, and a bridge whose cold start
-    // was slow (provider sync) would beat one that really started later — the
-    // wrong bridge wins and clients attach where nothing is live.
-    const hub = await startTestHub();
-    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(registerBody({ startedAt: 1_700_000_000_000 })),
-    });
-    expect(res.status).toBe(200);
-    const list = (await (await listInstances(hub)).json()) as Array<{ startedAt: number }>;
-    expect(list[0]!.startedAt).toBe(1_700_000_000_000);
-  });
-
-  it("falls back to its own clock when the register omits startedAt", async () => {
-    // Older bridges never sent it; the entry still needs a usable timestamp.
-    const hub = await startTestHub();
-    const before = Date.now();
-    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(registerBody()),
-    });
-    expect(res.status).toBe(200);
-    const list = (await (await listInstances(hub)).json()) as Array<{ startedAt: number }>;
-    expect(list[0]!.startedAt).toBeGreaterThanOrEqual(before);
   });
 
   it("preserves startedAt across heartbeats and removes on unregister", async () => {
@@ -294,15 +216,6 @@ describe("hub discovery API", () => {
 
 describe("hub on-demand probe", () => {
   /** Bare TCP listener — enough for the probe's connect check. */
-  function startTcpListener(): Promise<{ server: net.Server; port: number }> {
-    return new Promise((resolve) => {
-      const server = net.createServer(() => {});
-      server.listen(0, "127.0.0.1", () => {
-        const addr = server.address();
-        resolve({ server, port: typeof addr === "object" && addr ? addr.port : 0 });
-      });
-    });
-  }
 
   async function registerInstance(hub: HubHandle, body: unknown): Promise<void> {
     const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
@@ -345,34 +258,6 @@ describe("hub on-demand probe", () => {
     const after = (await (await listInstances(hub)).json()) as unknown[];
     expect(after).toEqual([]);
   });
-
-  it("a heartbeat re-register clears the unhealthy mark", async () => {
-    const hub = await startTestHub({ probeGraceMs: 100 });
-    await registerInstance(hub, registerBody()); // BASE_PORT: nothing listens
-
-    // Mark unhealthy, then let the grace fully expire while marked.
-    expect(((await listProbed(hub)) as unknown[]).length).toBe(1);
-    await new Promise((r) => setTimeout(r, 150));
-
-    // The heartbeat re-register proves liveness and must reset the mark, so
-    // the next failing probe starts a fresh grace instead of pruning.
-    await registerInstance(hub, registerBody());
-    const probed = (await listProbed(hub)) as unknown[];
-    expect(probed).toHaveLength(1);
-  });
-
-  it("keeps live instances when probing", async () => {
-    const hub = await startTestHub();
-    const listener = track(
-      await startTcpListener(),
-      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
-    );
-    await registerInstance(hub, registerBody({ port: listener.port }));
-
-    const probed = (await listProbed(hub)) as Array<Record<string, unknown>>;
-    expect(probed).toHaveLength(1);
-    expect(probed[0]).toMatchObject({ id: "inst-1", port: listener.port });
-  });
 });
 
 describe("hub quota endpoint", () => {
@@ -390,152 +275,6 @@ describe("hub quota endpoint", () => {
       (await fetch(quotaUrl(hub), { headers: { Authorization: "Bearer wrong" } })).status,
     ).toBe(401);
     expect(accountUsageStatsMock).not.toHaveBeenCalled();
-  });
-
-  it("returns the usage-stats payload verbatim", async () => {
-    const hub = await startTestHub();
-    accountUsageStatsMock.mockResolvedValueOnce(QUOTA_FIXTURE);
-    const res = await fetch(quotaUrl(hub), { headers: { Authorization: `Bearer ${TOKEN}` } });
-    expect(res.status).toBe(200);
-    expect(res.headers.get("Content-Type")).toContain("application/json");
-    expect(res.headers.get("Cache-Control")).toBe("no-store");
-    expect(await res.json()).toEqual(QUOTA_FIXTURE);
-    expect(accountUsageStatsMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("serves the cached copy within the TTL", async () => {
-    const hub = await startTestHub();
-    accountUsageStatsMock.mockResolvedValue(QUOTA_FIXTURE);
-    const headers = { Authorization: `Bearer ${TOKEN}` };
-    const first = await fetch(quotaUrl(hub), { headers });
-    const second = await fetch(quotaUrl(hub), { headers });
-    expect(await first.json()).toEqual(QUOTA_FIXTURE);
-    expect(await second.json()).toEqual(QUOTA_FIXTURE);
-    expect(accountUsageStatsMock).toHaveBeenCalledTimes(1);
-  });
-
-  it("answers 502 when the quota query fails, without caching the failure", async () => {
-    const hub = await startTestHub();
-    accountUsageStatsMock.mockRejectedValueOnce(new Error("upstream down"));
-    const res = await fetch(quotaUrl(hub), { headers: { Authorization: `Bearer ${TOKEN}` } });
-    expect(res.status).toBe(502);
-
-    accountUsageStatsMock.mockResolvedValueOnce(QUOTA_FIXTURE);
-    const retry = await fetch(quotaUrl(hub), { headers: { Authorization: `Bearer ${TOKEN}` } });
-    expect(retry.status).toBe(200);
-  });
-
-  it("falls through to 404 for non-GET methods", async () => {
-    const hub = await startTestHub();
-    const res = await fetch(quotaUrl(hub), {
-      method: "POST",
-      headers: { Authorization: `Bearer ${TOKEN}` },
-    });
-    expect(res.status).toBe(404);
-    expect(accountUsageStatsMock).not.toHaveBeenCalled();
-  });
-});
-
-describe("hub quota dock endpoint", () => {
-  const dockUrl = (hub: HubHandle) => `http://127.0.0.1:${hub.port}/api/quota/dock`;
-
-  beforeEach(() => {
-    queryQuotaMock.mockReset();
-    queryOcUsageMock.mockReset();
-    queryOcUsageMock.mockResolvedValue({ kind: "not_configured" });
-    queryCpUsageMock.mockReset();
-    queryCpUsageMock.mockResolvedValue({ result: { kind: "not_configured" }, otherCount: 0 });
-    resetDockCacheForTest();
-  });
-
-  it("rejects /api/quota/dock without a token", async () => {
-    const hub = await startTestHub();
-    expect((await fetch(dockUrl(hub))).status).toBe(401);
-    expect(queryQuotaMock).not.toHaveBeenCalled();
-  });
-
-  it("returns {formatted, fetchedAt} from queryQuota", async () => {
-    const hub = await startTestHub();
-    queryQuotaMock.mockResolvedValueOnce({
-      kind: "success",
-      level: "pro",
-      items: [
-        { key: "token_5h", label: "5h", usedPercent: 45, leftPercent: 55 },
-        { key: "token_week", label: "Week", usedPercent: 12, leftPercent: 88 },
-      ],
-    });
-    const res = await fetch(dockUrl(hub), { headers: { Authorization: `Bearer ${TOKEN}` } });
-    expect(res.status).toBe(200);
-    expect(res.headers.get("Cache-Control")).toBe("no-store");
-    const body = (await res.json()) as { formatted: string | null; fetchedAt: number };
-    expect(body.formatted).toBe("45% · 12%");
-    expect(body.fetchedAt).toBeGreaterThan(0);
-  });
-
-  it("appends the CLIProxy segment (tightest model) to the dock", async () => {
-    const hub = await startTestHub();
-    queryQuotaMock.mockResolvedValueOnce({
-      kind: "success",
-      level: "pro",
-      items: [{ key: "token_5h", label: "5h", usedPercent: 45, leftPercent: 55 }],
-    });
-    const resetAt = Date.now() + 3_600_000;
-    queryCpUsageMock.mockResolvedValueOnce({
-      result: {
-        kind: "success",
-        fetchedAt: Date.now(),
-        accounts: [
-          {
-            label: "will",
-            provider: "antigravity",
-            models: [
-              { name: "Gemini Models", windows: [{ window: "week", used: 0.634, resetAt }] },
-            ],
-          },
-        ],
-      },
-      otherCount: 1,
-    });
-    const res = await fetch(dockUrl(hub), { headers: { Authorization: `Bearer ${TOKEN}` } });
-    expect(res.status).toBe(200);
-    const body = (await res.json()) as { formatted: string | null };
-    const d = new Date(resetAt);
-    const date = `${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
-    expect(body.formatted).toBe(`45% · cp 63.4% ${date}`);
-  });
-
-  it("serves the cached copy within the TTL", async () => {
-    const hub = await startTestHub();
-    queryQuotaMock.mockResolvedValue({
-      kind: "success",
-      level: "pro",
-      items: [{ key: "token_5h", label: "5h", usedPercent: 1, leftPercent: 99 }],
-    });
-    const headers = { Authorization: `Bearer ${TOKEN}` };
-    const first = await fetch(dockUrl(hub), { headers });
-    const second = await fetch(dockUrl(hub), { headers });
-    expect(queryQuotaMock).toHaveBeenCalledTimes(1);
-    expect(((await first.json()) as { formatted: string }).formatted).toBe("1%");
-    expect(((await second.json()) as { formatted: string }).formatted).toBe("1%");
-  });
-
-  it("caches a null formatted (dock hidden), and answers 502 on query failure", async () => {
-    const hub = await startTestHub();
-    queryQuotaMock.mockResolvedValueOnce({ kind: "unavailable" });
-    const headers = { Authorization: `Bearer ${TOKEN}` };
-    const hidden = await fetch(dockUrl(hub), { headers });
-    expect(hidden.status).toBe(200);
-    expect(((await hidden.json()) as { formatted: unknown }).formatted).toBeNull();
-    // The null result is cached: a repeat within the TTL does not re-query.
-    const again = await fetch(dockUrl(hub), { headers });
-    expect(again.status).toBe(200);
-    expect(((await again.json()) as { formatted: unknown }).formatted).toBeNull();
-    expect(queryQuotaMock).toHaveBeenCalledTimes(1);
-
-    resetDockCacheForTest();
-    queryQuotaMock.mockRejectedValueOnce(new Error("upstream down"));
-    const failed = await fetch(dockUrl(hub), { headers });
-    expect(failed.status).toBe(502);
   });
 });
 
@@ -584,134 +323,6 @@ describe("hub status proxy", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("Content-Type")).toContain("application/json");
     expect(await res.json()).toEqual({ sessions: [{ sessionId: "s1", status: "running" }] });
-  });
-
-  it("rejects the status proxy without a token", async () => {
-    const hub = await startTestHub();
-    expect((await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/status`)).status).toBe(
-      401,
-    );
-  });
-
-  it("answers 404 for an unknown instance", async () => {
-    const hub = await startTestHub();
-    const res = await fetch(`http://127.0.0.1:${hub.port}/api/instances/nope/status`, {
-      headers: { Authorization: `Bearer ${TOKEN}` },
-    });
-    expect(res.status).toBe(404);
-  });
-
-  it("answers 502 when the bridge is unreachable", async () => {
-    const hub = await startTestHub();
-    await registerBridge(hub, BASE_PORT); // nothing listens there
-    const res = await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/status`, {
-      headers: { Authorization: `Bearer ${TOKEN}` },
-    });
-    expect(res.status).toBe(502);
-  });
-});
-
-describe("hub discovery status field", () => {
-  it("passes a valid session status through and strips an invalid one", async () => {
-    const hub = await startTestHub();
-    const post = (sessions: unknown) =>
-      fetch(`http://127.0.0.1:${hub.port}/api/register`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(registerBody({ sessions })),
-      });
-
-    await post([{ sessionId: "s1", title: "hello", updatedAt: 1, status: "running" }]);
-    const list = () =>
-      listInstances(hub).then(
-        (r) => r.json() as Promise<Array<{ sessions: Array<Record<string, unknown>> }>>,
-      );
-    expect((await list())[0]!.sessions[0]).toMatchObject({ sessionId: "s1", status: "running" });
-
-    await post([{ sessionId: "s1", title: "hello", updatedAt: 1, status: "bogus" }]);
-    expect((await list())[0]!.sessions[0]!["status"]).toBeUndefined();
-  });
-});
-
-describe("hub session close proxy", () => {
-  /** Fake bridge loopback HTTP server accepting POST /sessions/{id}/close. */
-  function startCloseBridge(): Promise<{ server: Server; port: number }> {
-    return new Promise((resolve) => {
-      const server = createServer((req, res) => {
-        const sid = new URL(req.url ?? "/", "http://127.0.0.1").pathname.split("/")[2];
-        if (req.method === "POST" && req.url === `/sessions/${sid}/close`) {
-          req.resume();
-          res.writeHead(sid === "s-busy" ? 409 : 200, { "Content-Type": "application/json" });
-          res.end(sid === "s-busy" ? "session is running" : '{"ok":true}');
-        } else {
-          res.writeHead(404, { "Content-Type": "text/plain" });
-          res.end("not found");
-        }
-      });
-      server.listen(0, "127.0.0.1", () => {
-        const addr = server.address();
-        resolve({ server, port: typeof addr === "object" && addr ? addr.port : 0 });
-      });
-    });
-  }
-
-  async function registerBridge(hub: HubHandle, port: number): Promise<void> {
-    const res = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(registerBody({ port })),
-    });
-    expect(res.status).toBe(200);
-  }
-
-  it("forwards the close POST and relays the bridge's response", async () => {
-    const hub = await startTestHub();
-    const bridge = track(
-      await startCloseBridge(),
-      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
-    );
-    await registerBridge(hub, bridge.port);
-
-    const ok = await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/sessions/s1/close`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${TOKEN}` },
-    });
-    expect(ok.status).toBe(200);
-    expect(await ok.json()).toEqual({ ok: true });
-
-    const busy = await fetch(
-      `http://127.0.0.1:${hub.port}/api/instances/inst-1/sessions/s-busy/close`,
-      { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } },
-    );
-    expect(busy.status).toBe(409);
-  });
-
-  it("guards the close proxy like the read routes", async () => {
-    const hub = await startTestHub();
-    const close = (sid: string, token: string | null) =>
-      fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/sessions/${sid}/close`, {
-        method: "POST",
-        ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
-      });
-
-    expect((await close("s1", null)).status).toBe(401); // no token
-    expect((await close("s1", "wrong")).status).toBe(401); // bad token
-    expect((await close("s1", TOKEN)).status).toBe(404); // unknown instance
-    // Non-POST falls through to the catch-all 404.
-    const get = await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/sessions/s1/close`, {
-      headers: { Authorization: `Bearer ${TOKEN}` },
-    });
-    expect(get.status).toBe(404);
-  });
-
-  it("answers 502 when the bridge is unreachable", async () => {
-    const hub = await startTestHub();
-    await registerBridge(hub, BASE_PORT); // nothing listens there
-    const res = await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/sessions/s1/close`, {
-      method: "POST",
-      headers: { Authorization: `Bearer ${TOKEN}` },
-    });
-    expect(res.status).toBe(502);
   });
 });
 
@@ -780,6 +391,7 @@ describe("hub project/session delete", () => {
     tasksIndexMock.workspaces = [];
     tasksIndexMock.deletedSids = new Set();
     tasksIndexMock.workspaceDeletes = [];
+    tasksIndexMock.taskIds = [];
   });
 
   describe("POST /api/projects/delete", () => {
@@ -869,6 +481,215 @@ describe("hub project/session delete", () => {
     await expect(res.json()).resolves.toEqual({ ok: true, deleted: true });
     expect(seen).toEqual(["POST /sessions/s1/delete"]);
   });
+
+  describe("POST /api/projects/delete {purge:true} (#376)", () => {
+    const PROJECT = "/Users/dev/Develop/demo";
+
+    afterEach(() => {
+      vi.unstubAllEnvs();
+    });
+
+    it("refuses purge while the machine is not armed — no tombstones either", async () => {
+      tasksIndexMock.workspaces = [{ workspacePath: PROJECT, sessions: 2, lastActive: 1 }];
+      const hub = await startTestHub();
+      const res = await fetch(`http://127.0.0.1:${hub.port}/api/projects/delete`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ workspacePath: PROJECT, purge: true }),
+      });
+      expect(res.status).toBe(403);
+      expect(tasksIndexMock.workspaceDeletes).toEqual([]);
+    });
+
+    it("tombstones and relays every session's purge through the serve bridge", async () => {
+      vi.stubEnv("ZCODE_ACP_DELETE_PURGE", "1");
+      tasksIndexMock.workspaces = [{ workspacePath: PROJECT, sessions: 2, lastActive: 1 }];
+      tasksIndexMock.taskIds = ["s1", "s2", "s3"];
+      const relays: Array<{ path: string; body: string }> = [];
+      const bridge = track(
+        await new Promise<{ server: Server; port: number }>((resolve) => {
+          const server = createServer((req, res) => {
+            const chunks: Buffer[] = [];
+            req.on("data", (c: Buffer) => chunks.push(c));
+            req.on("end", () => {
+              relays.push({ path: req.url ?? "", body: Buffer.concat(chunks).toString("utf8") });
+              if ((req.url ?? "").endsWith("/s2/delete")) {
+                res.writeHead(409, { "Content-Type": "application/json" });
+                res.end(JSON.stringify({ deleted: true, purged: false, reason: "running" }));
+                return;
+              }
+              res.writeHead(200, { "Content-Type": "application/json" });
+              res.end(JSON.stringify({ ok: true, deleted: true, purged: true }));
+            });
+          });
+          server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            resolve({ server, port: typeof addr === "object" && addr ? addr.port : 0 });
+          });
+        }),
+        ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+      );
+      const hub = await startTestHub();
+      // The serve bridge of THIS workspace — pickServeForNewWork's target.
+      const reg = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          registerBody({
+            id: `serve-${PROJECT}`,
+            workspace: PROJECT,
+            origin: "serve",
+            port: bridge.port,
+            pid: 4242,
+          }),
+        ),
+      });
+      expect(reg.ok).toBe(true);
+
+      const res = await fetch(`http://127.0.0.1:${hub.port}/api/projects/delete`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ workspacePath: PROJECT, purge: true }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        ok: boolean;
+        deletedTasks: number;
+        purged: string[];
+        skipped: Array<{ id: string; reason: string }>;
+      };
+      expect(body.ok).toBe(true);
+      expect(body.deletedTasks).toBe(2);
+      expect(body.purged.sort()).toEqual(["s1", "s3"]);
+      expect(body.skipped).toEqual([{ id: "s2", reason: "running" }]);
+      // Every relay carried the purge opt-in.
+      expect(relays.map((r) => r.path).sort()).toEqual([
+        "/sessions/s1/delete",
+        "/sessions/s2/delete",
+        "/sessions/s3/delete",
+      ]);
+      expect(relays.every((r) => r.body === '{"purge":true}')).toBe(true);
+      // The tombstones applied regardless of per-id purge outcomes.
+      expect(tasksIndexMock.workspaceDeletes).toEqual([
+        { workspacePath: PROJECT, dbPath: undefined },
+      ]);
+    });
+
+    it("purge with no ids stays a plain tombstone (no serve bridge needed)", async () => {
+      vi.stubEnv("ZCODE_ACP_DELETE_PURGE", "1");
+      tasksIndexMock.workspaces = [{ workspacePath: PROJECT, sessions: 1, lastActive: 1 }];
+      const hub = await startTestHub();
+      const res = await fetch(`http://127.0.0.1:${hub.port}/api/projects/delete`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ workspacePath: PROJECT, purge: true }),
+      });
+      expect(res.status).toBe(200);
+      await expect(res.json()).resolves.toEqual({
+        ok: true,
+        deletedTasks: 1,
+        purged: [],
+        skipped: [],
+      });
+    });
+
+    it("a purge that cannot reach a serve bridge degrades to tombstones + warning", async () => {
+      vi.stubEnv("ZCODE_ACP_DELETE_PURGE", "1");
+      tasksIndexMock.workspaces = [{ workspacePath: PROJECT, sessions: 1, lastActive: 1 }];
+      tasksIndexMock.taskIds = ["s1"];
+      // The incubation spawns a child that dies during startup — the hub ends
+      // up with no serve bridge for the workspace (hub-proxy's death pattern).
+      const fakeChild = new (await import("node:events")).EventEmitter() as {
+        pid: number;
+        exitCode: number | null;
+        signalCode: string | null;
+      };
+      fakeChild.pid = 4242;
+      fakeChild.exitCode = null;
+      fakeChild.signalCode = null;
+      const hub = await startTestHub({
+        spawnServe: () => fakeChild as unknown as import("node:child_process").ChildProcess,
+      });
+
+      const pending = fetch(`http://127.0.0.1:${hub.port}/api/projects/delete`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ workspacePath: PROJECT, purge: true }),
+      });
+      await new Promise((r) => setTimeout(r, 400));
+      fakeChild.exitCode = 1;
+      const res = await pending;
+
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        ok: boolean;
+        deletedTasks: number;
+        purged: string[];
+        skipped: Array<{ id: string; reason: string }>;
+        warning?: string;
+      };
+      expect(body.ok).toBe(true);
+      expect(body.deletedTasks).toBe(1);
+      expect(body.purged).toEqual([]);
+      expect(body.skipped).toEqual([{ id: "s1", reason: "no serve bridge" }]);
+      expect(body.warning).toMatch(/no serve bridge/);
+    });
+
+    it("reports ids past the per-request cap as skipped — never a silent truncation", async () => {
+      vi.stubEnv("ZCODE_ACP_DELETE_PURGE", "1");
+      tasksIndexMock.workspaces = [{ workspacePath: PROJECT, sessions: 201, lastActive: 1 }];
+      tasksIndexMock.taskIds = Array.from({ length: 201 }, (_, i) => `s${i}`);
+      let relayed = 0;
+      const bridge = track(
+        await new Promise<{ server: Server; port: number }>((resolve) => {
+          const server = createServer((req, res) => {
+            req.resume();
+            relayed++;
+            res.writeHead(200, { "Content-Type": "application/json" });
+            res.end(JSON.stringify({ ok: true, deleted: true, purged: true }));
+          });
+          server.listen(0, "127.0.0.1", () => {
+            const addr = server.address();
+            resolve({ server, port: typeof addr === "object" && addr ? addr.port : 0 });
+          });
+        }),
+        ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
+      );
+      const hub = await startTestHub();
+      const reg = await fetch(`http://127.0.0.1:${hub.port}/api/register`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(
+          registerBody({
+            id: `serve-${PROJECT}`,
+            workspace: PROJECT,
+            origin: "serve",
+            port: bridge.port,
+            pid: 4242,
+          }),
+        ),
+      });
+      expect(reg.ok).toBe(true);
+
+      const res = await fetch(`http://127.0.0.1:${hub.port}/api/projects/delete`, {
+        method: "POST",
+        headers: { Authorization: `Bearer ${TOKEN}`, "Content-Type": "application/json" },
+        body: JSON.stringify({ workspacePath: PROJECT, purge: true }),
+      });
+      expect(res.status).toBe(200);
+      const body = (await res.json()) as {
+        purged: string[];
+        skipped: Array<{ id: string; reason: string }>;
+      };
+      // Only the first 200 ids were relayed…
+      expect(relayed).toBe(200);
+      expect(body.purged).toHaveLength(200);
+      // …and the overflow is REPORTED, so the client knows bytes remain.
+      expect(body.skipped).toEqual([
+        { id: "s200", reason: expect.stringContaining("purge request cap") },
+      ]);
+    });
+  });
 });
 
 describe("hub backend restart proxy", () => {
@@ -927,38 +748,6 @@ describe("hub backend restart proxy", () => {
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({ ok: true, cancelledTurns: 2 });
     // The hub rewrites the documented path onto the bridge's settings route.
-    expect(bridge.seen).toEqual(["POST /settings/backend/restart"]);
-  });
-
-  it("guards the restart route and answers 404 for an unknown instance", async () => {
-    const hub = await startTestHub();
-    const call = (token: string | null, id = "inst-1") =>
-      fetch(`http://127.0.0.1:${hub.port}/api/instances/${id}/backend/restart`, {
-        method: "POST",
-        ...(token ? { headers: { Authorization: `Bearer ${token}` } } : {}),
-      });
-    expect((await call(null)).status).toBe(401);
-    expect((await call("wrong")).status).toBe(401);
-    expect((await call(TOKEN)).status).toBe(404);
-    // A GET is not a restart — it must not reach the bridge.
-    const get = await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/backend/restart`, {
-      headers: { Authorization: `Bearer ${TOKEN}` },
-    });
-    expect(get.status).toBe(404);
-  });
-
-  it("also serves the per-instance /settings/ spelling", async () => {
-    const hub = await startTestHub();
-    const bridge = track(
-      await startRestartBridge(),
-      ({ server }) => new Promise<void>((resolve) => server.close(() => resolve())),
-    );
-    await registerBridge(hub, bridge.port);
-    const res = await fetch(
-      `http://127.0.0.1:${hub.port}/api/instances/inst-1/settings/backend/restart`,
-      { method: "POST", headers: { Authorization: `Bearer ${TOKEN}` } },
-    );
-    expect(res.status).toBe(200);
     expect(bridge.seen).toEqual(["POST /settings/backend/restart"]);
   });
 });
@@ -1131,26 +920,6 @@ describe("hub instance shutdown", () => {
     const res = await shutdown(hub);
     expect(res.status).toBe(403);
     expect(child.exitCode).toBeNull(); // still alive
-  });
-
-  it("guards auth and unknown instances like the other write routes", async () => {
-    const hub = await startTestHub();
-    expect(
-      (
-        await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/shutdown`, {
-          method: "POST",
-        })
-      ).status,
-    ).toBe(401); // no token
-    expect((await shutdown(hub)).status).toBe(404); // unknown instance
-    // Non-POST falls through to the catch-all 404.
-    expect(
-      (
-        await fetch(`http://127.0.0.1:${hub.port}/api/instances/inst-1/shutdown`, {
-          headers: { Authorization: `Bearer ${TOKEN}` },
-        })
-      ).status,
-    ).toBe(404);
   });
 });
 

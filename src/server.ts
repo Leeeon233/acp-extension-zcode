@@ -15,10 +15,19 @@ import {
   loadZcodeCredentials,
   mergeEnvWithCreds,
   resolveZcodeCommand,
+  type ZcodeLifecycleSnapshot,
   zcodeDataBaseDirEnv,
   ZcodeBackend,
 } from "./backend/index.js";
-import { armSandboxArgv, collectSandboxWorkspaces, sandboxActive } from "./backend/sandbox.js";
+import {
+  armSandboxArgv,
+  ensureGlobalSandboxConfig,
+  readGlobalSandboxConfig,
+  sandboxActive,
+} from "./backend/sandbox.js";
+import { clearClosedSessionIds } from "./closed-sessions.js";
+import { desktopBundleAtLeast } from "./config/deferred-probe-capability.js";
+import { resolveOfficialZCodeBaseUrl } from "./config/official-mcp-auth.js";
 import {
   captureGate,
   ensureWorkflowPolicyPushed,
@@ -26,20 +35,26 @@ import {
   type WorkflowGate,
 } from "./config/workflow-gate.js";
 import { BackgroundTaskListener } from "./handlers/background-tasks.js";
-import { enqueueSessionSend, TURN_STATE_METHODS } from "./handlers/io.js";
+import { emitSessionTurnState, enqueueSessionSend, TURN_STATE_METHODS } from "./handlers/io.js";
 import { SandboxRestartBatcher, flushSandboxGrants } from "./handlers/sandbox-allow.js";
 import { authenticate } from "./handlers/authenticate.js";
 import { LODY_AGENT_CAPABILITIES } from "./lody.js";
 import {
+  answerOfficialMcpAuthHeaders,
   answerProviderRuntimeHeaders,
   sweepOrphanedServerRequests,
 } from "./handlers/server-requests.js";
 import { SessionTitleListener } from "./handlers/session-titles.js";
+import { isSessionGoneError } from "./handlers/session.js";
 import { pushInteractionIfOffline } from "./push/push.js";
 import { ClientRegistry } from "./remote/broadcast.js";
 import { envWithLoginShell } from "./remote/login-shell-env.js";
 import { stopAllWorkflowRunPollers } from "./workflow/poller.js";
 import { AGENT_INFO, clientConnectionRoot, PROTOCOL_VERSION, log, warn } from "./utils.js";
+
+/** `session/list`'s `sessionIds` array schema cap (upstream index.ts) — the
+ * batch tombstone-liveness oracle chunks at this bound. */
+const SESSION_IDS_QUERY_BATCH = 64;
 
 /** Client capabilities advertised in the initialize request. */
 export interface ClientCapabilities {
@@ -57,6 +72,14 @@ export interface ClientCapabilities {
  * The agent-type method checks readiness without an editor-side key exchange.
  */
 export { ZCODE_AUTH_METHOD_ID } from "./handlers/authenticate.js";
+
+/**
+ * Desktop bundle floor for the rewind extensions (`_meta.zcode.rewind`): the
+ * v4 conversation commands editUserQuery/retryTurn and the rowsRange read
+ * have existed since the earliest visible upstream tag (3.14.3) and were
+ * audited additive through 3.18.2 — see the initialize capability flag.
+ */
+const REWIND_BUNDLE_FLOOR = "3.14.3";
 
 /** A pending prompt turn. */
 export interface PendingTurn {
@@ -134,6 +157,12 @@ export class ZcodeAcpServer {
    * enforcement point — so flipping the kind flips every gated surface.
    */
   readonly backendKind: BackendKind = "zcode";
+  /** Concurrent initial catalog probes for the same workspace share one child. */
+  readonly initialCatalogFlights = new Map<
+    string,
+    Promise<import("./backend/types.js").ZcodeCreateResult | null>
+  >();
+  readonly initialCatalogCache = new Map<string, import("./backend/types.js").ZcodeCreateResult>();
   /** acp_sid → zcode session id (usually identical, but kept for clarity). */
   readonly sessionMap = new Map<string, string>();
   /**
@@ -167,6 +196,17 @@ export class ZcodeAcpServer {
        * carry command/args/env; remote entries carry type/url), so entries are
        * passed through unchanged. */
       mcpServers?: acp.McpServer[];
+      /**
+       * The model configOption `currentValue` last advertised to the client for
+       * this placeholder (`session/new` response, or the catalog-probe update
+       * that follows it). `session/create` is the first moment a model really
+       * exists, and the backend's own default can disagree with this
+       * projection; a client that skipped its switch because the two matched
+       * would otherwise run turns on a model it never picked. The create path
+       * pins the session to this value so the advertisement stays true
+       * (see ensureRealSession).
+       */
+      advertisedModel?: string;
     }
   >();
   /**
@@ -195,7 +235,7 @@ export class ZcodeAcpServer {
    * (a mid-restore query returns a prefix and the first-entry replay "ends
    * in the middle").
    */
-  readonly resumeInFlight = new Map<string, Promise<unknown>>();
+  readonly resumeInFlight = new Map<string, { generation: number; promise: Promise<unknown> }>();
   /**
    * Backend session ids whose last settle poll hit RESUME_SETTLE_CAP_MS while
    * hydration was still growing (see fetchMessagesSettled): a later plain
@@ -322,6 +362,20 @@ export class ZcodeAcpServer {
    * Reset at every spawn.
    */
   toolDenylistRejected = false;
+  /**
+   * `session/lifecycle/getState` availability on the CURRENT backend build:
+   * null = not yet probed, true/false = the pinned verdict (app-server <
+   * 0.17.1 answers method-not-found). Pinned per backend generation like
+   * toolDenylistRejected — a respawned process may be an older build.
+   */
+  backendLifecycleApi: boolean | null = null;
+  /**
+   * `session/list`'s `sessionIds` key acceptance on the CURRENT backend build:
+   * null = not yet probed, true = rejected (strict zod "Unrecognized key" —
+   * fall back to per-id lifecycle probes), false = accepted. Pinned per
+   * backend generation like toolDenylistRejected.
+   */
+  sessionIdsQueryRejected: boolean | null = null;
   /**
    * The full slash-command list (set once by buildAgentApp in index.ts).
    * Read by the gate-aware menu catch-up (resendMenuAfterGateSettled in
@@ -552,6 +606,8 @@ export class ZcodeAcpServer {
    * resolve the target's reasoning level from this cache first; an entry that
    * declares no levels simply has none (the backend's own "level-less" verdict).
    */
+  backendGeneration = 0;
+  readonly currentModelIdentity = new Map<string, { providerId: string; modelId: string }>();
   readonly modelAvailability = new Map<
     string,
     Array<{ providerId?: string; modelId?: string; defaultLevel?: string; levels?: string[] }>
@@ -583,6 +639,29 @@ export class ZcodeAcpServer {
    */
   readonly notifyTurnActiveSince = new Map<string, number>();
   /**
+   * Backend sessions (zcodeSid → turnId) whose CURRENT turn was NOT driven by
+   * a bridge prompt — background-subagent wake turns (`inputSource:
+   * "background_task"`), `subagent_message` turns, control-only turns. The
+   * turn loop only exists while a bridge-driven prompt is registered, so
+   * without this bookkeeping those turns produce messages (via the background
+   * listener's forwarding) while every running indicator reads idle: no
+   * `turnState running:true`, `/status` idle, `replayMeta.turnActive` false —
+   * the desktop showed a live streaming conversation as idle (observed live
+   * 2026-11-12 on the mapon session: a sub-agent Review returned after the
+   * main turn ended, the backend auto-continued for an hour, desktop idle).
+   *
+   * Upstream parity: the app-server's own taskActivityTracker
+   * (packages/zcode-server-cli/src/server-core/taskActivityTracker.ts) keys
+   * its running-session set off `turn.started` / `turn.terminal` facts
+   * regardless of origin, and deriveZCodeTaskStatus reads
+   * `runtime.activeTurnId` — a turn is a turn whoever started it. This map is
+   * the bridge's mirror of that fact, fed by BackgroundTaskListener (which
+   * sees every session event out-of-band). Maintained per turnId so an
+   * interleaved turn's terminal cannot clear a newer active one; cleared on
+   * backend respawn (resetBackendGeneration) and session close.
+   */
+  readonly foreignActiveTurns = new Map<string, string>();
+  /**
    * Last USER-originated action (session/prompt or session/cancel, stamped via
    * noteUserActivity) on this bridge, epoch ms. Read by pushSettled's quiet
    * window: a settle within `push.quietMs` of it means the user is still at
@@ -598,6 +677,15 @@ export class ZcodeAcpServer {
    * not override these (SessionTitleListener).
    */
   readonly titleUserSetBy = new Set<string>();
+  /**
+   * Backend sessions (zcodeSid) whose FIRST auto title is already final: the
+   * provisional seed has been replaced by (or settled as) the one allowed
+   * generated title. Every later `generated` push is ignored — only a manual
+   * rename (`custom` push, /rename, or the remote endpoint) may change the
+   * title again. In-memory is sufficient: after a restart the backend re-pushes
+   * the SAME stored title, so re-adopting it once is idempotent.
+   */
+  readonly autoTitleFinalized = new Set<string>();
   /**
    * Per-Bash-callId stdout snapshot already streamed via terminal_output. Used
    * by dispatchTerminalUpdate for two dedup guards:
@@ -628,8 +716,18 @@ export class ZcodeAcpServer {
    */
   readonly serveMode: boolean;
 
-  constructor(opts: { serveMode?: boolean } = {}) {
+  private readonly catalogProbe: boolean;
+  private readonly sweep: ReturnType<typeof setInterval>;
+  disposed = false;
+
+  dispose(): void {
+    this.disposed = true;
+    clearInterval(this.sweep);
+  }
+
+  constructor(opts: { serveMode?: boolean; catalogProbe?: boolean } = {}) {
     this.serveMode = opts.serveMode === true;
+    this.catalogProbe = opts.catalogProbe === true;
     // Offline-push hook (§5.1): fires inside requestAny's zero-clients branch.
     // The gate (clients.size / ACTIVE) lives in the push module; this wiring is
     // the only connection between the remote layer and the push module.
@@ -639,10 +737,10 @@ export class ZcodeAcpServer {
     // turn loop will ever poll — above all a background workflow run's — are
     // forwarded, pushed or settled instead of silently timing out. Unref'd,
     // never keeps the process alive; a no-op while the queue is empty.
-    const sweep = setInterval(() => {
+    this.sweep = setInterval(() => {
       void sweepOrphanedServerRequests(this).catch(() => undefined);
     }, 2_000);
-    sweep.unref();
+    this.sweep.unref();
   }
 
   /** Next JSON-RPC id for messages we send to zcode. */
@@ -666,8 +764,8 @@ export class ZcodeAcpServer {
 
   /**
    * Lazily spawn the zcode backend on first use (initialize doesn't need it).
-   * With the sandbox armed (ZCODE_ACP_SANDBOX=1 globally, or any live
-   * workspace's .zcode/acp/sandbox.json — ADR-0011), the spawn is wrapped in
+   * With the sandbox armed (the global switch: ZCODE_ACP_SANDBOX=1 or
+   * sandbox.enabled in the user config — ADR-0011), the spawn is wrapped in
    * a Seatbelt profile built from the live workspace roots — session/new
    * records cwds before any backend RPC (lazy placeholders), so the whitelist
    * is complete by the time the backend materializes here.
@@ -717,19 +815,38 @@ export class ZcodeAcpServer {
     // or the user's own tools even though they work in a terminal. The CLI
     // shells out to project tooling (npm scripts, local binaries), so a
     // completed PATH changes what a session can actually do.
-    const env = {
+    const env: NodeJS.ProcessEnv = {
       ...(await envWithLoginShell()),
       ...mergeEnvWithCreds(loadZcodeCredentials()),
       ...builtinProviderEnv(),
       ...zcodeDataBaseDirEnv(),
+      // Inject the authoritative ZCode service origin so official plugin
+      // `.mcp.json` `${ZCODE_BASE_URL}` URLs expand correctly
+      // (`mergeEnvWithCreds` has already stripped the possibly-polluted
+      // inherited value; this writes only the trusted ZCode domain).
+      ZCODE_BASE_URL: resolveOfficialZCodeBaseUrl(),
     };
-    let argv = resolveZcodeCommand();
-    this.backendSandboxed = sandboxActive(this.sandboxRoots());
+    let argv = resolveZcodeCommand({ catalogProbe: this.catalogProbe });
+    if (this.catalogProbe) {
+      const { boundDeferredProbeCommand } = await import("./config/deferred-probe-capability.js");
+      const bound = boundDeferredProbeCommand(argv);
+      if (!bound) throw new Error("catalog probe backend identity not verified");
+      argv = bound;
+      // A preload can run before the loader and bypass its identity check.
+      delete env.NODE_OPTIONS;
+      delete env.NODE_PATH;
+    }
+    // One-shot global-config settle BEFORE the arm decision: the machine-wide
+    // sandbox.json is created (toolchain template + legacy per-project
+    // migration) here, and a legacy `enabled: true` arms the global switch —
+    // which sandboxActive() reads live right after.
+    await ensureGlobalSandboxConfig(this.sandboxRoots());
+    this.backendSandboxed = sandboxActive();
     if (this.backendSandboxed) {
-      const { workspaces, extraAllow } = collectSandboxWorkspaces(this.sandboxRoots());
       argv = armSandboxArgv(argv, {
-        workspaces,
-        extraAllow: [...extraAllow, ...this.sandboxOnceAllows],
+        workspaceRoots: this.sandboxRoots(),
+        config: readGlobalSandboxConfig(),
+        onceAllows: this.sandboxOnceAllows,
       });
       // Birth-mark the wrapped process: the marker is inherited down any
       // spawn chain (a hub (re)spawned below a sandboxed backend carries
@@ -746,7 +863,7 @@ export class ZcodeAcpServer {
     // serve spawn passes `cwd` (defaultSpawnServe). Forcing a single `cwd` here
     // would be both redundant and wrong — the backend is one process shared by
     // every session, while the directory belongs to each window/session.
-    const backend = new ZcodeBackend(argv, env);
+    const backend = new ZcodeBackend(argv, env, this.catalogProbe);
     this.backend = backend;
     this.resetBackendGeneration();
     // Verdict observability (one line per spawn — a dark gate was previously
@@ -796,11 +913,44 @@ export class ZcodeAcpServer {
       });
       return true;
     };
+    // Answer official MCP identity-header requests at arrival (tianyancha,
+    // zcode-site, ...) so connect/discovery never goes unanswered.
+    backend.officialMcpAuthHeadersResponder = (id, params) => {
+      setImmediate(() => {
+        try {
+          answerOfficialMcpAuthHeaders(
+            backend,
+            id,
+            "interaction/requestOfficialMcpAuthHeaders",
+            params,
+          );
+        } catch (e) {
+          warn(
+            `official MCP auth headers responder threw, declining: ` +
+              `${e instanceof Error ? e.message : String(e)}`,
+          );
+          try {
+            backend.sendReply(id, { ok: false, reason: "official_auth_unavailable" });
+          } catch {
+            /* backend gone — nothing to answer */
+          }
+        }
+      });
+      return true;
+    };
     // Record compact terminal states (per-session) as they arrive — compact()
     // reads the entry after its lock wait to detect failures the RPC never
     // reports.
     backend.onCompactOutcome = (sid, reason) => {
       this.compactOutcomes.set(sid, { reason, at: Date.now() });
+    };
+    // Feed `session/lifecycle/changed` pushes (>= 0.17.1) into the
+    // backend-loaded stamps: a resident teardown (idle TTL / LRU eviction,
+    // close) voids the stamps the moment it happens instead of at the next
+    // BACKEND_RESIDENT_TTL_MS boundary. `ready` transitions deliberately do
+    // NOT re-stamp — see applyLifecycleSnapshot.
+    backend.onLifecycleChanged = (snap) => {
+      this.applyLifecycleSnapshot(snap);
     };
     return backend;
   }
@@ -832,20 +982,20 @@ export class ZcodeAcpServer {
   }
 
   /**
-   * Project-level sandbox flip (ADR-0011): flipping `enabled: true` in a live
-   * workspace's .zcode/acp/sandbox.json arms the sandbox mid-run, without a
-   * global env. If the flip happened after the current backend spawned
-   * unsandboxed, kill it — the caller's next ensureBackend() respawns under
-   * the profile, and prompt()'s subscribe recovery reloads the session. The
-   * reverse (flipping back to false) never restarts a live sandboxed backend;
-   * the next natural respawn drops the wrap. Best-effort: a failed kill
-   * leaves things as they were (the sandbox arms on a later respawn).
+   * Global sandbox flip: turning `sandbox.enabled` on in the user config (or
+   * setting ZCODE_ACP_SANDBOX=1) after the current backend spawned unsandboxed
+   * must arm on THIS prompt, not on the next bridge restart — kill the old
+   * process; the caller's next ensureBackend() respawns under the profile,
+   * and prompt()'s subscribe recovery reloads the session. The reverse (the
+   * switch going back off) never restarts a live sandboxed backend; the next
+   * natural respawn drops the wrap. Best-effort: a failed kill leaves things
+   * as they were (the sandbox arms on a later respawn).
    */
   async applySandboxFlip(): Promise<void> {
     if (this.backendSandboxed) return;
     if (!this.backend || this.backend.isDead) return;
-    if (!sandboxActive(this.sandboxRoots())) return;
-    warn("sandbox: project config armed mid-run — restarting backend under sandbox-exec");
+    if (!sandboxActive()) return;
+    warn("sandbox: global switch armed mid-run — restarting backend under sandbox-exec");
     this.cancelAllPendingTurns();
     try {
       await this.backend.close();
@@ -869,6 +1019,11 @@ export class ZcodeAcpServer {
   resetBackendGeneration(): void {
     // Fresh backend process: every session rehydrates from scratch, so the
     // settle bookkeeping from the previous instance is void.
+    this.backendGeneration++;
+    this.initialCatalogCache.clear();
+    this.initialCatalogFlights.clear();
+    this.modelAvailability.clear();
+    this.currentModelIdentity.clear();
     this.hydrationUnsettled.clear();
     this.hydrationWatermark.clear();
     this.compactOutcomes.clear();
@@ -877,6 +1032,12 @@ export class ZcodeAcpServer {
     this.observedSendBusyReject = false;
     // …and the toolDenylist schema verdict: the respawned build may accept it.
     this.toolDenylistRejected = false;
+    // …and the session/lifecycle/getState verdict: the respawned build may
+    // predate the family (0.17.1).
+    this.backendLifecycleApi = null;
+    // …and the session/list sessionIds-key verdict: the respawned build may
+    // accept the batch query.
+    this.sessionIdsQueryRejected = null;
     // …and the backend-loaded stamps: they vouch for residents of a process
     // that no longer exists. A surviving stamp kept isBackendSessionLive true
     // across a respawn, so session/load skipped the resume RPC and read a
@@ -884,6 +1045,23 @@ export class ZcodeAcpServer {
     // (the backend's "Session is not active" is swallowed by fetchMessages),
     // or a prefix when a sibling client's re-resume was still hydrating.
     this.backendLoadedSessions.clear();
+    // …and the foreign-turn tracking: the turns it holds ran on the dead
+    // process and no terminal event will ever arrive for them. Best-effort
+    // settle broadcast so a client left mid-"running" by the crash doesn't
+    // spin until the session is next used — but the value is the /status
+    // union (pendingTurns ∪ remaining foreign entries): a backend-lost
+    // recovery respawn happens INSIDE runOneTurn with the turn still
+    // registered, and a bare false would read the recovering session as idle
+    // for the whole recovery turn (found in review 2026-11).
+    for (const zcodeSid of [...this.foreignActiveTurns.keys()]) {
+      this.foreignActiveTurns.delete(zcodeSid);
+      const acpSid = this.acpSidByZcodeSid.get(zcodeSid);
+      if (!acpSid) continue;
+      const stillBusy =
+        [...this.pendingTurns.values()].some((t) => t.zcodeSid === zcodeSid) ||
+        this.foreignActiveTurns.has(zcodeSid);
+      void emitSessionTurnState(this, acpSid, stillBusy);
+    }
   }
 
   /**
@@ -910,6 +1088,60 @@ export class ZcodeAcpServer {
   isBackendSessionLive(acpSid: string): boolean {
     const at = this.backendLoadedSessions.get(acpSid);
     return at !== undefined && Date.now() - at < BACKEND_RESIDENT_TTL_MS;
+  }
+
+  /**
+   * Apply a `session/lifecycle/changed` snapshot (>= 0.17.1) to the
+   * backend-loaded stamps: a teardown transition (starting is the tail of a
+   * teardown-driven re-activation, stopping/unloaded/faulted are the teardown
+   * itself) voids every ACP alias of the backend session so the next use
+   * re-resumes instead of trusting a stamp that predates the transition.
+   *
+   * `ready` deliberately does NOT re-stamp. Instance-ready and
+   * projection-applied are two separate completion conditions upstream, and a
+   * foreign activation (the v4 gateway's cold-resume, an automation wake)
+   * rebuilds the runtime WITHOUT the bridge's per-load mcpServers (#193) and
+   * toolDenylist (#340) — blessing it here would make session/load skip its
+   * resume flight + settle and replay from a possibly mid-hydration
+   * projection. The getState probe in ensureBackendResident is the only
+   * ready-verifier: it fires on non-replay paths alone. Backend sessions
+   * without an ACP mapping (other clients' sessions) are ignored.
+   */
+  applyLifecycleSnapshot(snap: ZcodeLifecycleSnapshot): void {
+    if (snap.state === "ready") return;
+    let touched = false;
+    for (const [acpSid, zcodeSid] of this.sessionMap) {
+      if (zcodeSid !== snap.sessionId) continue;
+      if (this.backendLoadedSessions.delete(acpSid)) touched = true;
+    }
+    if (touched) {
+      log(`lifecycle: ${snap.sessionId} → ${snap.state} — backend-loaded stamps voided`);
+    }
+  }
+
+  /**
+   * Connection roots whose clients render steered text locally (martty's
+   * Send Now cell), by backend session. `_session/steering` records the
+   * steerer when the agent takes the message; the drain echo
+   * (echoSteeredInputs) excludes those roots so the steerer does not see
+   * the injected text twice. Bounded per session — most sessions have one
+   * steering client, whose root dedupes to a single entry. Accepted
+   * trade-off: a later backend-internal guide (plan-approval feedback) that
+   * drains for the same session skips that client's echo too.
+   */
+  readonly steerEchoSuppressedRoots = new Map<string, unknown[]>();
+
+  /** Record a steering client's connection root for the drain-echo exclusion. */
+  suppressSteerEcho(zcodeSid: string, root: unknown): void {
+    if (root === undefined || root === null) return;
+    const roots = this.steerEchoSuppressedRoots.get(zcodeSid) ?? [];
+    if (!roots.includes(root)) roots.push(root);
+    this.steerEchoSuppressedRoots.set(zcodeSid, roots.slice(-4));
+  }
+
+  /** Roots to exclude from this session's steer-drain echo (empty = none). */
+  steerEchoExclusions(zcodeSid: string): Set<unknown> {
+    return new Set(this.steerEchoSuppressedRoots.get(zcodeSid) ?? []);
   }
 
   /** Update a session's discovery summary (title sticky once set). */
@@ -940,6 +1172,11 @@ export class ZcodeAcpServer {
     // retirement stamp only ever suppressed TRAILING activity of the retired
     // conversation, and it must not suppress the next real one.
     this.discoveryRetiredAt.delete(acpSid);
+    // And it clears the DURABLE close record for every spelling — the next
+    // serve-bridge respawn must not re-retire a conversation the user
+    // deliberately reopened (self-heal, both halves). No write when nothing
+    // is recorded.
+    clearClosedSessionIds([acpSid, this.resolveSid(acpSid)]);
     // Self-heal soft-delete tombstones (ADR-0031 amendment): using a session
     // again cancels its tombstone — the session itself, and project-wide when
     // the workspace had gone fully invisible (project delete). Fire-and-forget
@@ -981,6 +1218,108 @@ export class ZcodeAcpServer {
   }
 
   /**
+   * Which of `ids` the CURRENT backend can no longer serve — the oracle
+   * behind tombstone retirement (#376). Uses the EXISTING backend only
+   * (never spawns: the session/new revival path is fire-and-forget and must
+   * stay free) and answers with the ids ABSENT from
+   * `session/list {sessionIds}` — upstream drops both physically deleted and
+   * soft-deleted (time_deleted) sessions there, and resume refuses both the
+   * same way, so both deserve retirement while bridge-tombstoned sessions
+   * (no time_deleted) keep reviving per the ADR-0031 self-heal contract.
+   *
+   * A backend whose schema predates the `sessionIds` key (strict zod
+   * "Unrecognized key", verdict pinned per generation) falls back to per-id
+   * `session/lifecycle/getState` probes (>= 0.17.1). Failure semantics: a
+   * chunk that ERRORS or a thrown transport aborts further probing and
+   * returns what earlier chunks already PROVED gone (each entry carries its
+   * own positive evidence); an id with no verdict is simply absent — the
+   * caller treats it as "revive blindly" (the pre-#376 behavior): a probe
+   * hiccup must never un-revive a session the store still has.
+   */
+  async probeGoneBackendSessions(ids: string[]): Promise<Set<string>> {
+    const gone = new Set<string>();
+    const backend = this.backend;
+    const unique = [...new Set(ids)].filter((id) => typeof id === "string" && id);
+    if (!backend || unique.length === 0) return gone;
+    try {
+      if (this.sessionIdsQueryRejected !== true) {
+        for (let i = 0; i < unique.length; i += SESSION_IDS_QUERY_BATCH) {
+          const chunk = unique.slice(i, i + SESSION_IDS_QUERY_BATCH);
+          const resp = await backend.request(
+            this.nextId(),
+            "session/list",
+            { sessionIds: chunk },
+            15000,
+          );
+          if (resp.error) {
+            if (
+              this.sessionIdsQueryRejected === null &&
+              /unrecognized key/i.test(resp.error.message ?? "")
+            ) {
+              this.sessionIdsQueryRejected = true;
+              log(
+                "session/list sessionIds unsupported on this backend build — per-id lifecycle probes",
+              );
+            }
+            if (this.sessionIdsQueryRejected === true) {
+              // Redo the whole set through the per-id probe — chunking state
+              // before the rejection is not worth carrying.
+              return await this.probeGoneViaLifecycle(backend, unique);
+            }
+            return gone; // transient RPC failure — no verdict
+          }
+          this.sessionIdsQueryRejected = false;
+          const present = new Set(
+            (
+              (resp.result as { sessions?: Array<{ sessionId?: string }> } | undefined)?.sessions ??
+              []
+            )
+              .map((s) => s.sessionId)
+              .filter((sid): sid is string => typeof sid === "string"),
+          );
+          for (const id of chunk) if (!present.has(id)) gone.add(id);
+        }
+        return gone;
+      }
+      return await this.probeGoneViaLifecycle(backend, unique);
+    } catch {
+      return gone; // best-effort: no verdict
+    }
+  }
+
+  /** Per-id fallback oracle: `session/lifecycle/getState`'s "Session not
+   * found" is the same resume-refused verdict as the batch face. Unavailable
+   * on pre-0.17.1 builds — no oracle, no retirement. */
+  private async probeGoneViaLifecycle(backend: ZcodeBackend, ids: string[]): Promise<Set<string>> {
+    const gone = new Set<string>();
+    if (this.backendLifecycleApi === false) return gone;
+    for (const id of ids) {
+      try {
+        const resp = await backend.request(
+          this.nextId(),
+          "session/lifecycle/getState",
+          { sessionId: id },
+          5000,
+        );
+        if (resp.error) {
+          const message = resp.error.message ?? "";
+          if (resp.error.code === -32601 || /method not found/i.test(message)) {
+            this.backendLifecycleApi = false;
+            log("lifecycle getState unsupported on this backend build — no retirement oracle");
+            return gone;
+          }
+          if (isSessionGoneError(message)) gone.add(id);
+          continue; // other errors: no verdict for this id
+        }
+        this.backendLifecycleApi = true;
+      } catch {
+        // per-id failure: no verdict for this id
+      }
+    }
+    return gone;
+  }
+
+  /**
    * Tombstone revival behind markSessionActive. Guarded, not destructured:
    * several test suites mock tasks-index PARTIALLY (without this export), and
    * a missing index or unknown cwd must never surface on the activity path.
@@ -992,6 +1331,7 @@ export class ZcodeAcpServer {
       await tasksIndex.reviveTombstonesOnActivity({
         taskId: this.resolveSid(acpSid) ?? acpSid,
         workspacePath: this.sessionCwds.get(acpSid),
+        probeGone: (ids) => this.probeGoneBackendSessions(ids),
       });
     } catch {
       // best-effort — a tombstone revival failure must never break a turn
@@ -1236,8 +1576,20 @@ export class ZcodeAcpServer {
         // endpoint, hub-proxied at /api/instances/{id}/fs/* (ADR-0004).
         // turnState: the out-of-band running notifications this bridge emits,
         // old and new spellings (#311) — see TURN_STATE_METHODS.
+        // rewind: session/edit_user_message + session/retry_turn (v4
+        // editUserQuery/retryTurn). The floor is source-verified — the v4
+        // rewind command set and rowsRange predate desktop 3.14.3 (the
+        // earliest upstream tag) and were audited additive through 3.18.2 —
+        // so the static bundle version gates at initialize (before any
+        // backend exists to probe), fail closed on unreadable bundles.
+        // Absent (not false) below the floor — the established "unsupported"
+        // spelling, cf. _meta.zcode.fs.
         _meta: {
-          zcode: { fs: true, turnState: [...TURN_STATE_METHODS] },
+          zcode: {
+            fs: true,
+            turnState: [...TURN_STATE_METHODS],
+            ...(desktopBundleAtLeast(REWIND_BUNDLE_FLOOR) ? { rewind: true } : {}),
+          },
           lody: LODY_AGENT_CAPABILITIES,
         },
       },
@@ -1255,6 +1607,13 @@ export class ZcodeAcpServer {
             "Reads the GLM API key from the ZCode desktop app's credential files (~/.zcode/v2) or a saved zcode-acp account. No editor-side credentials required.",
         },
       ],
+      // Cross-adapter steering extension (#352): `_session/steering` injects
+      // into the running turn via the v4 command API. Convention:
+      // InitializeResponse._meta.steering.supported (codex-acp /
+      // claude-agent-acp); `timings` is this bridge's additive declaration —
+      // `now` (guide into the live turn) and `next` (queue for the next
+      // boundary), carried by the request's _meta.steering.priority.
+      _meta: { steering: { supported: true, timings: ["now", "next"] } },
     };
   }
 
